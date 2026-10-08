@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Keiba Prediction API")
 
-# Androidアプリ等からのアクセスを許可
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 起動時に学習済みモデルをロード
 MODEL_PATH = "horse_ranker_model.txt"
 try:
     model = lgb.Booster(model_file=MODEL_PATH)
@@ -30,30 +28,35 @@ FEATURE_COLS = [
     "体重", "体重増減", "distance", "track_type_code", "condition_code"
 ]
 
-def fetch_shutuba_table(race_id: str) -> pd.DataFrame:
-    """出馬表（または確定前レースページ）を取得してDataFrame化"""
-    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+def fetch_race_table(race_id: str) -> pd.DataFrame:
+    """出馬表または確定レース結果からテーブルを取得"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
+
+    # 1. まずは出馬表URLを試す
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=headers, timeout=10)
     resp.encoding = "EUC-JP"
     soup = BeautifulSoup(resp.text, "html.parser")
-    
     table = soup.find("table", class_="RaceTable01")
+
+    # 2. なければ確定結果URLを試す
     if not table:
-        fallback_url = f"https://db.netkeiba.com/race/{race_id}/"
-        resp = requests.get(fallback_url, headers=headers, timeout=10)
+        url = f"https://db.netkeiba.com/race/{race_id}/"
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.encoding = "EUC-JP"
         soup = BeautifulSoup(resp.text, "html.parser")
         table = soup.find("table", class_="race_table_01")
-        if not table:
-            return pd.DataFrame()
+
+    if not table:
+        return pd.DataFrame()
 
     df = pd.read_html(io.StringIO(str(table)))[0]
+    # カラム名に含まれる改行や全角・半角スペースを完全に除去
     df.columns = [re.sub(r"\s+", "", str(c)) for c in df.columns]
 
+    # メタデータ抽出
     intro_text = soup.get_text()
     dist_match = re.search(r"(芝|ダ|障).*?(\d{3,4})m", intro_text)
     track_type = dist_match.group(1) if dist_match else "芝"
@@ -62,34 +65,55 @@ def fetch_shutuba_table(race_id: str) -> pd.DataFrame:
     cond_match = re.search(r"(?:芝|ダート|障)\s*:\s*(\w+)", intro_text)
     track_condition = cond_match.group(1) if cond_match else "良"
 
-    df["race_id"] = race_id
+    df["race_id"] = str(race_id)
     df["distance"] = distance
     df["track_type"] = track_type
     df["track_condition"] = track_condition
     return df
 
+def find_column(df: pd.DataFrame, candidates: list) -> str:
+    """指定した候補名に部分一致するカラムを探す"""
+    for cand in candidates:
+        for col in df.columns:
+            if cand in col:
+                return col
+    return None
+
 def preprocess_for_inference(df: pd.DataFrame) -> pd.DataFrame:
-    """推論用の特徴量変換"""
+    """推論用の特徴量変換（カラム揺れを自動吸収）"""
     data = df.copy()
 
-    data["枠番"] = pd.to_numeric(data["枠番"], errors="coerce").fillna(0).astype(int)
-    data["馬番"] = pd.to_numeric(data["馬番"], errors="coerce").fillna(0).astype(int)
-    data["斤量"] = pd.to_numeric(data["斤量"], errors="coerce").fillna(55.0)
+    # 枠番
+    col_waku = find_column(data, ["枠番", "枠"])
+    data["枠番"] = pd.to_numeric(data[col_waku], errors="coerce").fillna(0).astype(int) if col_waku else 0
 
-    if "人気" in data.columns:
-        data["人気"] = pd.to_numeric(data["人気"], errors="coerce").fillna(10.0)
-    else:
-        data["人気"] = 10.0
+    # 馬番
+    col_uma = find_column(data, ["馬番", "馬"])
+    data["馬番"] = pd.to_numeric(data[col_uma], errors="coerce").fillna(0).astype(int) if col_uma else 0
 
-    sex_age_col = "性齢" if "性齢" in data.columns else "性/齢"
-    if sex_age_col in data.columns:
-        data["性別"] = data[sex_age_col].astype(str).str[0]
-        data["年齢"] = pd.to_numeric(data[sex_age_col].astype(str).str[1:], errors="coerce").fillna(3)
+    # 馬名
+    col_name = find_column(data, ["馬名"])
+    data["馬名"] = data[col_name].astype(str) if col_name else "馬名未設定"
+
+    # 斤量
+    col_kinryo = find_column(data, ["斤量", "負担重量"])
+    data["斤量"] = pd.to_numeric(data[col_kinryo], errors="coerce").fillna(55.0) if col_kinryo else 55.0
+
+    # 人気
+    col_ninki = find_column(data, ["人気"])
+    data["人気"] = pd.to_numeric(data[col_ninki], errors="coerce").fillna(10.0) if col_ninki else 10.0
+
+    # 性齢
+    col_sex_age = find_column(data, ["性齢", "性/齢"])
+    if col_sex_age:
+        data["性別"] = data[col_sex_age].astype(str).str[0]
+        data["年齢"] = pd.to_numeric(data[col_sex_age].astype(str).str[1:], errors="coerce").fillna(3)
     else:
         data["性別"] = "牡"
         data["年齢"] = 3
 
-    weight_col = "馬体重" if "馬体重" in data.columns else "体重"
+    # 馬体重
+    col_weight = find_column(data, ["馬体重", "体重"])
     def parse_weight(val):
         match = re.search(r"(\d+)(?:\(([-+]?\d+)\))?", str(val))
         if match:
@@ -98,8 +122,8 @@ def preprocess_for_inference(df: pd.DataFrame) -> pd.DataFrame:
             return w, diff
         return 470.0, 0.0
 
-    if weight_col in data.columns:
-        parsed = [parse_weight(w) for w in data[weight_col]]
+    if col_weight:
+        parsed = [parse_weight(w) for w in data[col_weight]]
         data["体重"] = [p[0] for p in parsed]
         data["体重増減"] = [p[1] for p in parsed]
     else:
@@ -126,7 +150,7 @@ def predict(race_id: str):
     if model is None:
         raise HTTPException(status_code=500, detail="モデルがロードされていません")
 
-    raw_df = fetch_shutuba_table(race_id)
+    raw_df = fetch_race_table(race_id)
     if raw_df.empty:
         raise HTTPException(status_code=404, detail="出馬表を取得できませんでした")
 
