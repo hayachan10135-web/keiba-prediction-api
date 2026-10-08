@@ -29,34 +29,34 @@ FEATURE_COLS = [
 ]
 
 def fetch_race_table(race_id: str) -> pd.DataFrame:
-    """出馬表または確定レース結果からテーブルを取得"""
+    """出馬表または確定結果ページからテーブルを取得"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # 1. まずは出馬表URLを試す
-    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    resp = requests.get(url, headers=headers, timeout=10)
+    # 1. 過去レース結果URL（db.netkeiba.com）を優先取得
+    url_db = f"https://db.netkeiba.com/race/{race_id}/"
+    resp = requests.get(url_db, headers=headers, timeout=10)
     resp.encoding = "EUC-JP"
     soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.find("table", class_="RaceTable01")
+    table = soup.find("table", class_="race_table_01")
 
-    # 2. なければ確定結果URLを試す
+    # 2. なければ当日の出馬表URL（race.netkeiba.com）
     if not table:
-        url = f"https://db.netkeiba.com/race/{race_id}/"
-        resp = requests.get(url, headers=headers, timeout=10)
+        url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+        resp = requests.get(url_shutuba, headers=headers, timeout=10)
         resp.encoding = "EUC-JP"
         soup = BeautifulSoup(resp.text, "html.parser")
-        table = soup.find("table", class_="race_table_01")
+        table = soup.find("table", class_="RaceTable01")
 
     if not table:
         return pd.DataFrame()
 
     df = pd.read_html(io.StringIO(str(table)))[0]
-    # カラム名に含まれる改行や全角・半角スペースを完全に除去
+    # カラム名に含まれる改行やスペースを完全に除去
     df.columns = [re.sub(r"\s+", "", str(c)) for c in df.columns]
 
-    # メタデータ抽出
+    # メタデータ
     intro_text = soup.get_text()
     dist_match = re.search(r"(芝|ダ|障).*?(\d{3,4})m", intro_text)
     track_type = dist_match.group(1) if dist_match else "芝"
@@ -71,49 +71,37 @@ def fetch_race_table(race_id: str) -> pd.DataFrame:
     df["track_condition"] = track_condition
     return df
 
-def find_column(df: pd.DataFrame, candidates: list) -> str:
-    """指定した候補名に部分一致するカラムを探す"""
+def get_col_val(df: pd.DataFrame, candidates: list, default=None):
+    """候補リストのいずれかに一致するカラムが存在すればそのSeriesを返し、なければデフォルト値を返す"""
     for cand in candidates:
         for col in df.columns:
             if cand in col:
-                return col
-    return None
+                return df[col]
+    return pd.Series([default] * len(df))
 
 def preprocess_for_inference(df: pd.DataFrame) -> pd.DataFrame:
-    """推論用の特徴量変換（カラム揺れを自動吸収）"""
+    """推論用の特徴量変換"""
     data = df.copy()
 
-    # 枠番
-    col_waku = find_column(data, ["枠番", "枠"])
-    data["枠番"] = pd.to_numeric(data[col_waku], errors="coerce").fillna(0).astype(int) if col_waku else 0
-
-    # 馬番
-    col_uma = find_column(data, ["馬番", "馬"])
-    data["馬番"] = pd.to_numeric(data[col_uma], errors="coerce").fillna(0).astype(int) if col_uma else 0
-
     # 馬名
-    col_name = find_column(data, ["馬名"])
-    data["馬名"] = data[col_name].astype(str) if col_name else "馬名未設定"
+    col_name = get_col_val(data, ["馬名"], "未設定")
+    data["馬名"] = col_name.astype(str)
 
-    # 斤量
-    col_kinryo = find_column(data, ["斤量", "負担重量"])
-    data["斤量"] = pd.to_numeric(data[col_kinryo], errors="coerce").fillna(55.0) if col_kinryo else 55.0
+    # 枠番・馬番・斤量
+    data["枠番"] = pd.to_numeric(get_col_val(data, ["枠番", "枠"], 0), errors="coerce").fillna(0).astype(int)
+    data["馬番"] = pd.to_numeric(get_col_val(data, ["馬番", "馬"], 0), errors="coerce").fillna(0).astype(int)
+    data["斤量"] = pd.to_numeric(get_col_val(data, ["斤量", "負担重量"], 55.0), errors="coerce").fillna(55.0)
 
     # 人気
-    col_ninki = find_column(data, ["人気"])
-    data["人気"] = pd.to_numeric(data[col_ninki], errors="coerce").fillna(10.0) if col_ninki else 10.0
+    data["人気"] = pd.to_numeric(get_col_val(data, ["人気"], 10.0), errors="coerce").fillna(10.0)
 
     # 性齢
-    col_sex_age = find_column(data, ["性齢", "性/齢"])
-    if col_sex_age:
-        data["性別"] = data[col_sex_age].astype(str).str[0]
-        data["年齢"] = pd.to_numeric(data[col_sex_age].astype(str).str[1:], errors="coerce").fillna(3)
-    else:
-        data["性別"] = "牡"
-        data["年齢"] = 3
+    sex_age_s = get_col_val(data, ["性齢", "性/齢"], "牡3").astype(str)
+    data["性別"] = sex_age_s.str[0]
+    data["年齢"] = pd.to_numeric(sex_age_s.str[1:], errors="coerce").fillna(3)
 
     # 馬体重
-    col_weight = find_column(data, ["馬体重", "体重"])
+    weight_s = get_col_val(data, ["馬体重", "体重"], "470(0)").astype(str)
     def parse_weight(val):
         match = re.search(r"(\d+)(?:\(([-+]?\d+)\))?", str(val))
         if match:
@@ -122,13 +110,9 @@ def preprocess_for_inference(df: pd.DataFrame) -> pd.DataFrame:
             return w, diff
         return 470.0, 0.0
 
-    if col_weight:
-        parsed = [parse_weight(w) for w in data[col_weight]]
-        data["体重"] = [p[0] for p in parsed]
-        data["体重増減"] = [p[1] for p in parsed]
-    else:
-        data["体重"] = 470.0
-        data["体重増減"] = 0.0
+    parsed = [parse_weight(w) for w in weight_s]
+    data["体重"] = [p[0] for p in parsed]
+    data["体重増減"] = [p[1] for p in parsed]
 
     track_map = {"芝": 1, "ダ": 2, "障": 3}
     cond_map = {"良": 1, "稍重": 2, "重": 3, "不良": 4}
@@ -157,8 +141,11 @@ def predict(race_id: str):
     df_inf = preprocess_for_inference(raw_df)
     X = df_inf[FEATURE_COLS]
 
+    # スコア推論
     scores = model.predict(X)
     df_inf["prediction_score"] = scores
+
+    # スコアが高い順にソート
     df_sorted = df_inf.sort_values(by="prediction_score", ascending=False).reset_index(drop=True)
 
     marks = ["◎", "○", "▲", "△", "☆"]
