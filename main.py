@@ -171,6 +171,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
 
 # --- 3. 出走表取得・LightGBM推論・買い目レコメンド (GET /predict/{race_id}) ---
 def fetch_shutuba_table(race_id: str):
+    # 1. 出馬表HTMLから基本情報（馬名、馬番、枠番、斤量、騎手）を取得
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
@@ -181,6 +182,23 @@ def fetch_shutuba_table(race_id: str):
 
     race_title_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = race_title_tag.get_text(strip=True) if race_title_tag else f"Race {race_id}"
+
+    # 2. netkeiba専用オッズAPIからリアルタイム単勝オッズ・人気を取得
+    odds_map = {}
+    try:
+        odds_api_url = f"https://race.netkeiba.com/api/api_get_jra_odds.php?race_id={race_id}&type=1"
+        odds_resp = requests.get(odds_api_url, headers=HEADERS_PC, timeout=5)
+        odds_json = odds_resp.json()
+        
+        # 単勝オッズデータ: "1" 配列に各馬番の [オッズ, 人気] が入る
+        tansho_data = odds_json.get("data", {}).get("odds", {}).get("1", {})
+        for u_str, val in tansho_data.items():
+            u_num = int(u_str)
+            o_val = float(val[0]) if val and val[0] and val[0] != "---" else None
+            p_val = int(val[1]) if len(val) > 1 and val[1] and str(val[1]).isdigit() else None
+            odds_map[u_num] = {"odds": o_val, "popularity": p_val}
+    except Exception as e:
+        print(f"オッズAPI取得スキップ ({race_id}): {e}")
 
     horses = []
     rows = soup.select("tr.HorseList, table.Shutuba_Table tbody tr")
@@ -211,24 +229,24 @@ def fetch_shutuba_table(race_id: str):
             if km:
                 kinryo = float(km.group(1))
 
-        # --- オッズの取得（セレクタを拡充・IDセレクタ対応） ---
-        odds = None
-        # 1. 発売中のspan (idがodds-1_で始まるもの、またはクラス指定)
-        odds_tag = row.select_one("span[id^='odds-'], .Popular, td[class*='Popular'], .Odds, td.Txt_R")
-        if odds_tag:
-            odds_text = odds_tag.get_text(strip=True)
-            # 「---」や「取消」を除外し、数値（例: 2.5）を正規表現で抽出
-            om = re.search(r"(\d+\.\d+)", odds_text)
-            if om:
-                odds = float(om.group(1))
+        # オッズAPIから取得した値を結合（APIに無ければHTMLからフォールバック取得）
+        odds_info = odds_map.get(umaban, {})
+        odds = odds_info.get("odds")
+        popularity = odds_info.get("popularity")
 
-        # --- 人気の取得 ---
-        popularity = None
-        pop_tag = row.select_one(".Ninki, span.Ninki, td[class*='Ninki']")
-        if pop_tag:
-            pop_match = re.search(r"\d+", pop_tag.get_text(strip=True))
-            if pop_match:
-                popularity = int(pop_match.group())
+        if odds is None:
+            odds_tag = row.select_one("span[id^='odds-'], .Popular, td[class*='Popular'], .Odds, td.Txt_R")
+            if odds_tag:
+                om = re.search(r"(\d+\.\d+)", odds_tag.get_text(strip=True))
+                if om:
+                    odds = float(om.group(1))
+
+        if popularity is None:
+            pop_tag = row.select_one(".Ninki, span.Ninki, td[class*='Ninki']")
+            if pop_tag:
+                pop_match = re.search(r"\d+", pop_tag.get_text(strip=True))
+                if pop_match:
+                    popularity = int(pop_match.group())
 
         horses.append({
             "umaban": umaban,
