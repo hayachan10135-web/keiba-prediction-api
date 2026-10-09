@@ -7,8 +7,9 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Keiba Prediction API")
 
+# モバイル用User-Agentで静的HTMLを確実に取得
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 }
 
 # --- 1. UptimeRobot用のヘルスチェック (GET /) ---
@@ -18,62 +19,73 @@ def health_check():
     return {"status": "ok", "message": "Keiba Prediction API is running"}
 
 
-# --- netkeiba開催HTMLパース用ヘルパー関数 ---
-def parse_netkeiba_page(soup: BeautifulSoup):
+# --- netkeiba SP版開催パース用ヘルパー関数 ---
+def parse_netkeiba_sp_page(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
     venues_data = []
 
-    # パターン1: race_list.html 用のセレクタ (.RaceList_Box)
-    kaisai_boxes = soup.select(".RaceList_Box")
+    # 会場ごとの開催ブロックを取得
+    kaisai_blocks = soup.select(".RaceList_DataBox, .KaisaiBlock, .RaceList")
     
-    # パターン2: top ページ用のセレクタ (.RaceList_DataBox)
-    if not kaisai_boxes:
-        kaisai_boxes = soup.select(".RaceList_DataBox")
+    # リンクから race_id を含むものすべてを走査
+    race_links = soup.find_all("a", href=re.compile(r"race_id=(\d{12})"))
+    if not race_links:
+        return []
 
-    for box in kaisai_boxes:
-        # 開催会場タイトル（例: "4回 東京 1日目"）
-        title_tag = box.select_one(".RaceList_DataTitle, .RaceList_DataTitle_Box")
-        venue_title = title_tag.get_text(strip=True) if title_tag else "中央開催"
+    # race_id ごとにグループ化
+    # race_id の 5〜6文字目が競馬場コード (01:札幌 ... 10:小倉)
+    VENUE_CODE_MAP = {
+        "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+        "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
+    }
 
-        races = []
-        # レース項目抽出
-        for race_item in box.select("li.RaceList_DataItem, .RaceList_DataList li"):
-            num_tag = race_item.select_one(".Race_Num span, .RaceNum")
-            race_num = num_tag.get_text(strip=True) if num_tag else ""
+    venue_races_map = {}
+    seen_ids = set()
 
-            name_tag = race_item.select_one(".ItemTitle, .RaceName")
-            race_name = name_tag.get_text(strip=True) if name_tag else ""
+    for a in race_links:
+        href = a["href"]
+        m = re.search(r"race_id=(\d{12})", href)
+        if not m:
+            continue
+        race_id = m.group(1)
+        if race_id in seen_ids:
+            continue
+        seen_ids.add(race_id)
 
-            info_tag = race_item.select_one(".RaceData, .RaceData01")
-            race_info = info_tag.get_text(separator=" ", strip=True) if info_tag else ""
+        v_code = race_id[4:6]
+        venue_name = VENUE_CODE_MAP.get(v_code, "中央開催")
+        race_num_int = int(race_id[10:12])
+        race_no = f"{race_num_int}R"
 
-            # リンクから12桁の race_id を抽出
-            link_tag = race_item.select_one("a")
-            race_id = ""
-            if link_tag and "href" in link_tag.attrs:
-                m = re.search(r"race_id=(\d{12})", link_tag["href"])
-                if m:
-                    race_id = m.group(1)
+        # テキストからレース名等の取得を試みる
+        raw_text = a.get_text(separator=" ", strip=True)
+        # 不要な改行や重複スペースを整理
+        clean_text = " ".join(raw_text.split())
 
-            if race_id:
-                races.append({
-                    "race_no": race_num,
-                    "race_id": race_id,
-                    "race_name": race_name,
-                    "race_info": race_info
-                })
+        if venue_name not in venue_races_map:
+            venue_races_map[venue_name] = []
 
-        if races:
-            venues_data.append({
-                "venue_name": venue_title,
-                "races": races
-            })
+        venue_races_map[venue_name].append({
+            "race_no": race_no,
+            "race_id": race_id,
+            "race_name": clean_text if clean_text else f"{race_no}",
+            "race_info": ""
+        })
+
+    for v_name, r_list in venue_races_map.items():
+        # レース番号順にソート
+        r_list.sort(key=lambda x: int(x["race_id"][10:12]))
+        venues_data.append({
+            "venue_name": v_name,
+            "races": r_list
+        })
 
     return venues_data
 
 
 # --- 2. Step 3-2: 当日・直近週末開催レース一覧取得 (GET /races/today) ---
 @app.get("/races/today")
-def get_today_races(date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)。未指定時は直近の開催日を自動検索")):
+def get_today_races(date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)")):
     """
     当日または直近週末の開催競馬場および全レース一覧を取得するエンドポイント
     """
@@ -83,25 +95,29 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
         clean_date = date.replace("-", "")
         target_dates = [clean_date]
     else:
-        # 今日から直近7日間を対象に探索（土日開催を確実にキャッチ）
+        # 今日から直近7日間を対象に探索
         target_dates = [
             (today + datetime.timedelta(days=i)).strftime("%Y%m%d")
             for i in range(7)
         ]
 
     for d_str in target_dates:
-        # 枠順確定一覧ページ（race_list.html）を優先参照
+        # SP版のレース一覧URL
         urls = [
-            f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d_str}",
-            f"https://race.netkeiba.com/top/?kaisai_date={d_str}"
+            f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={d_str}",
+            f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d_str}"
         ]
 
         for url in urls:
             try:
                 resp = requests.get(url, headers=HEADERS, timeout=10)
-                resp.encoding = "euc-jp"
-                soup = BeautifulSoup(resp.text, "html.parser")
-                venues = parse_netkeiba_page(soup)
+                # SP版はutf-8 / euc-jpの自動判別
+                try:
+                    text = resp.content.decode("euc-jp")
+                except UnicodeDecodeError:
+                    text = resp.content.decode("utf-8", errors="replace")
+
+                venues = parse_netkeiba_sp_page(text)
 
                 if venues:
                     formatted_date = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
