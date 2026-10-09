@@ -1,167 +1,94 @@
-import io
+import datetime
 import re
 import requests
-import pandas as pd
-import lightgbm as lgb
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Keiba Prediction API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
 
-MODEL_PATH = "horse_ranker_model.txt"
-try:
-    model = lgb.Booster(model_file=MODEL_PATH)
-except Exception as e:
-    model = None
-    print(f"モデルのロードに失敗しました: {e}")
-
-FEATURE_COLS = [
-    "枠番", "馬番", "斤量", "人気", "sex_code", "年齢", 
-    "体重", "体重増減", "distance", "track_type_code", "condition_code"
-]
-
-def fetch_race_table(race_id: str) -> pd.DataFrame:
-    """出馬表または確定結果ページからテーブルを取得"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    # 1. 過去レース結果URL（db.netkeiba.com）を優先取得
-    url_db = f"https://db.netkeiba.com/race/{race_id}/"
-    resp = requests.get(url_db, headers=headers, timeout=10)
-    resp.encoding = "EUC-JP"
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.find("table", class_="race_table_01")
-
-    # 2. なければ当日の出馬表URL（race.netkeiba.com）
-    if not table:
-        url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-        resp = requests.get(url_shutuba, headers=headers, timeout=10)
-        resp.encoding = "EUC-JP"
-        soup = BeautifulSoup(resp.text, "html.parser")
-        table = soup.find("table", class_="RaceTable01")
-
-    if not table:
-        return pd.DataFrame()
-
-    df = pd.read_html(io.StringIO(str(table)))[0]
-    # カラム名に含まれる改行やスペースを完全に除去
-    df.columns = [re.sub(r"\s+", "", str(c)) for c in df.columns]
-
-    # メタデータ
-    intro_text = soup.get_text()
-    dist_match = re.search(r"(芝|ダ|障).*?(\d{3,4})m", intro_text)
-    track_type = dist_match.group(1) if dist_match else "芝"
-    distance = int(dist_match.group(2)) if dist_match else 1600
-
-    cond_match = re.search(r"(?:芝|ダート|障)\s*:\s*(\w+)", intro_text)
-    track_condition = cond_match.group(1) if cond_match else "良"
-
-    df["race_id"] = str(race_id)
-    df["distance"] = distance
-    df["track_type"] = track_type
-    df["track_condition"] = track_condition
-    return df
-
-def get_col_val(df: pd.DataFrame, candidates: list, default=None):
-    """候補リストのいずれかに一致するカラムが存在すればそのSeriesを返し、なければデフォルト値を返す"""
-    for cand in candidates:
-        for col in df.columns:
-            if cand in col:
-                return df[col]
-    return pd.Series([default] * len(df))
-
-def preprocess_for_inference(df: pd.DataFrame) -> pd.DataFrame:
-    """推論用の特徴量変換"""
-    data = df.copy()
-
-    # 馬名
-    col_name = get_col_val(data, ["馬名"], "未設定")
-    data["馬名"] = col_name.astype(str)
-
-    # 枠番・馬番・斤量
-    data["枠番"] = pd.to_numeric(get_col_val(data, ["枠番", "枠"], 0), errors="coerce").fillna(0).astype(int)
-    data["馬番"] = pd.to_numeric(get_col_val(data, ["馬番", "馬"], 0), errors="coerce").fillna(0).astype(int)
-    data["斤量"] = pd.to_numeric(get_col_val(data, ["斤量", "負担重量"], 55.0), errors="coerce").fillna(55.0)
-
-    # 人気
-    data["人気"] = pd.to_numeric(get_col_val(data, ["人気"], 10.0), errors="coerce").fillna(10.0)
-
-    # 性齢
-    sex_age_s = get_col_val(data, ["性齢", "性/齢"], "牡3").astype(str)
-    data["性別"] = sex_age_s.str[0]
-    data["年齢"] = pd.to_numeric(sex_age_s.str[1:], errors="coerce").fillna(3)
-
-    # 馬体重
-    weight_s = get_col_val(data, ["馬体重", "体重"], "470(0)").astype(str)
-    def parse_weight(val):
-        match = re.search(r"(\d+)(?:\(([-+]?\d+)\))?", str(val))
-        if match:
-            w = float(match.group(1))
-            diff = float(match.group(2)) if match.group(2) else 0.0
-            return w, diff
-        return 470.0, 0.0
-
-    parsed = [parse_weight(w) for w in weight_s]
-    data["体重"] = [p[0] for p in parsed]
-    data["体重増減"] = [p[1] for p in parsed]
-
-    track_map = {"芝": 1, "ダ": 2, "障": 3}
-    cond_map = {"良": 1, "稍重": 2, "重": 3, "不良": 4}
-    sex_map = {"牡": 1, "牝": 2, "セ": 3}
-
-    data["track_type_code"] = data["track_type"].map(track_map).fillna(1).astype(int)
-    data["condition_code"] = data["track_condition"].map(cond_map).fillna(1).astype(int)
-    data["sex_code"] = data["性別"].map(sex_map).fillna(1).astype(int)
-    data["distance"] = pd.to_numeric(data["distance"], errors="coerce").fillna(1600).astype(int)
-
-    return data
-
+# --- 1. UptimeRobot用のヘルスチェック (GET /) ---
 @app.get("/")
-def root():
+def health_check():
+    """死活監視・常時起動用のエンドポイント"""
     return {"status": "ok", "message": "Keiba Prediction API is running"}
 
-@app.get("/predict/{race_id}")
-def predict(race_id: str):
-    if model is None:
-        raise HTTPException(status_code=500, detail="モデルがロードされていません")
 
-    raw_df = fetch_race_table(race_id)
-    if raw_df.empty:
-        raise HTTPException(status_code=404, detail="出馬表を取得できませんでした")
+# --- 2. Step 3-2: 当日開催・レース一覧取得 (GET /races/today) ---
+@app.get("/races/today")
+def get_today_races():
+    """
+    当日（または直近開催日）の開催競馬場および全レース一覧を取得するエンドポイント
+    """
+    url = "https://race.netkeiba.com/top/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        # netkeibaのHTMLエンコーディングに対応
+        resp.encoding = "euc-jp"
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"netkeibaへのアクセスに失敗しました: {e}")
 
-    df_inf = preprocess_for_inference(raw_df)
-    X = df_inf[FEATURE_COLS]
+    venues_data = []
 
-    # スコア推論
-    scores = model.predict(X)
-    df_inf["prediction_score"] = scores
+    # netkeibaトップの各開催場ブロック（東京、京都など）を取得
+    kaisai_blocks = soup.select(".RaceList_DataBox")
 
-    # スコアが高い順にソート
-    df_sorted = df_inf.sort_values(by="prediction_score", ascending=False).reset_index(drop=True)
+    # 平日などで開催ブロックがない場合
+    if not kaisai_blocks:
+        return {
+            "date": datetime.date.today().strftime("%Y-%m-%d"),
+            "message": "現在、中央競馬の開催情報はありません。",
+            "venues": []
+        }
 
-    marks = ["◎", "○", "▲", "△", "☆"]
-    predictions = []
-    for rank, row in df_sorted.iterrows():
-        predictions.append({
-            "predicted_rank": rank + 1,
-            "mark": marks[rank] if rank < len(marks) else "−",
-            "umaban": int(row["馬番"]),
-            "wakuban": int(row["枠番"]),
-            "horse_name": str(row["馬名"]),
-            "score": round(float(row["prediction_score"]), 4)
-        })
+    for block in kaisai_blocks:
+        # 開催タイトル（例: "4回 東京 1日目"）
+        title_tag = block.select_one(".RaceList_DataTitle")
+        venue_title = title_tag.get_text(strip=True) if title_tag else "中央開催"
+
+        races = []
+        for race_item in block.select("li.RaceList_DataItem"):
+            # レース番号（例: "1R"）
+            num_tag = race_item.select_one(".Race_Num span")
+            race_num = num_tag.get_text(strip=True) if num_tag else ""
+
+            # レース名（例: "2歳未勝利"）
+            name_tag = race_item.select_one(".ItemTitle")
+            race_name = name_tag.get_text(strip=True) if name_tag else ""
+
+            # 発走時刻・距離など（例: "10:05発走 / 芝1600m"）
+            info_tag = race_item.select_one(".RaceData")
+            race_info = info_tag.get_text(separator=" ", strip=True) if info_tag else ""
+
+            # リンクから12桁の race_id を抽出
+            link_tag = race_item.select_one("a")
+            race_id = ""
+            if link_tag and "href" in link_tag.attrs:
+                m = re.search(r"race_id=(\d{12})", link_tag["href"])
+                if m:
+                    race_id = m.group(1)
+
+            if race_id:
+                races.append({
+                    "race_no": race_num,
+                    "race_id": race_id,
+                    "race_name": race_name,
+                    "race_info": race_info
+                })
+
+        if races:
+            venues_data.append({
+                "venue_name": venue_title,
+                "races": races
+            })
 
     return {
-        "race_id": race_id,
-        "count": len(predictions),
-        "predictions": predictions
+        "date": datetime.date.today().strftime("%Y-%m-%d"),
+        "venues": venues_data
     }
+
+# 既存の /predict などのエンドポイントはそのまま維持してください
