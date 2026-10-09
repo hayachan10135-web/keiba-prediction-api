@@ -2,6 +2,7 @@ from typing import List, Optional
 import os
 import datetime
 import re
+import json
 import requests
 import lightgbm as lgb
 import pandas as pd
@@ -162,8 +163,12 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 3. 出馬表テーブル ＆ オッズAPIからデータ統合 ---
+# --- 3. 出馬表テーブル ＆ オッズ取得 ---
 def fetch_shutuba_table(race_id: str):
+    print(f"\n==========================================")
+    print(f"[DEBUG] レースデータ取得開始: race_id={race_id}")
+    
+    # 1. 出馬表から馬基本情報
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
@@ -174,29 +179,89 @@ def fetch_shutuba_table(race_id: str):
 
     race_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
+    print(f"[DEBUG] レース名: {race_name}")
 
-    # netkeiba オッズ取得API
+    # 2. netkeiba オッズAPI呼び出し
     odds_map = {}
+    odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&output=json"
+    print(f"[DEBUG] オッズAPIリクエスト: {odds_url}")
+    
     try:
-        odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1"
         oresp = requests.get(odds_url, headers=HEADERS_PC, timeout=5)
-        odata = oresp.json()
-        tansho_dict = odata.get("data", {}).get("odds", {}).get("1", {})
-        for u_str, val in tansho_dict.items():
-            if isinstance(val, list) and len(val) >= 1:
-                o_text = str(val[0])
-                if o_text and o_text != "---":
-                    try:
-                        o_val = float(o_text)
-                        p_val = int(val[1]) if len(val) > 1 and str(val[1]).isdigit() else None
-                        odds_map[int(u_str)] = {"odds": o_val, "popularity": p_val}
-                    except ValueError:
-                        pass
+        print(f"[DEBUG] オッズAPIステータスコード: {oresp.status_code}")
+        print(f"[DEBUG] オッズAPIレスポンス先頭200文字: {oresp.text[:200]}")
+        
+        try:
+            raw_res = oresp.json()
+        except Exception:
+            raw_res = json.loads(oresp.text)
+
+        if isinstance(raw_res, str):
+            raw_res = json.loads(raw_res)
+
+        print(f"[DEBUG] パース後JSONの型: {type(raw_res)}")
+        if isinstance(raw_res, dict):
+            print(f"[DEBUG] JSONキー一覧: {list(raw_res.keys())}")
+            # data -> odds -> 1
+            data_block = raw_res.get("data", {})
+            if isinstance(data_block, str):
+                data_block = json.loads(data_block)
+            
+            odds_block = data_block.get("odds", {})
+            tansho_dict = odds_block.get("1", {})
+            print(f"[DEBUG] 単勝データ件数: {len(tansho_dict)}")
+
+            for u_str, val in tansho_dict.items():
+                if isinstance(val, list) and len(val) >= 1:
+                    o_text = str(val[0]).strip()
+                    if o_text and o_text != "---":
+                        try:
+                            o_val = float(o_text)
+                            p_val = int(val[1]) if len(val) > 1 and str(val[1]).isdigit() else None
+                            odds_map[int(u_str)] = {"odds": o_val, "popularity": p_val}
+                        except ValueError:
+                            pass
+        print(f"[DEBUG] オッズAPIから取得成功した馬番数: {len(odds_map)} (サンプル: {dict(list(odds_map.items())[:3])})")
     except Exception as e:
-        print(f"オッズAPI取得スキップ ({race_id}): {e}")
+        print(f"[DEBUG EXCEPTION] オッズAPI取得失敗: {type(e).__name__} - {e}")
+
+    # 3. HTMLフォールバック (APIが0件だった場合)
+    if not odds_map:
+        print(f"[DEBUG] APIから取得できなかったため、HTMLフォールバックを実行します...")
+        try:
+            b1_url = f"https://race.netkeiba.com/odds/index.html?race_id={race_id}&type=b1"
+            b1_resp = requests.get(b1_url, headers=HEADERS_PC, timeout=5)
+            try:
+                b1_html = b1_resp.content.decode("euc-jp")
+            except UnicodeDecodeError:
+                b1_html = b1_resp.content.decode("utf-8", errors="replace")
+            b1_soup = BeautifulSoup(b1_html, "html.parser")
+
+            for tr in b1_soup.select("tr"):
+                u_td = tr.select_one("td.Umaban, td[class*='Umaban']")
+                o_td = tr.select_one("td.Odds, td[class*='Odds']")
+                p_td = tr.select_one("td.Ninki, td[class*='Ninki']")
+                if u_td and o_td:
+                    u_txt = u_td.get_text(strip=True)
+                    o_txt = o_td.get_text(strip=True)
+                    if u_txt.isdigit():
+                        u_num = int(u_txt)
+                        om = re.search(r"(\d+\.\d+)", o_txt)
+                        if om:
+                            o_val = float(om.group(1))
+                            p_val = None
+                            if p_td:
+                                pm = re.search(r"(\d+)", p_td.get_text(strip=True))
+                                if pm:
+                                    p_val = int(pm.group(1))
+                            odds_map[u_num] = {"odds": o_val, "popularity": p_val}
+            print(f"[DEBUG] HTMLフォールバックで取得できた馬番数: {len(odds_map)}")
+        except Exception as e:
+            print(f"[DEBUG EXCEPTION] HTMLフォールバック失敗: {e}")
 
     horses = []
     rows = soup.select("tr.HorseList")
+    print(f"[DEBUG] 出馬表テーブル行数: {len(rows)}")
 
     for row in rows:
         umaban_tag = row.select_one("td.Umaban, td[class*='Umaban']")
@@ -237,6 +302,11 @@ def fetch_shutuba_table(race_id: str):
             "odds": odds,
             "popularity": popularity
         })
+
+    print(f"[DEBUG] 最終抽出完了頭数: {len(horses)}")
+    if horses:
+        print(f"[DEBUG] 先頭馬データ: {horses[0]}")
+    print(f"==========================================\n")
 
     return race_name, sorted(horses, key=lambda x: x["umaban"])
 
