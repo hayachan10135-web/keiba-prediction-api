@@ -211,16 +211,24 @@ def fetch_shutuba_table(race_id: str):
             if km:
                 kinryo = float(km.group(1))
 
-        odds_tag = row.select_one(".Popular, td[class*='Popular'], .Odds")
+        # --- オッズの取得（セレクタを拡充・IDセレクタ対応） ---
         odds = None
+        # 1. 発売中のspan (idがodds-1_で始まるもの、またはクラス指定)
+        odds_tag = row.select_one("span[id^='odds-'], .Popular, td[class*='Popular'], .Odds, td.Txt_R")
         if odds_tag:
-            om = re.search(r"(\d+(?:\.\d+)?)", odds_tag.get_text(strip=True))
+            odds_text = odds_tag.get_text(strip=True)
+            # 「---」や「取消」を除外し、数値（例: 2.5）を正規表現で抽出
+            om = re.search(r"(\d+\.\d+)", odds_text)
             if om:
                 odds = float(om.group(1))
 
-        pop_tag = row.select_one(".Ninki, span.Ninki")
-        pop_match = re.search(r"\d+", pop_tag.get_text(strip=True)) if pop_tag else None
-        popularity = int(pop_match.group()) if pop_match else None
+        # --- 人気の取得 ---
+        popularity = None
+        pop_tag = row.select_one(".Ninki, span.Ninki, td[class*='Ninki']")
+        if pop_tag:
+            pop_match = re.search(r"\d+", pop_tag.get_text(strip=True))
+            if pop_match:
+                popularity = int(pop_match.group())
 
         horses.append({
             "umaban": umaban,
