@@ -1,8 +1,9 @@
+from typing import Optional
 import datetime
 import re
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Keiba Prediction API")
 
@@ -17,36 +18,12 @@ def health_check():
     return {"status": "ok", "message": "Keiba Prediction API is running"}
 
 
-# --- 2. Step 3-2: 当日開催・レース一覧取得 (GET /races/today) ---
-@app.get("/races/today")
-def get_today_races():
-    """
-    当日（または直近開催日）の開催競馬場および全レース一覧を取得するエンドポイント
-    """
-    url = "https://race.netkeiba.com/top/"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        # netkeibaのHTMLエンコーディングに対応
-        resp.encoding = "euc-jp"
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"netkeibaへのアクセスに失敗しました: {e}")
-
+# --- netkeiba開催HTMLパース用ヘルパー関数 ---
+def parse_netkeiba_kaisai_page(soup: BeautifulSoup):
     venues_data = []
-
-    # netkeibaトップの各開催場ブロック（東京、京都など）を取得
     kaisai_blocks = soup.select(".RaceList_DataBox")
 
-    # 平日などで開催ブロックがない場合
-    if not kaisai_blocks:
-        return {
-            "date": datetime.date.today().strftime("%Y-%m-%d"),
-            "message": "現在、中央競馬の開催情報はありません。",
-            "venues": []
-        }
-
     for block in kaisai_blocks:
-        # 開催タイトル（例: "4回 東京 1日目"）
         title_tag = block.select_one(".RaceList_DataTitle")
         venue_title = title_tag.get_text(strip=True) if title_tag else "中央開催"
 
@@ -86,9 +63,49 @@ def get_today_races():
                 "races": races
             })
 
-    return {
-        "date": datetime.date.today().strftime("%Y-%m-%d"),
-        "venues": venues_data
-    }
+    return venues_data
 
-# 既存の /predict などのエンドポイントはそのまま維持してください
+
+# --- 2. Step 3-2: 当日・直近週末開催レース一覧取得 (GET /races/today) ---
+@app.get("/races/today")
+def get_today_races(date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)。未指定時は直近の開催日を自動検索")):
+    """
+    当日または直近週末（明日・明後日）の開催競馬場および全レース一覧を取得するエンドポイント
+    """
+    today = datetime.date.today()
+
+    # 日付パラメータ指定がある場合
+    if date:
+        clean_date = date.replace("-", "")
+        target_dates = [clean_date]
+    else:
+        # 未指定時は「今日 → 明日 → 明後日」の順に探索
+        target_dates = [
+            (today + datetime.timedelta(days=i)).strftime("%Y%m%d")
+            for i in range(3)
+        ]
+
+    for d_str in target_dates:
+        url = f"https://race.netkeiba.com/top/?kaisai_date={d_str}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            resp.encoding = "euc-jp"
+            soup = BeautifulSoup(resp.text, "html.parser")
+            venues = parse_netkeiba_kaisai_page(soup)
+
+            # 開催データが見つかればその日付で返却
+            if venues:
+                formatted_date = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
+                return {
+                    "date": formatted_date,
+                    "venues": venues
+                }
+        except Exception:
+            continue
+
+    # 直近3日間すべて開催がない場合
+    return {
+        "date": today.strftime("%Y-%m-%d"),
+        "message": "直近の開催情報（出馬表）が見つかりませんでした。",
+        "venues": []
+    }
