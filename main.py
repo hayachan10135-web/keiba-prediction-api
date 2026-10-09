@@ -164,7 +164,6 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
 
 # --- 3. 出馬表テーブル ＆ オッズAPIからデータ統合 ---
 def fetch_shutuba_table(race_id: str):
-    # 1. 出馬表から馬基本情報
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
@@ -176,7 +175,7 @@ def fetch_shutuba_table(race_id: str):
     race_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
 
-    # 2. netkeiba オッズ取得API（.htmlエンドポイント）からリアルタイムオッズ・人気を取得
+    # netkeiba オッズ取得API
     odds_map = {}
     try:
         odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1"
@@ -225,7 +224,6 @@ def fetch_shutuba_table(race_id: str):
             if km:
                 kinryo = float(km.group(1))
 
-        # オッズ・人気
         odds_item = odds_map.get(umaban, {})
         odds = odds_item.get("odds")
         popularity = odds_item.get("popularity")
@@ -245,7 +243,11 @@ def fetch_shutuba_table(race_id: str):
 
 def build_prediction_and_recs(race_name: str, horses: List[dict]) -> dict:
     if not horses:
-        return {"race_name": race_name, "horses": [], "recommendations": {"tansho": [], "fukusho": [], "umaren": [], "wide": [], "sanrenpuku": []}}
+        return {
+            "race_name": race_name,
+            "horses": [],
+            "recommendations": {"tansho": [], "fukusho": [], "umaren": [], "wide": [], "sanrenpuku": []}
+        }
 
     feature_rows = []
     for h in horses:
@@ -288,4 +290,40 @@ def build_prediction_and_recs(race_name: str, horses: List[dict]) -> dict:
         opponents = [taiko] + ([kuro] if kuro else []) + osae
         recs["umaren"] = [f"{honmei}-{opp}" for opp in opponents]
         recs["wide"] = [f"{honmei}-{opp}" for opp in opponents[:3]]
-        second_tier = [str(x) for x in
+        
+        second_tier_list = [str(x) for x in ([taiko] + ([kuro] if kuro else []))]
+        third_tier_list = [str(x) for x in opponents]
+        second_tier_str = ",".join(second_tier_list)
+        third_tier_str = ",".join(third_tier_list)
+        recs["sanrenpuku"] = [f"{honmei} - {second_tier_str} - {third_tier_str}"]
+
+    horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
+
+    return {
+        "race_name": race_name,
+        "horses": horses_sorted_by_num,
+        "recommendations": recs
+    }
+
+
+@app.get("/predict/{race_id}", response_model=PredictResponse)
+def predict_race(race_id: str):
+    if len(race_id) != 12 or not race_id.isdigit():
+        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
+
+    try:
+        race_name, horses = fetch_shutuba_table(race_id)
+        if not horses:
+            raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
+
+        result = build_prediction_and_recs(race_name, horses)
+        return {
+            "race_id": race_id,
+            "race_name": result["race_name"],
+            "horses": result["horses"],
+            "recommendations": result["recommendations"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
