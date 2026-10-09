@@ -161,7 +161,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 3. PC版出馬表から馬情報・オッズ・人気を正確にスクレイピング ---
+# --- 3. PC版出馬表から馬情報・オッズ・人気をスクレイピング ---
 def fetch_shutuba_table(race_id: str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
@@ -175,7 +175,6 @@ def fetch_shutuba_table(race_id: str):
     race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
 
     horses = []
-    # PC版出馬表テーブルの出走馬行のみを抽出
     rows = soup.select("tr.HorseList")
 
     for row in rows:
@@ -185,16 +184,19 @@ def fetch_shutuba_table(race_id: str):
             continue
         umaban = int(umaban_tag.get_text(strip=True))
 
-        # 枠番
+        # 枠番 (安全に抽出)
+        wakuban = 1
         waku_tag = row.select_one("td.Waku, td[class*='Waku']")
-        w_match = re.search(r"\d+", waku_tag.get_text(strip=True)) if waku_tag else None
-        wakuban = int(w_match.group()) if waku_match else 1
+        if waku_tag:
+            wm = re.search(r"\d+", waku_tag.get_text(strip=True))
+            if wm:
+                wakuban = int(wm.group())
 
-        # 馬名（aタグ内の純粋な馬名のみ抽出）
+        # 馬名
         name_tag = row.select_one(".HorseName a, .Horse_Info a")
         horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
 
-        # 騎手（aタグ内の純粋な騎手名のみ抽出）
+        # 騎手
         jockey_tag = row.select_one(".Jockey a")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
 
@@ -234,7 +236,6 @@ def fetch_shutuba_table(race_id: str):
             "popularity": popularity
         })
 
-    # 馬番順にソートして返却
     return race_name, sorted(horses, key=lambda x: x["umaban"])
 
 
