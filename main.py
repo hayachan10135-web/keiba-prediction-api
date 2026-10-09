@@ -12,8 +12,8 @@ from pydantic import BaseModel
 # FastAPI アプリケーション定義
 app = FastAPI(title="Keiba Prediction API")
 
-HEADERS_SP = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+HEADERS_PC = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
 # --- LightGBM モデルのロード ---
@@ -141,7 +141,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     for d_str in target_dates:
         url = f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={d_str}"
         try:
-            resp = requests.get(url, headers=HEADERS_SP, timeout=10)
+            resp = requests.get(url, headers=HEADERS_PC, timeout=10)
             try:
                 text = resp.content.decode("euc-jp")
             except UnicodeDecodeError:
@@ -161,78 +161,68 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 3. スマホ版出馬表から馬情報・オッズ・人気を一括スクレイピング ---
-def fetch_shutuba_table_sp(race_id: str):
-    url = f"https://race.sp.netkeiba.com/?pid=shutuba&race_id={race_id}"
-    resp = requests.get(url, headers=HEADERS_SP, timeout=10)
+# --- 3. PC版出馬表から馬情報・オッズ・人気を正確にスクレイピング ---
+def fetch_shutuba_table(race_id: str):
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
         html = resp.content.decode("euc-jp")
     except UnicodeDecodeError:
         html = resp.content.decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
 
-    race_name_tag = soup.select_one(".RaceName, .Race_Name, h1")
+    race_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
 
     horses = []
-    # 各出走馬の行またはカード要素
-    horse_blocks = soup.select(".HorseList, .Horse_List, tr.HorseList, tr[id^='tr_']")
+    # PC版出馬表テーブルの出走馬行のみを抽出
+    rows = soup.select("tr.HorseList")
 
-    for idx, block in enumerate(horse_blocks, 1):
+    for row in rows:
         # 馬番
-        umaban = None
-        umaban_tag = block.select_one(".Umaban, .Umaban_Box, span[class*='Umaban']")
-        if umaban_tag:
-            u_match = re.search(r"\d+", umaban_tag.get_text(strip=True))
-            if u_match:
-                umaban = int(u_match.group())
-        if umaban is None:
-            umaban = idx
+        umaban_tag = row.select_one("td.Umaban, td[class*='Umaban']")
+        if not umaban_tag or not umaban_tag.get_text(strip=True).isdigit():
+            continue
+        umaban = int(umaban_tag.get_text(strip=True))
 
         # 枠番
-        wakuban = 1
-        waku_tag = block.select_one(".Waku, span[class*='Waku'], td[class*='Waku']")
-        if waku_tag:
-            w_match = re.search(r"\d+", waku_tag.get_text(strip=True))
-            if w_match:
-                wakuban = int(w_match.group())
+        waku_tag = row.select_one("td.Waku, td[class*='Waku']")
+        w_match = re.search(r"\d+", waku_tag.get_text(strip=True)) if waku_tag else None
+        wakuban = int(w_match.group()) if waku_match else 1
 
-        # 馬名
-        name_tag = block.select_one(".HorseName, .Horse_Name, a[href*='horse/']")
+        # 馬名（aタグ内の純粋な馬名のみ抽出）
+        name_tag = row.select_one(".HorseName a, .Horse_Info a")
         horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
 
-        # 騎手
-        jockey_tag = block.select_one(".Jockey, a[href*='jockey/']")
+        # 騎手（aタグ内の純粋な騎手名のみ抽出）
+        jockey_tag = row.select_one(".Jockey a")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
 
         # 斤量
         kinryo = 55.0
-        kinryo_tag = block.select_one(".Weight, .Kinryo, .Barei")
+        kinryo_tag = row.select_one("td.Barei, td.Weight, td.Kinryo")
         if kinryo_tag:
             km = re.search(r"(\d{2}(?:\.\d)?)", kinryo_tag.get_text(strip=True))
             if km:
                 kinryo = float(km.group(1))
 
-        # 単勝オッズ・人気
+        # 単勝オッズ
         odds = None
+        odds_tag = row.select_one("span[id^='odds-'], td.Popular span, td.Popular, td.Odds")
+        if odds_tag:
+            txt = odds_tag.get_text(strip=True)
+            om = re.search(r"(\d+\.\d+)", txt)
+            if om:
+                odds = float(om.group(1))
+
+        # 人気順
         popularity = None
-        block_text = block.get_text(separator=" ", strip=True)
-
-        # オッズ（例: 3.2倍、14.5など）
-        odds_match = re.search(r"(?:単勝)?\s*(\d+\.\d+)\s*(?:倍)?", block_text)
-        if odds_match:
-            try:
-                odds = float(odds_match.group(1))
-            except ValueError:
-                pass
-
-        # 人気（例: 1人気、1人など）
-        pop_match = re.search(r"(\d+)\s*人(?:気)?", block_text)
-        if pop_match:
-            try:
-                popularity = int(pop_match.group(1))
-            except ValueError:
-                pass
+        pop_tag = row.select_one("span[id^='ninki-'], span.Ninki, td.Popular + td")
+        if pop_tag:
+            txt = pop_tag.get_text(strip=True)
+            pm = re.search(r"(\d+)", txt)
+            if pm:
+                popularity = int(pm.group(1))
 
         horses.append({
             "umaban": umaban,
@@ -244,9 +234,8 @@ def fetch_shutuba_table_sp(race_id: str):
             "popularity": popularity
         })
 
-    # 重複排除と馬番順ソート
-    unique_horses = {h["umaban"]: h for h in horses}.values()
-    return race_name, sorted(unique_horses, key=lambda x: x["umaban"])
+    # 馬番順にソートして返却
+    return race_name, sorted(horses, key=lambda x: x["umaban"])
 
 
 def build_prediction_and_recs(race_name: str, horses: List[dict]) -> dict:
@@ -313,7 +302,7 @@ def predict_race(race_id: str):
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
     try:
-        race_name, horses = fetch_shutuba_table_sp(race_id)
+        race_name, horses = fetch_shutuba_table(race_id)
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
