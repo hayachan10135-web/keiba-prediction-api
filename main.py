@@ -1,7 +1,10 @@
 from typing import List, Optional
+import os
 import datetime
 import re
 import requests
+import lightgbm as lgb
+import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -11,6 +14,15 @@ app = FastAPI(title="Keiba Prediction API")
 HEADERS_PC = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
+
+# --- LightGBM モデルのロード ---
+MODEL_PATH = "lgb_model.txt"
+model = None
+if os.path.exists(MODEL_PATH):
+    model = lgb.Booster(model_file=MODEL_PATH)
+    print("LightGBMモデルを正常にロードしました。")
+else:
+    print("モデルファイルが見つかりません。フォールバックスコアリングを使用します。")
 
 # --- Pydantic レスポンススキーマ ---
 class HorsePrediction(BaseModel):
@@ -157,7 +169,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 3. 出走表取得・推論・買い目レコメンド (GET /predict/{race_id}) ---
+# --- 3. 出走表取得・LightGBM推論・買い目レコメンド (GET /predict/{race_id}) ---
 def fetch_shutuba_table(race_id: str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
@@ -200,7 +212,7 @@ def fetch_shutuba_table(race_id: str):
                 kinryo = float(km.group(1))
 
         odds_tag = row.select_one(".Popular, td[class*='Popular'], .Odds")
-        odds = 10.0
+        odds = None
         if odds_tag:
             om = re.search(r"(\d+(?:\.\d+)?)", odds_tag.get_text(strip=True))
             if om:
@@ -227,11 +239,29 @@ def build_prediction_and_recs(race_name: str, horses: List[dict]) -> dict:
     if not horses:
         return {"race_name": race_name, "horses": [], "recommendations": {"tansho": [], "fukusho": [], "umaren": [], "wide": [], "sanrenpuku": []}}
 
+    # 特徴量行列の作成 (wakuban, umaban, kinryo, odds, popularity)
+    feature_rows = []
     for h in horses:
-        odds = h["odds"] if h["odds"] else 50.0
-        base_score = 1.0 / (1.0 + (odds ** 0.5))
-        h["score"] = round(float(base_score), 4)
+        w = h["wakuban"]
+        u = h["umaban"]
+        k = h["kinryo"]
+        o = h["odds"] if h["odds"] is not None else 50.0
+        p = h["popularity"] if h["popularity"] is not None else 10.0
+        feature_rows.append([w, u, k, o, p])
 
+    if model:
+        # 学習済みLightGBMモデルによる予測
+        scores = model.predict(feature_rows)
+        for idx, h in enumerate(horses):
+            h["score"] = round(float(scores[idx]), 4)
+    else:
+        # フォールバック
+        for idx, h in enumerate(horses):
+            odds = h["odds"] if h["odds"] else 50.0
+            base_score = 1.0 / (1.0 + (odds ** 0.5))
+            h["score"] = round(float(base_score), 4)
+
+    # スコア順にソートして印を割り当て
     sorted_horses = sorted(horses, key=lambda x: x["score"], reverse=True)
     marks = ["◎", "◯", "▲", "△", "☆"]
     for idx, h in enumerate(sorted_horses):
@@ -275,7 +305,7 @@ def predict_race(race_id: str):
     try:
         race_name, horses = fetch_shutuba_table(race_id)
         if not horses:
-            raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした（開催前または存在しないIDの可能性があります）。")
+            raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
         
         result = build_prediction_and_recs(race_name, horses)
         return {
