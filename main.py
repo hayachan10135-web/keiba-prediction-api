@@ -217,7 +217,13 @@ def fetch_shutuba_table(race_id: str):
                     if o_text and o_text != "---":
                         try:
                             o_val = float(o_text)
-                            p_val = int(val[1]) if len(val) > 1 and str(val[1]).isdigit() else None
+                            # val[2] が人気順位（val[1]はフラグ等のためval[2]を採用）
+                            p_val = None
+                            if len(val) >= 3 and str(val[2]).isdigit() and int(val[2]) > 0:
+                                p_val = int(val[2])
+                            elif len(val) >= 2 and str(val[1]).isdigit() and int(val[1]) > 0:
+                                p_val = int(val[1])
+                                
                             odds_map[int(u_str)] = {"odds": o_val, "popularity": p_val}
                         except ValueError:
                             pass
