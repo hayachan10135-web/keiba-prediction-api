@@ -13,7 +13,8 @@ from pydantic import BaseModel
 app = FastAPI(title="Keiba Prediction API")
 
 HEADERS_PC = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://race.netkeiba.com/"
 }
 
 # --- LightGBM モデルのロード ---
@@ -161,8 +162,9 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 3. PC版出馬表から馬情報・オッズ・人気をスクレイピング ---
+# --- 3. 出馬表テーブル ＆ オッズAPIからデータ統合 ---
 def fetch_shutuba_table(race_id: str):
+    # 1. 出馬表から馬基本情報
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
@@ -174,17 +176,35 @@ def fetch_shutuba_table(race_id: str):
     race_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
 
+    # 2. netkeiba オッズ取得API（.htmlエンドポイント）からリアルタイムオッズ・人気を取得
+    odds_map = {}
+    try:
+        odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1"
+        oresp = requests.get(odds_url, headers=HEADERS_PC, timeout=5)
+        odata = oresp.json()
+        tansho_dict = odata.get("data", {}).get("odds", {}).get("1", {})
+        for u_str, val in tansho_dict.items():
+            if isinstance(val, list) and len(val) >= 1:
+                o_text = str(val[0])
+                if o_text and o_text != "---":
+                    try:
+                        o_val = float(o_text)
+                        p_val = int(val[1]) if len(val) > 1 and str(val[1]).isdigit() else None
+                        odds_map[int(u_str)] = {"odds": o_val, "popularity": p_val}
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"オッズAPI取得スキップ ({race_id}): {e}")
+
     horses = []
     rows = soup.select("tr.HorseList")
 
     for row in rows:
-        # 馬番
         umaban_tag = row.select_one("td.Umaban, td[class*='Umaban']")
         if not umaban_tag or not umaban_tag.get_text(strip=True).isdigit():
             continue
         umaban = int(umaban_tag.get_text(strip=True))
 
-        # 枠番 (安全に抽出)
         wakuban = 1
         waku_tag = row.select_one("td.Waku, td[class*='Waku']")
         if waku_tag:
@@ -192,15 +212,12 @@ def fetch_shutuba_table(race_id: str):
             if wm:
                 wakuban = int(wm.group())
 
-        # 馬名
         name_tag = row.select_one(".HorseName a, .Horse_Info a")
         horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
 
-        # 騎手
         jockey_tag = row.select_one(".Jockey a")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
 
-        # 斤量
         kinryo = 55.0
         kinryo_tag = row.select_one("td.Barei, td.Weight, td.Kinryo")
         if kinryo_tag:
@@ -208,23 +225,10 @@ def fetch_shutuba_table(race_id: str):
             if km:
                 kinryo = float(km.group(1))
 
-        # 単勝オッズ
-        odds = None
-        odds_tag = row.select_one("span[id^='odds-'], td.Popular span, td.Popular, td.Odds")
-        if odds_tag:
-            txt = odds_tag.get_text(strip=True)
-            om = re.search(r"(\d+\.\d+)", txt)
-            if om:
-                odds = float(om.group(1))
-
-        # 人気順
-        popularity = None
-        pop_tag = row.select_one("span[id^='ninki-'], span.Ninki, td.Popular + td")
-        if pop_tag:
-            txt = pop_tag.get_text(strip=True)
-            pm = re.search(r"(\d+)", txt)
-            if pm:
-                popularity = int(pm.group(1))
+        # オッズ・人気
+        odds_item = odds_map.get(umaban, {})
+        odds = odds_item.get("odds")
+        popularity = odds_item.get("popularity")
 
         horses.append({
             "umaban": umaban,
@@ -284,37 +288,4 @@ def build_prediction_and_recs(race_name: str, horses: List[dict]) -> dict:
         opponents = [taiko] + ([kuro] if kuro else []) + osae
         recs["umaren"] = [f"{honmei}-{opp}" for opp in opponents]
         recs["wide"] = [f"{honmei}-{opp}" for opp in opponents[:3]]
-        second_tier = [str(x) for x in ([taiko] + ([kuro] if kuro else []))]
-        third_tier = [str(x) for x in opponents]
-        recs["sanrenpuku"] = [f"{honmei} - {','.join(second_tier)} - {','.join(third_tier)}"]
-
-    horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
-
-    return {
-        "race_name": race_name,
-        "horses": horses_sorted_by_num,
-        "recommendations": recs
-    }
-
-
-@app.get("/predict/{race_id}", response_model=PredictResponse)
-def predict_race(race_id: str):
-    if len(race_id) != 12 or not race_id.isdigit():
-        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
-
-    try:
-        race_name, horses = fetch_shutuba_table(race_id)
-        if not horses:
-            raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
-
-        result = build_prediction_and_recs(race_name, horses)
-        return {
-            "race_id": race_id,
-            "race_name": result["race_name"],
-            "horses": result["horses"],
-            "recommendations": result["recommendations"]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
+        second_tier = [str(x) for x in
