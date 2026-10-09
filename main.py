@@ -161,8 +161,8 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
 
 # --- 3. Step 3-3: 推論＆買い目レコメンド (GET /predict/{race_id}) ---
 def fetch_shutuba_table(race_id: str):
-    """出馬表ページから出走馬データをスクレイピング"""
-    url = f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    """出馬表ページから出走馬データをスクレイピング（PC版URLを使用）"""
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS, timeout=10)
     try:
         html = resp.content.decode("euc-jp")
@@ -175,42 +175,48 @@ def fetch_shutuba_table(race_id: str):
     race_name = race_title_tag.get_text(strip=True) if race_title_tag else f"Race {race_id}"
 
     horses = []
-    horse_rows = soup.select(".Shutuba_Table tr.HorseList, .RaceTable01 tr")
+    # PC版出馬表の各行
+    horse_rows = soup.select("table.Shutuba_Table tr.HorseList")
 
     for row in horse_rows:
-        tds = row.select("td")
-        if len(tds) < 5:
-            continue
-
         # 枠番
-        waku_text = row.select_one(".Waku span, td:nth-child(1)")
-        waku = int(re.sub(r"\D", "", waku_text.get_text())) if waku_text and re.search(r"\d+", waku_text.get_text()) else 1
+        waku_tag = row.select_one(".Waku span, td.Waku")
+        waku_str = re.sub(r"\D", "", waku_tag.get_text()) if waku_tag else "1"
+        waku = int(waku_str) if waku_str else 1
 
         # 馬番
-        umaban_text = row.select_one(".Umaban, td:nth-child(2)")
-        umaban_match = re.search(r"\d+", umaban_text.get_text()) if umaban_text else None
+        umaban_tag = row.select_one(".Umaban, td.Umaban")
+        umaban_match = re.search(r"\d+", umaban_tag.get_text()) if umaban_tag else None
         if not umaban_match:
             continue
         umaban = int(umaban_match.group())
 
         # 馬名
-        name_tag = row.select_one(".HorseName a, .Horse_Info a, .Horse02 a")
+        name_tag = row.select_one(".HorseName a, .Horse_Info a")
         horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
 
-        # 斤量・騎手
+        # 騎手
         jockey_tag = row.select_one(".Jockey a, .Jockey")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
 
-        kinryo_tag = row.select_one(".Weight, .Kinryo")
-        kinryo_match = re.search(r"\d+(\.\d+)?", kinryo_tag.get_text()) if kinryo_tag else None
-        kinryo = float(kinryo_match.group()) if kinryo_match else 55.0
+        # 斤量
+        kinryo_tag = row.select_one(".Weight, .Kinryo, td.Barei")
+        # 例: "牡2/55.0" または 単独の "55.0"
+        kinryo = 55.0
+        if kinryo_tag:
+            km = re.search(r"(\d{2}(?:\.\d)?)", kinryo_tag.get_text())
+            if km:
+                kinryo = float(km.group(1))
 
         # 単勝オッズ・人気
-        odds_tag = row.select_one(".Popular span, .Odds")
-        odds_match = re.search(r"\d+(\.\d+)?", odds_tag.get_text()) if odds_tag else None
-        odds = float(odds_match.group()) if odds_match else 10.0
+        odds_tag = row.select_one(".Popular span, td.Popular")
+        odds = 10.0
+        if odds_tag:
+            om = re.search(r"(\d+(?:\.\d+)?)", odds_tag.get_text())
+            if om:
+                odds = float(om.group(1))
 
-        pop_tag = row.select_one(".Popular_Num")
+        pop_tag = row.select_one(".Ninki, span.Ninki")
         pop_match = re.search(r"\d+", pop_tag.get_text()) if pop_tag else None
         popularity = int(pop_match.group()) if pop_match else None
 
