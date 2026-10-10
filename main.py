@@ -4,6 +4,7 @@ import datetime
 import re
 import json
 import sqlite3
+import asyncio
 import requests
 import lightgbm as lgb
 from bs4 import BeautifulSoup
@@ -26,6 +27,7 @@ DB_PATH = "results_cache.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    # 確定レース結果キャッシュテーブル
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_results_cache (
             race_id TEXT PRIMARY KEY,
@@ -35,6 +37,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 収支検証履歴テーブル
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_settlements (
             race_id TEXT PRIMARY KEY,
@@ -52,6 +55,18 @@ def init_db():
             fukusho_payout INTEGER,
             total_payout INTEGER,
             is_hit INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # 自動照合監視用スケジュールテーブル
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_races (
+            race_id TEXT PRIMARY KEY,
+            race_date TEXT,
+            race_name TEXT,
+            post_datetime TEXT,
+            is_settled INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -150,6 +165,31 @@ class DailySummary(BaseModel):
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Keiba Prediction & Verification API is running"}
+
+
+# --- 自動スケジュール登録ヘルパー ---
+def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
+    """発走時刻（例: '10:05発走'）をパースし、DBに監視対象として登録"""
+    try:
+        m = re.search(r"(\d{1,2}):(\d{2})", post_time_str)
+        if not m:
+            return
+        hour, minute = int(m.group(1)), int(m.group(2))
+        today_date = datetime.date.today().strftime("%Y-%m-%d")
+        post_dt = datetime.datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO scheduled_races (race_id, race_date, race_name, post_datetime, is_settled)
+            VALUES (?, ?, ?, ?, 0)
+        """, (race_id, today_date, race_name, post_dt_str))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"スケジュール登録エラー ({race_id}): {e}")
 
 
 # --- 開催日レース一覧 (GET /races/today) ---
@@ -333,6 +373,10 @@ def fetch_shutuba_table(race_id: str):
         "post_time": post_time,
         "course_details": course_details
     }
+
+    # ★ 出馬表取得時に発走時刻をスケジュールDBへ自動登録
+    if post_time:
+        register_race_schedule(race_id, race_name, post_time)
 
     odds_map = {}
     try:
@@ -677,7 +721,7 @@ def save_settlement(data: dict):
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     """
     確定したレース結果（着順・単勝・複勝払戻）をSP版/PC版/DB版から確実にスクレイピング
-    単勝払戻が検出できれば確定済みと判定して結果を生成
+    単勝払戻が検出できれば確定済みと判定
     """
     orders = {}
     payouts = {"tansho": {}, "fukusho": {}}
@@ -805,7 +849,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     # 確定判定（単勝払戻が存在するか、または1着が存在すれば確定とみなす）
     is_confirmed = (len(payouts["tansho"]) > 0) or (1 in orders.values())
 
-    # 払戻は取れているが着順セルが空文字だった場合の勝馬自動補完
     if len(payouts["tansho"]) > 0 and 1 not in orders.values():
         for winner_u in payouts["tansho"].keys():
             orders[winner_u] = 1
@@ -845,7 +888,7 @@ def verify_race_result(race_id: str):
             raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
         save_cached_result(race_id, race_res["race_name"], race_date, race_res)
 
-    # 2. 当該レースのAI推奨買い目を取得（辞書キーアクセス）
+    # 2. 当該レースのAI推奨買い目を取得
     pred_data = predict_race(race_id)
     rec = pred_data["recommendation"]
     race_name = pred_data["race_name"]
@@ -995,3 +1038,76 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "recovery_rate": recovery_rate,
         "settled_races": settled_list
     }
+
+
+# =========================================================================
+# ★ 出走時刻から1時間後に自動で照合するバックグラウンドスケジューラー
+# =========================================================================
+
+async def auto_verification_scheduler_loop():
+    """
+    バックグラウンド定期巡回ループ (90秒ごとにチェック)
+    現在時刻 >= 発走時刻 + 1時間 の未確定レースを自動検証・キャッシュ登録
+    """
+    print("[Scheduler] 自動照合スケジューラーを開始しました。")
+    while True:
+        try:
+            now = datetime.datetime.now()
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT race_id, race_name, post_datetime, retry_count
+                FROM scheduled_races
+                WHERE is_settled = 0
+            """)
+            scheduled_races = cur.fetchall()
+            conn.close()
+
+            for r in scheduled_races:
+                r_id = r["race_id"]
+                p_dt_str = r["post_datetime"]
+                retries = r["retry_count"]
+
+                try:
+                    post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+
+                # ★ 出走時刻から1時間（60分）経過しているかを判定
+                trigger_time = post_dt + datetime.timedelta(minutes=60)
+                if now >= trigger_time:
+                    print(f"[Scheduler] 自動照合を実行します: {r_id} ({r['race_name']}) - 発走: {p_dt_str}")
+                    try:
+                        res = verify_race_result(r_id)
+                        # 正常に照合・確定できたら完了マーク
+                        conn_up = sqlite3.connect(DB_PATH)
+                        cur_up = conn_up.cursor()
+                        cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
+                        conn_up.commit()
+                        conn_up.close()
+                        print(f"[Scheduler] 自動照合完了・収支保存成功: {r_id} -> {res.message}")
+                    except Exception as err:
+                        # まだ確定していない場合（最大10回まで再試行カウント）
+                        conn_up = sqlite3.connect(DB_PATH)
+                        cur_up = conn_up.cursor()
+                        if retries >= 10:
+                            # 10回失敗した場合は断念して完了扱いに
+                            cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
+                        else:
+                            cur_up.execute("UPDATE scheduled_races SET retry_count = retry_count + 1 WHERE race_id = ?", (r_id,))
+                        conn_up.commit()
+                        conn_up.close()
+                        print(f"[Scheduler] 自動照合保留 (未確定): {r_id} ({err})")
+
+        except Exception as e:
+            print(f"[Scheduler] 巡回ループエラー: {e}")
+
+        # 90秒待機して次回巡回
+        await asyncio.sleep(90)
+
+
+@app.on_event("startup")
+async def startup_event():
+    # サーバー起動時に自動照合ループを非同期タスクとしてバックグラウンド実行
+    asyncio.create_task(auto_verification_scheduler_loop())
