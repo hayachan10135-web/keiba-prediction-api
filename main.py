@@ -740,7 +740,8 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
         elif d["is_hit"]:
             msg = f"{d['horse_name']} は {d['actual_order']}着でした。 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
         else:
-            msg = f"{d['horse_name']} は {d['actual_order']}着でした。 不的中 (収支: {profit:,}円)" if d["actual_order"] else f"{d['horse_name']} の結果です。 不的中 (収支: {profit:,}円)"
+            order_str = f"{d['actual_order']}着" if (d['actual_order'] and d['actual_order'] < 90) else "着外"
+            msg = f"{d['horse_name']} は {order_str}でした。 不的中 (収支: {profit:,}円)"
 
         return {
             "race_id": d["race_id"],
@@ -1052,7 +1053,8 @@ def verify_race_result(race_id: str):
     }
     save_settlement(settlement)
 
-    msg = f"{h_name} は {actual_order}着でした。" if actual_order != 99 else f"{h_name} の結果です。"
+    order_str = f"{actual_order}着" if actual_order < 90 else "着外"
+    msg = f"{h_name} は {order_str}でした。 不的中 (収支: {profit:,}円)"
     if is_hit:
         msg += f" 的中！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
     else:
