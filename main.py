@@ -676,110 +676,137 @@ def save_settlement(data: dict):
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     """
-    netkeiba DB (db.netkeiba.com) および SP版から確定着順と払戻金を確実にスクレイピング
-    ※ db.netkeiba.com は確定結果が静的HTMLとして確実に埋め込まれているため最安定
+    当日確定直後のレース結果（着順・単勝・複勝払戻）を確実に取得
+    PC版速報 (race.netkeiba.com) と SP版速報 (race.sp.netkeiba.com) を両対応
     """
     orders = {}
     payouts = {"tansho": {}, "fukusho": {}}
     race_name = f"Race {race_id}"
 
-    # パターン1: db.netkeiba.com (最も安定して静的HTMLに着順・払戻が入っている)
-    db_url = f"https://db.netkeiba.com/race/{race_id}/"
-    html = ""
+    # --- 1. SP版速報ページ (当日確定データが最も確実に静的HTMLに存在する) ---
+    sp_url = f"https://race.sp.netkeiba.com/race/result.html?race_id={race_id}"
     try:
-        resp = requests.get(db_url, headers=HEADERS_PC, timeout=10)
+        resp = requests.get(sp_url, headers=HEADERS_PC, timeout=10)
         try:
             html = resp.content.decode("euc-jp")
         except UnicodeDecodeError:
             html = resp.content.decode("utf-8", errors="replace")
-    except Exception as e:
-        print(f"db.netkeiba.com 取得エラー: {e}")
+        
+        soup = BeautifulSoup(html, "html.parser")
+        r_title = soup.select_one(".RaceName, h1, .Race_Title")
+        if r_title:
+            race_name = r_title.get_text(strip=True)
 
-    soup = BeautifulSoup(html, "html.parser")
+        # SP版の着順行
+        # パターンA: .RaceResultList .HorseList / tr
+        for row in soup.select("tr.HorseList, .RaceResultList tr, table.RaceTable tr"):
+            o_elem = row.select_one("td.Rank, .Rank, td.Result_Num")
+            u_elem = row.select_one("td.Umaban, .Umaban")
+            if o_elem and u_elem:
+                o_txt = o_elem.get_text(strip=True)
+                u_txt = u_elem.get_text(strip=True)
+                if o_txt.isdigit() and u_txt.isdigit():
+                    orders[int(u_txt)] = int(o_txt)
 
-    # レース名
-    r_name_tag = soup.select_one(".racedata h1, .RaceName, h1")
-    if r_name_tag:
-        race_name = r_name_tag.get_text(strip=True)
-
-    # 1. 着順テーブル (db.netkeiba.com: table.race_table_01)
-    result_table = soup.select_one("table.race_table_01, table.RaceTable01, table.ResultTable")
-    if result_table:
-        for tr in result_table.select("tr"):
-            tds = tr.find_all("td")
-            if len(tds) >= 4:
-                order_txt = tds[0].get_text(strip=True)
-                umaban_txt = tds[2].get_text(strip=True)
-                if order_txt.isdigit() and umaban_txt.isdigit():
-                    orders[int(umaban_txt)] = int(order_txt)
-
-    # 2. 払戻テーブル (db.netkeiba.com: table.pay_table_01)
-    pay_tables = soup.select("table.pay_table_01, table.Payout_Detail_Table")
-    for pt in pay_tables:
-        for tr in pt.select("tr"):
+        # SP版の払戻テーブル
+        for tr in soup.select("table[class*='Payout'] tr, table[class*='Pay'] tr, .Payout_Detail tr"):
             th = tr.select_one("th")
-            if not th:
-                continue
-            kind = th.get_text(strip=True)
             tds = tr.find_all("td")
-            if len(tds) < 2:
-                continue
+            if th and len(tds) >= 2:
+                kind = th.get_text(strip=True)
+                nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", tds[0].get_text())]
+                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", tds[1].get_text()) if x.replace(",", "").isdigit()]
+                if "単勝" in kind:
+                    for n, p in zip(nums, pays):
+                        payouts["tansho"][n] = p
+                elif "複勝" in kind:
+                    for n, p in zip(nums, pays):
+                        payouts["fukusho"][n] = p
+    except Exception as e:
+        print(f"SP版取得エラー: {e}")
 
-            nums_txt = tds[0].get_text(separator=" ", strip=True)
-            pays_txt = tds[1].get_text(separator=" ", strip=True)
-
-            nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", nums_txt)]
-            pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", pays_txt) if x.replace(",", "").isdigit()]
-
-            if "単勝" in kind:
-                for n, p in zip(nums, pays):
-                    payouts["tansho"][n] = p
-            elif "複勝" in kind:
-                for n, p in zip(nums, pays):
-                    payouts["fukusho"][n] = p
-
-    # --- パターン2: db.netkeiba.comで取れなかった場合のSP版フォールバック ---
+    # --- 2. PC版速報ページ (SP版で取れなかった場合のフォールバック) ---
     if not any(v == 1 for v in orders.values()):
-        sp_url = f"https://race.sp.netkeiba.com/?pid=race_result&race_id={race_id}"
+        pc_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         try:
-            sp_resp = requests.get(sp_url, headers=HEADERS_PC, timeout=10)
+            resp = requests.get(pc_url, headers=HEADERS_PC, timeout=10)
             try:
-                sp_html = sp_resp.content.decode("euc-jp")
+                html = resp.content.decode("euc-jp")
             except UnicodeDecodeError:
-                sp_html = sp_resp.content.decode("utf-8", errors="replace")
-            sp_soup = BeautifulSoup(sp_html, "html.parser")
+                html = resp.content.decode("utf-8", errors="replace")
+            soup = BeautifulSoup(html, "html.parser")
 
-            # SP版着順リスト
-            sp_rows = sp_soup.select(".RaceResultList_Item, tr.HorseList, table tr")
-            for r in sp_rows:
-                o_tag = r.select_one(".Rank, .Result_Num, td.Rank")
-                u_tag = r.select_one(".Umaban, td.Umaban")
-                if o_tag and u_tag:
-                    o_t = o_tag.get_text(strip=True)
-                    u_t = u_tag.get_text(strip=True)
-                    if o_t.isdigit() and u_t.isdigit():
-                        orders[int(u_t)] = int(o_t)
+            r_title = soup.select_one(".RaceName, h1")
+            if r_title and not race_name:
+                race_name = r_title.get_text(strip=True)
 
-            # SP版払戻
-            for tr in sp_soup.select("table.Payout_Table tr, table.Pay_Table tr"):
+            # PC版の全テーブル走査
+            for row in soup.select("tr"):
+                o_elem = row.select_one("td.Rank, td.Result_Num, div.Rank")
+                u_elem = row.select_one("td.Umaban, div.Umaban")
+                if o_elem and u_elem:
+                    o_txt = o_elem.get_text(strip=True)
+                    u_txt = u_elem.get_text(strip=True)
+                    if o_txt.isdigit() and u_txt.isdigit():
+                        orders[int(u_txt)] = int(o_txt)
+
+            # PC版払戻テーブル
+            for tr in soup.select("table.Payout_Detail_Table tr, table[class*='Payout'] tr"):
                 th = tr.select_one("th")
-                tds = tr.find_all("td")
-                if th and len(tds) >= 2:
-                    k = th.get_text(strip=True)
-                    nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", tds[0].get_text())]
-                    pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", tds[1].get_text()) if x.replace(",", "").isdigit()]
-                    if "単勝" in k:
+                td_res = tr.select_one("td.Result")
+                td_pay = tr.select_one("td.Payout")
+                if th and td_res and td_pay:
+                    kind = th.get_text(strip=True)
+                    nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", td_res.get_text())]
+                    pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pay.get_text()) if x.replace(",", "").isdigit()]
+                    if "単勝" in kind:
                         for n, p in zip(nums, pays):
                             payouts["tansho"][n] = p
-                    elif "複勝" in k:
+                    elif "複勝" in kind:
                         for n, p in zip(nums, pays):
                             payouts["fukusho"][n] = p
         except Exception as e:
-            print(f"SP版フォールバック取得エラー: {e}")
+            print(f"PC版取得エラー: {e}")
 
-    # 最終チェック: 1着が存在するか
+    # --- 3. db.netkeiba.com (過去アーカイブ用フォールバック) ---
     if not any(v == 1 for v in orders.values()):
-        print(f"未確定判定: 着順取得失敗 (orders={orders})")
+        db_url = f"https://db.netkeiba.com/race/{race_id}/"
+        try:
+            resp = requests.get(db_url, headers=HEADERS_PC, timeout=10)
+            try:
+                html = resp.content.decode("euc-jp")
+            except UnicodeDecodeError:
+                html = resp.content.decode("utf-8", errors="replace")
+            soup = BeautifulSoup(html, "html.parser")
+
+            for tr in soup.select("table.race_table_01 tr"):
+                tds = tr.find_all("td")
+                if len(tds) >= 4:
+                    o_txt = tds[0].get_text(strip=True)
+                    u_txt = tds[2].get_text(strip=True)
+                    if o_txt.isdigit() and u_txt.isdigit():
+                        orders[int(u_txt)] = int(o_txt)
+
+            for tr in soup.select("table.pay_table_01 tr"):
+                th = tr.select_one("th")
+                tds = tr.find_all("td")
+                if th and len(tds) >= 2:
+                    kind = th.get_text(strip=True)
+                    nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", tds[0].get_text())]
+                    pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", tds[1].get_text()) if x.replace(",", "").isdigit()]
+                    if "単勝" in kind:
+                        for n, p in zip(nums, pays):
+                            payouts["tansho"][n] = p
+                    elif "複勝" in kind:
+                        for n, p in zip(nums, pays):
+                            payouts["fukusho"][n] = p
+        except Exception as e:
+            print(f"DB版取得エラー: {e}")
+
+    # 判定ログ
+    print(f"[{race_id}] パース完了: 着順件数={len(orders)} / 1着存在={1 in orders.values()} / 単勝払戻件数={len(payouts['tansho'])}")
+
+    if not any(v == 1 for v in orders.values()):
         return None
 
     return {
@@ -787,7 +814,7 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         "orders": orders,
         "payouts": payouts
     }
-
+    
 
 # --- 個別レース結果検証エンドポイント ---
 @app.get("/result/{race_id}", response_model=VerificationResult)
