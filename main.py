@@ -49,7 +49,7 @@ def init_db():
         )
     """)
     
-    # 3. ★ 確定収支台帳テーブル（永続保存：0時になっても削除しない）
+    # 3. 確定収支台帳テーブル（永続保存：0時になっても削除しない）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_settlements (
             race_id TEXT PRIMARY KEY,
@@ -675,9 +675,10 @@ def get_cached_prediction(race_id: str) -> Optional[dict]:
 def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    # 修正: プレースホルダーを3つに修正
     cur.execute("""
         INSERT OR REPLACE INTO predictions_cache (race_id, race_date, data_json)
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?)
     """, (race_id, race_date, json.dumps(data_dict, ensure_ascii=False)))
     conn.commit()
     conn.close()
@@ -689,13 +690,11 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
-    # 手動再予想でなければ、まずSQLiteキャッシュを検索（5msで即時返却）
     if not force_refresh:
         cached_pred = get_cached_prediction(race_id)
         if cached_pred:
             return cached_pred
 
-    # キャッシュがない場合、または「再予想」ボタン押下時はスクレイピング＋推論実行
     try:
         race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id)
         if not horses:
@@ -710,7 +709,6 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
             "recommendation": result["recommendation"]
         }
 
-        # 次回アクセスの高速化のためSQLiteへ保存
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         save_cached_prediction(race_id, today_str, resp_data)
 
@@ -726,7 +724,6 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
 # =========================================================================
 
 def get_cached_settlement(race_id: str) -> Optional[dict]:
-    """確定収支台帳（race_settlements）から直接取得（predict_raceをスキップして超高速化）"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -949,7 +946,7 @@ def verify_race_result(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
-    # ★ 1. すでに確定・検証済みの場合は、推論もスクレイピングも一切スキップして即時返却 (5ms)
+    # 1. すでに確定・検証済みの場合は、推論もスクレイピングも一切スキップして即時返却 (5ms)
     cached_settlement = get_cached_settlement(race_id)
     if cached_settlement:
         return cached_settlement
@@ -1129,11 +1126,6 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 # =========================================================================
 
 async def background_maintenance_loop():
-    """
-    バックグラウンド定期巡回ループ
-    1. 発走1時間後の自動照合（90秒おき）
-    2. 毎日0:00の一時キャッシュクリア（出馬表キャッシュ・結果キャッシュのみ削除、収支台帳は残す）
-    """
     print("[Scheduler] メンテナンススケジューラーを開始しました。")
     last_cleaned_date = None
 
@@ -1142,22 +1134,21 @@ async def background_maintenance_loop():
             now = datetime.datetime.now()
             today_str = now.strftime("%Y-%m-%d")
 
-            # --- A. 毎日 0:00 の一時キャッシュ削除 ---
+            # 毎日 0:00 の一時キャッシュ削除 (収支台帳は残す)
             if now.hour == 0 and last_cleaned_date != today_str:
                 print(f"[Cleanup] 0:00 定期クリーンアップを開始します (収支台帳は保持)")
                 conn = sqlite3.connect(DB_PATH)
                 cur = conn.cursor()
-                # 出馬表・推論キャッシュと結果一時キャッシュをクリア
                 cur.execute("DELETE FROM predictions_cache WHERE race_date < ?", (today_str,))
                 cur.execute("DELETE FROM race_results_cache WHERE race_date < ?", (today_str,))
                 cur.execute("DELETE FROM scheduled_races WHERE race_date < ?", (today_str,))
-                cur.execute("VACUUM")  # DBファイル断片化解消と容量圧縮
+                cur.execute("VACUUM")
                 conn.commit()
                 conn.close()
                 last_cleaned_date = today_str
                 print(f"[Cleanup] 前日以前の一時キャッシュを削除しました。")
 
-            # --- B. 発走1時間後の自動照合巡回 ---
+            # 発走1時間後の自動照合巡回
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
