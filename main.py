@@ -58,7 +58,7 @@ class TanFukuRecommendation(BaseModel):
     target_umaban: Optional[int]
     horse_name: Optional[str]
     grade: str                   # "S", "A", "B", "C", "D"
-    confidence_label: str        # "鉄板・大勝負", "勝負レース", "標準推奨", "少額推奨", "見送り推奨"
+    confidence_label: str        # "鉄板・大勝負", "勝負レース", "標準推奨", "少額推奨", "見送り推奨", "見送り推奨(低オッズ)"
     is_pass: bool                # 見送り判定フラグ
     tansho_amount: int           # 単勝購入額 (円)
     fukusho_amount: int          # 複勝購入額 (円)
@@ -352,11 +352,15 @@ def fetch_shutuba_table(race_id: str):
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
-# --- 動的資金配分ロジック (分位数最適化・2026年回収率557%実証版) ---
-def calculate_dynamic_bet(score: float):
+# --- 動的資金配分ロジック (単勝2.0倍未満ケン判定ガード付き) ---
+def calculate_dynamic_bet(score: float, odds: Optional[float] = None):
     """
-    推論スコア分布（分位数）に完全適合させた動的傾斜配分
+    推論スコア分布に基づく動的配分。
+    ただし、単勝オッズが2.0倍未満（低配当・トリガミリスク）の場合は無条件で見送り(ケン)にする。
     """
+    if odds is not None and odds < 2.0:
+        return "D", "見送り推奨(低オッズ)", True, 0, 0
+
     if score >= 0.650:
         return "S", "鉄板・大勝負", False, 300, 700
     elif score >= 0.550:
@@ -496,19 +500,23 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                     if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
                         sorted_horses[7]["mark"] = "☆"
 
-    # 本命馬（◎）の抽出と動的配分算出
+    # 本命馬（◎）の抽出と動的配分算出（単勝2.0倍未満ガード適用）
     honmei_horse = next((h for h in sorted_horses if h["mark"] == "◎"), None)
 
     if honmei_horse:
         u_num = honmei_horse["umaban"]
         h_name = honmei_horse["horse_name"]
         h_score = honmei_horse["score"]
+        h_odds = honmei_horse.get("odds")
 
-        grade, conf_label, is_pass, b_tan, b_fuku = calculate_dynamic_bet(h_score)
+        grade, conf_label, is_pass, b_tan, b_fuku = calculate_dynamic_bet(h_score, h_odds)
         total_amt = b_tan + b_fuku
 
         if is_pass:
-            summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
+            if h_odds is not None and h_odds < 2.0:
+                summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{h_odds}倍のためトリガミ回避・見送り推奨)"
+            else:
+                summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
         else:
             summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{b_tan}円 + 複勝{b_fuku}円 / 計{total_amt}円)"
 
