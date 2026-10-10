@@ -41,11 +41,23 @@ class HorsePrediction(BaseModel):
     score: float
     mark: str
 
+class WideFormation(BaseModel):
+    first_tier: List[int]      # 軸馬 [◎]
+    second_tier: List[int]     # 相手 [◯, ▲]
+    summary: str               # 例: "11 - 12,13 (計2点)"
+    total_count: int
+
+class SanrenpukuFormation(BaseModel):
+    first_tier: List[int]      # 1列目 [◎, ◯]
+    second_tier: List[int]     # 2列目 [◎, ◯, ▲, △]
+    third_tier: List[int]      # 3列目 [◎, ◯, ▲, △, ☆]
+    summary: str               # 例: "11,12 - 11,12,13,14 - 11,12,13,14,16,9,10 (計19点)"
+    total_count: int
+
 class Recommendations(BaseModel):
     tansho_fukusho: List[int]
-    wide: List[str]
-    sanrenpuku: List[str]
-    sanrenpuku_summary: str
+    wide: WideFormation
+    sanrenpuku: SanrenpukuFormation
 
 class PredictResponse(BaseModel):
     race_id: str
@@ -54,12 +66,13 @@ class PredictResponse(BaseModel):
     recommendations: Recommendations
 
 
+# --- 1. ヘルスチェック ---
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Keiba Prediction API is running"}
 
 
-# --- 開催日レース一覧 (GET /races/today) ---
+# --- 2. 開催日レース一覧 (GET /races/today) ---
 def parse_netkeiba_sp_page(html_text: str):
     soup = BeautifulSoup(html_text, "html.parser")
     venues_data = []
@@ -162,7 +175,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 出馬表・レース条件・オッズ抽出 ---
+# --- 3. 出馬表・コース条件・オッズ抽出 ---
 def fetch_shutuba_table(race_id: str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
@@ -179,18 +192,15 @@ def fetch_shutuba_table(race_id: str):
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
     race_data_text = race_data_tag.get_text() if race_data_tag else ""
 
-    # 距離
     dist_m = re.search(r"(\d{3,4})m", race_data_text)
     distance = float(dist_m.group(1)) if dist_m else 1600.0
 
-    # 馬場種別 (芝:0, ダ:1, 障:2)
     surface_type = 0
     if "ダ" in race_data_text:
         surface_type = 1
     elif "障" in race_data_text:
         surface_type = 2
 
-    # 馬場状態 (良:0, 稍重:1, 重:2, 不良:3)
     condition_code = 0
     if "稍" in race_data_text:
         condition_code = 1
@@ -199,7 +209,6 @@ def fetch_shutuba_table(race_id: str):
     elif "重" in race_data_text:
         condition_code = 2
 
-    # netkeiba オッズ取得API
     odds_map = {}
     try:
         odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&output=json"
@@ -283,19 +292,20 @@ def fetch_shutuba_table(race_id: str):
     return race_name, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
-# --- 推論 ＆ マーク・推奨買い目の生成 ---
+# --- 4. 推論 ＆ マーク・推奨フォーメーション買い目生成 ---
 def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], course_meta: dict) -> dict:
-    empty_recs = {
-        "tansho_fukusho": [],
-        "wide": [],
-        "sanrenpuku": [],
-        "sanrenpuku_summary": ""
-    }
+    empty_wide = {"first_tier": [], "second_tier": [], "summary": "", "total_count": 0}
+    empty_sanrenpuku = {"first_tier": [], "second_tier": [], "third_tier": [], "summary": "", "total_count": 0}
+
     if not horses:
         return {
             "race_name": race_name,
             "horses": [],
-            "recommendations": empty_recs
+            "recommendations": {
+                "tansho_fukusho": [],
+                "wide": empty_wide,
+                "sanrenpuku": empty_sanrenpuku
+            }
         }
 
     expected_num_features = 15
@@ -332,7 +342,7 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
         days_since_prev = h.get("days_since_prev", 35.0)
 
         if expected_num_features == 15:
-            # 15特徴量セット (当日オッズ・人気除外)
+            # 15特徴量 (当日オッズ・人気除外)
             feature_rows.append([
                 w, u, k,
                 venue_code, surface_type, distance, distance_diff, condition_code,
@@ -388,7 +398,7 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
                     if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
                         sorted_horses[7]["mark"] = "☆"
 
-    # 各印の馬番を抽出
+    # 印ごとの馬番を抽出
     honmei = next((h["umaban"] for h in sorted_horses if h["mark"] == "◎"), None)
     taiko = next((h["umaban"] for h in sorted_horses if h["mark"] == "◯"), None)
     tankuro = next((h["umaban"] for h in sorted_horses if h["mark"] == "▲"), None)
@@ -398,15 +408,13 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
     # 1. 単複 (◎の1頭)
     tansho_fukusho = [honmei] if honmei else []
 
-    # 2. ワイド (◎ - ◯, ▲ の最大2点)
-    wide_bets = []
-    if honmei:
-        if taiko:
-            wide_bets.append(f"{min(honmei, taiko)}-{max(honmei, taiko)}")
-        if tankuro:
-            wide_bets.append(f"{min(honmei, tankuro)}-{max(honmei, tankuro)}")
+    # 2. ワイド フォーメーション (1頭軸: ◎ / 相手: ◯, ▲)
+    wide_first = [honmei] if honmei else []
+    wide_second = [x for x in [taiko, tankuro] if x is not None]
+    wide_count = len(wide_second) if honmei else 0
+    wide_summary = f"{','.join(map(str, wide_first))} - {','.join(map(str, wide_second))} (計{wide_count}点)" if wide_count > 0 else ""
 
-    # 3. 三連複フォーメーション (◎,◯ - ◎,◯,▲,△ - ◎,◯,▲,△,☆)
+    # 3. 三連複 フォーメーション (1列目: ◎,◯ / 2列目: ◎,◯,▲,△ / 3列目: ◎,◯,▲,△,☆)
     row1 = [x for x in [honmei, taiko] if x is not None]
     row2 = list(dict.fromkeys(row1 + ([tankuro] if tankuro else []) + osae_list))
     row3 = list(dict.fromkeys(row2 + hoshi_list))
@@ -419,24 +427,31 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
             for c in row3:
                 if c == a or c == b:
                     continue
-                sorted_trip = tuple(sorted([a, b, c]))
-                combos.add(sorted_trip)
+                combos.add(tuple(sorted([a, b, c])))
 
-    sorted_combos = sorted(list(combos))
-    sanrenpuku_bets = [f"{t[0]}-{t[1]}-{t[2]}" for t in sorted_combos]
-
-    summary_str = ""
+    sanrenpuku_count = len(combos)
+    sanrenpuku_summary = ""
     if row1 and row2 and row3:
         r1_s = ",".join(map(str, row1))
         r2_s = ",".join(map(str, row2))
         r3_s = ",".join(map(str, row3))
-        summary_str = f"{r1_s} - {r2_s} - {r3_s} (計{len(sanrenpuku_bets)}点)"
+        sanrenpuku_summary = f"{r1_s} - {r2_s} - {r3_s} (計{sanrenpuku_count}点)"
 
     recs = {
         "tansho_fukusho": tansho_fukusho,
-        "wide": wide_bets,
-        "sanrenpuku": sanrenpuku_bets,
-        "sanrenpuku_summary": summary_str
+        "wide": {
+            "first_tier": wide_first,
+            "second_tier": wide_second,
+            "summary": wide_summary,
+            "total_count": wide_count
+        },
+        "sanrenpuku": {
+            "first_tier": row1,
+            "second_tier": row2,
+            "third_tier": row3,
+            "summary": sanrenpuku_summary,
+            "total_count": sanrenpuku_count
+        }
     }
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
@@ -448,7 +463,7 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
     }
 
 
-# --- 推論エンドポイント ---
+# --- 5. 推論エンドポイント ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
