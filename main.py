@@ -73,9 +73,15 @@ class Recommendations(BaseModel):
     wide: WideFormation
     sanrenpuku: SanrenpukuFormation
 
+class RaceDetails(BaseModel):
+    race_num: str               # 例: "1R"
+    post_time: str              # 例: "10:05発走" または ""
+    course_details: str         # 例: "芝1600m (良) 天候:晴"
+
 class PredictResponse(BaseModel):
     race_id: str
     race_name: str
+    race_details: RaceDetails
     horses: List[HorsePrediction]
     recommendations: Recommendations
 
@@ -188,7 +194,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 出馬表・コース条件・調教師・オッズ抽出 ---
+# --- 出馬表・コース詳細条件・調教師・オッズ抽出 ---
 def fetch_shutuba_table(race_id: str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
@@ -198,31 +204,90 @@ def fetch_shutuba_table(race_id: str):
         html = resp.content.decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
 
-    race_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
-    race_name = race_name_tag.get_text(strip=True) if race_name_tag else f"Race {race_id}"
+    # --- 1. レース番号 ---
+    race_num_int = int(race_id[10:12]) if len(race_id) == 12 and race_id[10:12].isdigit() else 1
+    race_num = f"{race_num_int}R"
 
-    # コース条件
+    # --- 2. レース名の抽出（網羅的セレクタ検索） ---
+    race_name = ""
+    # パターンA: .RaceName クラス
+    name_candidates = soup.select(".RaceName, .RaceName_Text, .Race_Title, h1.RaceName")
+    for cand in name_candidates:
+        txt = cand.get_text(strip=True)
+        if txt and not txt.isdigit():
+            race_name = txt
+            break
+
+    # パターンB: title タグから抽出 (例: "東京1R 3歳未勝利 出馬表 - netkeiba.com")
+    if not race_name:
+        title_tag = soup.find("title")
+        if title_tag:
+            t_txt = title_tag.get_text(strip=True)
+            m = re.search(r"\d+R\s+([^|・\-_]+)", t_txt)
+            if m:
+                race_name = m.group(1).strip()
+
+    # パターンC: meta タグ
+    if not race_name:
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            m = re.search(r"\d+R\s+([^|・\-_]+)", og_title["content"])
+            if m:
+                race_name = m.group(1).strip()
+
+    # フォールバック
+    if not race_name:
+        race_name = f"{race_num} 一般競走"
+
+    # --- 3. レース詳細情報（発走時刻・馬場・天候） ---
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
-    race_data_text = race_data_tag.get_text() if race_data_tag else ""
+    race_data_text = race_data_tag.get_text(separator=" ", strip=True) if race_data_tag else ""
 
+    # 発走時刻 (例: 10:05発走)
+    post_time_m = re.search(r"(\d{1,2}:\d{2})\s*発走", race_data_text)
+    post_time = f"{post_time_m.group(1)}発走" if post_time_m else ""
+
+    # 天候 (例: 天候:晴)
+    weather_m = re.search(r"天候\s*:\s*([^\s/]+)", race_data_text)
+    weather = weather_m.group(1) if weather_m else ""
+
+    # 馬場状態 (良/稍重/重/不良)
+    baba_m = re.search(r"(?:芝|ダート|ダ)?\s*:\s*(良|稍重|重|不良)", race_data_text)
+    baba = baba_m.group(1) if baba_m else "良"
+
+    # 距離 & 芝ダート
     dist_m = re.search(r"(\d{3,4})m", race_data_text)
     distance = float(dist_m.group(1)) if dist_m else 1600.0
 
+    surface_name = "芝"
     surface_type = 0
     if "ダ" in race_data_text:
+        surface_name = "ダート"
         surface_type = 1
     elif "障" in race_data_text:
+        surface_name = "障害"
         surface_type = 2
 
+    # condition_code
     condition_code = 0
-    if "稍" in race_data_text:
+    if "稍" in baba:
         condition_code = 1
-    elif "不良" in race_data_text:
+    elif "不良" in baba:
         condition_code = 3
-    elif "重" in race_data_text:
+    elif "重" in baba:
         condition_code = 2
 
-    # オッズAPI
+    # 整形テキスト
+    weather_str = f" 天候:{weather}" if weather else ""
+    course_details = f"{surface_name}{int(distance)}m ({baba}){weather_str}"
+
+    race_details = {
+        "race_num": race_num,
+        "post_time": post_time,
+        "course_details": course_details
+    }
+
+    # --- 4. netkeiba オッズ取得API ---
     odds_map = {}
     try:
         odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&output=json"
@@ -254,6 +319,7 @@ def fetch_shutuba_table(race_id: str):
     except Exception as e:
         print(f"オッズAPI取得スキップ ({race_id}): {e}")
 
+    # --- 5. 出走馬一覧の取得 ---
     horses = []
     rows = soup.select("tr.HorseList")
 
@@ -307,17 +373,18 @@ def fetch_shutuba_table(race_id: str):
         "condition_code": condition_code
     }
 
-    return race_name, sorted(horses, key=lambda x: x["umaban"]), course_meta
+    return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
 # --- 19特徴量組み立て & 推論 ---
-def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], course_meta: dict) -> dict:
+def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, horses: List[dict], course_meta: dict) -> dict:
     empty_wide = {"first_tier": [], "second_tier": [], "summary": "", "total_count": 0}
     empty_sanrenpuku = {"first_tier": [], "second_tier": [], "third_tier": [], "summary": "", "total_count": 0}
 
     if not horses:
         return {
             "race_name": race_name,
+            "race_details": race_details,
             "horses": [],
             "recommendations": {
                 "tansho_fukusho": [],
@@ -343,7 +410,6 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
     condition_code = course_meta.get("condition_code", 0)
     distance_diff = 0.0
 
-    # コースキー (例: "05_0")
     course_key = f"{venue_code:02d}_{surface_type}"
 
     j_stats = stats_dict.get("jockey_stats", {})
@@ -367,7 +433,6 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
         prev2_order = h.get("prev2_order", 5.0)
         days_since_prev = h.get("days_since_prev", 35.0)
 
-        # 騎手・調教師のクリーニング
         j_clean = re.sub(r"[▲△◇☆\s]", "", h["jockey"])
         t_clean = re.sub(r"\[.*?\]|\s", "", h.get("trainer", "") or "")
 
@@ -377,7 +442,6 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
         tc_rate = tc_stats.get(f"{t_clean}_{course_key}", t_rate)
 
         if expected_num_features == 19:
-            # 19特徴量セット
             feature_rows.append([
                 w, u, k,
                 venue_code, surface_type, distance, distance_diff, condition_code,
@@ -491,26 +555,28 @@ def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict], 
 
     return {
         "race_name": race_name,
+        "race_details": race_details,
         "horses": horses_sorted_by_num,
         "recommendations": recs
     }
 
 
-# --- 推論エンドポイント ---
+# --- 5. 推論エンドポイント ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
     try:
-        race_name, horses, course_meta = fetch_shutuba_table(race_id)
+        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id)
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
-        result = build_prediction_and_recs(race_name, race_id, horses, course_meta)
+        result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
         return {
             "race_id": race_id,
             "race_name": result["race_name"],
+            "race_details": result["race_details"],
             "horses": result["horses"],
             "recommendations": result["recommendations"]
         }
