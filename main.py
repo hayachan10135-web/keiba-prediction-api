@@ -1,11 +1,10 @@
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional
 import os
 import datetime
 import re
 import json
 import requests
 import lightgbm as lgb
-import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -55,35 +54,28 @@ class HorsePrediction(BaseModel):
     score: float
     mark: str
 
-class WideFormation(BaseModel):
-    first_tier: List[int]
-    second_tier: List[int]
+class TanFukuRecommendation(BaseModel):
+    target_umaban: Optional[int]
+    horse_name: Optional[str]
+    grade: str                   # "S", "A", "B", "C", "D"
+    confidence_label: str        # "鉄板・大勝負", "勝負レース", "標準推奨", "少額推奨", "見送り推奨"
+    is_pass: bool                # 見送り判定フラグ
+    tansho_amount: int           # 単勝購入額 (円)
+    fukusho_amount: int          # 複勝購入額 (円)
+    total_amount: int            # 合計購入額 (円)
     summary: str
-    total_count: int
-
-class SanrenpukuFormation(BaseModel):
-    first_tier: List[int]
-    second_tier: List[int]
-    third_tier: List[int]
-    summary: str
-    total_count: int
-
-class Recommendations(BaseModel):
-    tansho_fukusho: List[int]
-    wide: WideFormation
-    sanrenpuku: SanrenpukuFormation
 
 class RaceDetails(BaseModel):
-    race_num: str               # 例: "1R"
-    post_time: str              # 例: "10:05発走" または ""
-    course_details: str         # 例: "芝1600m (良) 天候:晴"
+    race_num: str
+    post_time: str
+    course_details: str
 
 class PredictResponse(BaseModel):
     race_id: str
     race_name: str
     race_details: RaceDetails
     horses: List[HorsePrediction]
-    recommendations: Recommendations
+    recommendation: TanFukuRecommendation
 
 
 @app.get("/")
@@ -204,13 +196,10 @@ def fetch_shutuba_table(race_id: str):
         html = resp.content.decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
 
-    # --- 1. レース番号 ---
     race_num_int = int(race_id[10:12]) if len(race_id) == 12 and race_id[10:12].isdigit() else 1
     race_num = f"{race_num_int}R"
 
-    # --- 2. レース名の抽出（網羅的セレクタ検索） ---
     race_name = ""
-    # パターンA: .RaceName クラス
     name_candidates = soup.select(".RaceName, .RaceName_Text, .Race_Title, h1.RaceName")
     for cand in name_candidates:
         txt = cand.get_text(strip=True)
@@ -218,16 +207,13 @@ def fetch_shutuba_table(race_id: str):
             race_name = txt
             break
 
-    # パターンB: title タグから抽出 (例: "東京1R 3歳未勝利 出馬表 - netkeiba.com")
     if not race_name:
         title_tag = soup.find("title")
         if title_tag:
-            t_txt = title_tag.get_text(strip=True)
-            m = re.search(r"\d+R\s+([^|・\-_]+)", t_txt)
+            m = re.search(r"\d+R\s+([^|・\-_]+)", title_tag.get_text(strip=True))
             if m:
                 race_name = m.group(1).strip()
 
-    # パターンC: meta タグ
     if not race_name:
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
@@ -235,27 +221,21 @@ def fetch_shutuba_table(race_id: str):
             if m:
                 race_name = m.group(1).strip()
 
-    # フォールバック
     if not race_name:
         race_name = f"{race_num} 一般競走"
 
-    # --- 3. レース詳細情報（発走時刻・馬場・天候） ---
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
     race_data_text = race_data_tag.get_text(separator=" ", strip=True) if race_data_tag else ""
 
-    # 発走時刻 (例: 10:05発走)
     post_time_m = re.search(r"(\d{1,2}:\d{2})\s*発走", race_data_text)
     post_time = f"{post_time_m.group(1)}発走" if post_time_m else ""
 
-    # 天候 (例: 天候:晴)
     weather_m = re.search(r"天候\s*:\s*([^\s/]+)", race_data_text)
     weather = weather_m.group(1) if weather_m else ""
 
-    # 馬場状態 (良/稍重/重/不良)
     baba_m = re.search(r"(?:芝|ダート|ダ)?\s*:\s*(良|稍重|重|不良)", race_data_text)
     baba = baba_m.group(1) if baba_m else "良"
 
-    # 距離 & 芝ダート
     dist_m = re.search(r"(\d{3,4})m", race_data_text)
     distance = float(dist_m.group(1)) if dist_m else 1600.0
 
@@ -268,7 +248,6 @@ def fetch_shutuba_table(race_id: str):
         surface_name = "障害"
         surface_type = 2
 
-    # condition_code
     condition_code = 0
     if "稍" in baba:
         condition_code = 1
@@ -277,7 +256,6 @@ def fetch_shutuba_table(race_id: str):
     elif "重" in baba:
         condition_code = 2
 
-    # 整形テキスト
     weather_str = f" 天候:{weather}" if weather else ""
     course_details = f"{surface_name}{int(distance)}m ({baba}){weather_str}"
 
@@ -287,7 +265,6 @@ def fetch_shutuba_table(race_id: str):
         "course_details": course_details
     }
 
-    # --- 4. netkeiba オッズ取得API ---
     odds_map = {}
     try:
         odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&output=json"
@@ -319,7 +296,6 @@ def fetch_shutuba_table(race_id: str):
     except Exception as e:
         print(f"オッズAPI取得スキップ ({race_id}): {e}")
 
-    # --- 5. 出走馬一覧の取得 ---
     horses = []
     rows = soup.select("tr.HorseList")
 
@@ -376,21 +352,43 @@ def fetch_shutuba_table(race_id: str):
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
-# --- 19特徴量組み立て & 推論 ---
+# --- 動的資金配分ロジック ---
+def calculate_dynamic_bet(score: float):
+    """
+    推論スコアに応じたグレード判定と傾斜購入額の算出
+    """
+    if score >= 0.380:
+        return "S", "鉄板・大勝負", False, 300, 700
+    elif score >= 0.350:
+        return "A", "勝負レース", False, 200, 400
+    elif score >= 0.330:
+        return "B", "標準推奨", False, 100, 200
+    elif score >= 0.315:
+        return "C", "少額推奨", False, 100, 100
+    else:
+        return "D", "見送り推奨", True, 0, 0
+
+
+# --- 19特徴量推論 ＆ 動的資金配分推奨生成 ---
 def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, horses: List[dict], course_meta: dict) -> dict:
-    empty_wide = {"first_tier": [], "second_tier": [], "summary": "", "total_count": 0}
-    empty_sanrenpuku = {"first_tier": [], "second_tier": [], "third_tier": [], "summary": "", "total_count": 0}
+    empty_recommendation = {
+        "target_umaban": None,
+        "horse_name": None,
+        "grade": "D",
+        "confidence_label": "見送り推奨",
+        "is_pass": True,
+        "tansho_amount": 0,
+        "fukusho_amount": 0,
+        "total_amount": 0,
+        "summary": "推奨馬なし (見送り)"
+    }
 
     if not horses:
         return {
             "race_name": race_name,
             "race_details": race_details,
             "horses": [],
-            "recommendations": {
-                "tansho_fukusho": [],
-                "wide": empty_wide,
-                "sanrenpuku": empty_sanrenpuku
-            }
+            "recommendation": empty_recommendation
         }
 
     expected_num_features = 19
@@ -480,10 +478,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     for h in sorted_horses:
         h["mark"] = "-"
 
+    # 1位〜5位への印付け
     base_marks = ["◎", "◯", "▲", "△", "×"]
     for idx in range(min(5, len(sorted_horses))):
         sorted_horses[idx]["mark"] = base_marks[idx]
 
+    # 6位以降の☆（最大3頭）
     if len(sorted_horses) >= 6:
         sorted_horses[5]["mark"] = "☆"
         base_hoshi_score = sorted_horses[5]["score"]
@@ -496,60 +496,35 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                     if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
                         sorted_horses[7]["mark"] = "☆"
 
-    honmei = next((h["umaban"] for h in sorted_horses if h["mark"] == "◎"), None)
-    taiko = next((h["umaban"] for h in sorted_horses if h["mark"] == "◯"), None)
-    tankuro = next((h["umaban"] for h in sorted_horses if h["mark"] == "▲"), None)
-    osae_list = [h["umaban"] for h in sorted_horses if h["mark"] == "△"]
-    hoshi_list = [h["umaban"] for h in sorted_horses if h["mark"] == "☆"]
+    # 本命馬（◎）の抽出と動的配分算出
+    honmei_horse = next((h for h in sorted_horses if h["mark"] == "◎"), None)
 
-    # 1. 単複
-    tansho_fukusho = [honmei] if honmei else []
+    if honmei_horse:
+        u_num = honmei_horse["umaban"]
+        h_name = honmei_horse["horse_name"]
+        h_score = honmei_horse["score"]
 
-    # 2. ワイド
-    wide_first = [honmei] if honmei else []
-    wide_second = [x for x in [taiko, tankuro] if x is not None]
-    wide_count = len(wide_second) if honmei else 0
-    wide_summary = f"{','.join(map(str, wide_first))} - {','.join(map(str, wide_second))} (計{wide_count}点)" if wide_count > 0 else ""
+        grade, conf_label, is_pass, b_tan, b_fuku = calculate_dynamic_bet(h_score)
+        total_amt = b_tan + b_fuku
 
-    # 3. 三連複
-    row1 = [x for x in [honmei, taiko] if x is not None]
-    row2 = list(dict.fromkeys(row1 + ([tankuro] if tankuro else []) + osae_list))
-    row3 = list(dict.fromkeys(row2 + hoshi_list))
+        if is_pass:
+            summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
+        else:
+            summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{b_tan}円 + 複勝{b_fuku}円 / 計{total_amt}円)"
 
-    combos: Set[Tuple[int, int, int]] = set()
-    for a in row1:
-        for b in row2:
-            if b == a:
-                continue
-            for c in row3:
-                if c == a or c == b:
-                    continue
-                combos.add(tuple(sorted([a, b, c])))
-
-    sanrenpuku_count = len(combos)
-    sanrenpuku_summary = ""
-    if row1 and row2 and row3:
-        r1_s = ",".join(map(str, row1))
-        r2_s = ",".join(map(str, row2))
-        r3_s = ",".join(map(str, row3))
-        sanrenpuku_summary = f"{r1_s} - {r2_s} - {r3_s} (計{sanrenpuku_count}点)"
-
-    recs = {
-        "tansho_fukusho": tansho_fukusho,
-        "wide": {
-            "first_tier": wide_first,
-            "second_tier": wide_second,
-            "summary": wide_summary,
-            "total_count": wide_count
-        },
-        "sanrenpuku": {
-            "first_tier": row1,
-            "second_tier": row2,
-            "third_tier": row3,
-            "summary": sanrenpuku_summary,
-            "total_count": sanrenpuku_count
+        recommendation = {
+            "target_umaban": u_num,
+            "horse_name": h_name,
+            "grade": grade,
+            "confidence_label": conf_label,
+            "is_pass": is_pass,
+            "tansho_amount": b_tan,
+            "fukusho_amount": b_fuku,
+            "total_amount": total_amt,
+            "summary": summary_text
         }
-    }
+    else:
+        recommendation = empty_recommendation
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
 
@@ -557,11 +532,11 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         "race_name": race_name,
         "race_details": race_details,
         "horses": horses_sorted_by_num,
-        "recommendations": recs
+        "recommendation": recommendation
     }
 
 
-# --- 5. 推論エンドポイント ---
+# --- 推論エンドポイント ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
@@ -578,7 +553,7 @@ def predict_race(race_id: str):
             "race_name": result["race_name"],
             "race_details": result["race_details"],
             "horses": result["horses"],
-            "recommendations": result["recommendations"]
+            "recommendation": result["recommendation"]
         }
     except HTTPException:
         raise
