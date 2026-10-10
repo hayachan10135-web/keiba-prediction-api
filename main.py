@@ -45,7 +45,7 @@ class HorsePrediction(BaseModel):
 class Recommendations(BaseModel):
     tansho_fukusho: List[int]     # 単複(1頭): [◎の馬番]
     wide: List[str]               # ワイド(2点): ["◎-◯", "◎-▲"]
-    sanrenpuku: List[str]         # 三連複フォーメーションの全買い目リスト ["8-9-7", "8-9-1", ...]
+    sanrenpuku: List[str]         # 三連複フォーメーション全買い目リスト
     sanrenpuku_summary: str       # フォーメーション概要表示用文字列
 
 class PredictResponse(BaseModel):
@@ -226,4 +226,226 @@ def fetch_shutuba_table(race_id: str):
             if wm:
                 wakuban = int(wm.group())
 
-        name_tag = row.select_one(".HorseName a, .Horse_Info a
+        # セレクタ文字列を安全に閉じています
+        name_tag = row.select_one(".HorseName a, .Horse_Info a")
+        horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
+
+        jockey_tag = row.select_one(".Jockey a")
+        jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
+
+        kinryo = 55.0
+        kinryo_tag = row.select_one("td.Barei, td.Weight, td.Kinryo")
+        if kinryo_tag:
+            km = re.search(r"(\d{2}(?:\.\d)?)", kinryo_tag.get_text(strip=True))
+            if km:
+                kinryo = float(km.group(1))
+
+        odds_item = odds_map.get(umaban, {})
+        odds = odds_item.get("odds")
+        popularity = odds_item.get("popularity")
+
+        horses.append({
+            "umaban": umaban,
+            "wakuban": wakuban,
+            "horse_name": horse_name,
+            "jockey": jockey,
+            "kinryo": kinryo,
+            "odds": odds,
+            "popularity": popularity
+        })
+
+    return race_name, sorted(horses, key=lambda x: x["umaban"])
+
+
+# --- 4. 推論 ＆ マーク・推奨買い目の生成 ---
+def build_prediction_and_recs(race_name: str, race_id: str, horses: List[dict]) -> dict:
+    empty_recs = {
+        "tansho_fukusho": [],
+        "wide": [],
+        "sanrenpuku": [],
+        "sanrenpuku_summary": ""
+    }
+    if not horses:
+        return {
+            "race_name": race_name,
+            "horses": [],
+            "recommendations": empty_recs
+        }
+
+    # モデルの期待する特徴量数を判定 (5 / 12 / 16)
+    expected_num_features = 16
+    if model:
+        try:
+            expected_num_features = model.num_feature()
+        except Exception:
+            expected_num_features = 16
+
+    try:
+        venue_code = int(race_id[4:6])
+    except Exception:
+        venue_code = 5
+
+    feature_rows = []
+    for h in horses:
+        w = h["wakuban"]
+        u = h["umaban"]
+        k = h["kinryo"]
+        o = h["odds"] if h["odds"] is not None else 50.0
+        p = h["popularity"] if h["popularity"] is not None else 10.0
+
+        if expected_num_features == 16:
+            surface_type = 0
+            distance = 1600.0
+            distance_diff = 0.0
+            career_races = h.get("career_races", 5.0)
+            career_top3_rate = h.get("career_top3_rate", 0.25)
+            prev1_order = h.get("prev1_order", 5.0)
+            prev1_pop = h.get("prev1_pop", 5.0)
+            prev1_odds = h.get("prev1_odds", 15.0)
+            prev2_order = h.get("prev2_order", 5.0)
+            days_since_prev = h.get("days_since_prev", 35.0)
+
+            feature_rows.append([
+                w, u, k, o, p,
+                venue_code, surface_type, distance, distance_diff,
+                career_races, career_top3_rate,
+                prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev
+            ])
+        elif expected_num_features == 12:
+            career_races = h.get("career_races", 5.0)
+            career_top3_rate = h.get("career_top3_rate", 0.25)
+            prev1_order = h.get("prev1_order", 5.0)
+            prev1_pop = h.get("prev1_pop", 5.0)
+            prev1_odds = h.get("prev1_odds", 15.0)
+            prev2_order = h.get("prev2_order", 5.0)
+            days_since_prev = h.get("days_since_prev", 35.0)
+            feature_rows.append([
+                w, u, k, o, p,
+                career_races, career_top3_rate,
+                prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev
+            ])
+        else:
+            feature_rows.append([w, u, k, o, p])
+
+    if model:
+        try:
+            scores = model.predict(feature_rows)
+            for idx, h in enumerate(horses):
+                h["score"] = round(float(scores[idx]), 4)
+        except Exception as e:
+            print(f"推論エラー (フォールバック計算に移行): {e}")
+            for idx, h in enumerate(horses):
+                odds = h["odds"] if h["odds"] else 50.0
+                h["score"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+    else:
+        for idx, h in enumerate(horses):
+            odds = h["odds"] if h["odds"] else 50.0
+            base_score = 1.0 / (1.0 + (odds ** 0.5))
+            h["score"] = round(float(base_score), 4)
+
+    sorted_horses = sorted(horses, key=lambda x: x["score"], reverse=True)
+
+    # 全頭の印を初期化
+    for h in sorted_horses:
+        h["mark"] = "-"
+
+    # 基本の5頭 (1〜5位)
+    base_marks = ["◎", "◯", "▲", "△", "×"]
+    for idx in range(min(5, len(sorted_horses))):
+        sorted_horses[idx]["mark"] = base_marks[idx]
+
+    # 6位以降の「☆」判定（最大3頭まで拡張）
+    if len(sorted_horses) >= 6:
+        sorted_horses[5]["mark"] = "☆"
+        base_hoshi_score = sorted_horses[5]["score"]
+        DIFF_THRESHOLD = 0.015
+
+        if len(sorted_horses) >= 7:
+            if (base_hoshi_score - sorted_horses[6]["score"]) <= DIFF_THRESHOLD:
+                sorted_horses[6]["mark"] = "☆"
+                if len(sorted_horses) >= 8:
+                    if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
+                        sorted_horses[7]["mark"] = "☆"
+
+    # --- 各印の馬番を抽出 ---
+    honmei = next((h["umaban"] for h in sorted_horses if h["mark"] == "◎"), None)
+    taiko = next((h["umaban"] for h in sorted_horses if h["mark"] == "◯"), None)
+    tankuro = next((h["umaban"] for h in sorted_horses if h["mark"] == "▲"), None)
+    osae_list = [h["umaban"] for h in sorted_horses if h["mark"] == "△"]
+    hoshi_list = [h["umaban"] for h in sorted_horses if h["mark"] == "☆"]
+
+    # 1. 単複 (◎の1頭)
+    tansho_fukusho = [honmei] if honmei else []
+
+    # 2. ワイド (◎ - ◯, ▲ の最大2点)
+    wide_bets = []
+    if honmei:
+        if taiko:
+            wide_bets.append(f"{min(honmei, taiko)}-{max(honmei, taiko)}")
+        if tankuro:
+            wide_bets.append(f"{min(honmei, tankuro)}-{max(honmei, tankuro)}")
+
+    # 3. 三連複フォーメーション (◎,◯ - ◎,◯,▲,△ - ◎,◯,▲,△,☆)
+    row1 = [x for x in [honmei, taiko] if x is not None]
+    row2 = list(dict.fromkeys(row1 + ([tankuro] if tankuro else []) + osae_list))
+    row3 = list(dict.fromkeys(row2 + hoshi_list))
+
+    combos: Set[Tuple[int, int, int]] = set()
+    for a in row1:
+        for b in row2:
+            if b == a:
+                continue
+            for c in row3:
+                if c == a or c == b:
+                    continue
+                sorted_trip = tuple(sorted([a, b, c]))
+                combos.add(sorted_trip)
+
+    sorted_combos = sorted(list(combos))
+    sanrenpuku_bets = [f"{t[0]}-{t[1]}-{t[2]}" for t in sorted_combos]
+
+    summary_str = ""
+    if row1 and row2 and row3:
+        r1_s = ",".join(map(str, row1))
+        r2_s = ",".join(map(str, row2))
+        r3_s = ",".join(map(str, row3))
+        summary_str = f"{r1_s} - {r2_s} - {r3_s} (計{len(sanrenpuku_bets)}点)"
+
+    recs = {
+        "tansho_fukusho": tansho_fukusho,
+        "wide": wide_bets,
+        "sanrenpuku": sanrenpuku_bets,
+        "sanrenpuku_summary": summary_str
+    }
+
+    horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
+
+    return {
+        "race_name": race_name,
+        "horses": horses_sorted_by_num,
+        "recommendations": recs
+    }
+
+
+# --- 5. 推論エンドポイント ---
+@app.get("/predict/{race_id}", response_model=PredictResponse)
+def predict_race(race_id: str):
+    if len(race_id) != 12 or not race_id.isdigit():
+        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
+
+    try:
+        race_name, horses = fetch_shutuba_table(race_id)
+        if not horses:
+            raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
+
+        result = build_prediction_and_recs(race_name, race_id, horses)
+        return {
+            "race_id": race_id,
+            "race_name": result["race_name"],
+            "horses": result["horses"],
+            "recommendations": result["recommendations"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
