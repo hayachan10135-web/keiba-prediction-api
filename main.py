@@ -676,14 +676,14 @@ def save_settlement(data: dict):
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     """
-    当日確定直後のレース結果（着順・単勝・複勝払戻）を確実に取得
-    PC版速報 (race.netkeiba.com) と SP版速報 (race.sp.netkeiba.com) を両対応
+    確定したレース結果（着順・単勝・複勝払戻）をSP版/PC版/DB版から確実にスクレイピング
+    単勝払戻が検出できれば確定済みと判定して結果を生成
     """
     orders = {}
     payouts = {"tansho": {}, "fukusho": {}}
     race_name = f"Race {race_id}"
 
-    # --- 1. SP版速報ページ (当日確定データが最も確実に静的HTMLに存在する) ---
+    # --- 1. SP版速報ページ ---
     sp_url = f"https://race.sp.netkeiba.com/race/result.html?race_id={race_id}"
     try:
         resp = requests.get(sp_url, headers=HEADERS_PC, timeout=10)
@@ -691,24 +691,13 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
             html = resp.content.decode("euc-jp")
         except UnicodeDecodeError:
             html = resp.content.decode("utf-8", errors="replace")
-        
         soup = BeautifulSoup(html, "html.parser")
+
         r_title = soup.select_one(".RaceName, h1, .Race_Title")
         if r_title:
             race_name = r_title.get_text(strip=True)
 
-        # SP版の着順行
-        # パターンA: .RaceResultList .HorseList / tr
-        for row in soup.select("tr.HorseList, .RaceResultList tr, table.RaceTable tr"):
-            o_elem = row.select_one("td.Rank, .Rank, td.Result_Num")
-            u_elem = row.select_one("td.Umaban, .Umaban")
-            if o_elem and u_elem:
-                o_txt = o_elem.get_text(strip=True)
-                u_txt = u_elem.get_text(strip=True)
-                if o_txt.isdigit() and u_txt.isdigit():
-                    orders[int(u_txt)] = int(o_txt)
-
-        # SP版の払戻テーブル
+        # 払戻テーブル（単勝・複勝）
         for tr in soup.select("table[class*='Payout'] tr, table[class*='Pay'] tr, .Payout_Detail tr"):
             th = tr.select_one("th")
             tds = tr.find_all("td")
@@ -722,11 +711,21 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
                 elif "複勝" in kind:
                     for n, p in zip(nums, pays):
                         payouts["fukusho"][n] = p
+
+        # SP版の着順走査
+        for row in soup.select("tr.HorseList, .RaceResultList tr, table tr, tr"):
+            o_elem = row.select_one(".Rank, td.Rank, td.Result_Num, .Result_Num")
+            u_elem = row.select_one(".Umaban, td.Umaban, .umaban")
+            if o_elem and u_elem:
+                o_txt = o_elem.get_text(strip=True)
+                u_txt = u_elem.get_text(strip=True)
+                if o_txt.isdigit() and u_txt.isdigit():
+                    orders[int(u_txt)] = int(o_txt)
     except Exception as e:
         print(f"SP版取得エラー: {e}")
 
-    # --- 2. PC版速報ページ (SP版で取れなかった場合のフォールバック) ---
-    if not any(v == 1 for v in orders.values()):
+    # --- 2. PC版速報ページ (フォールバック) ---
+    if not payouts["tansho"] or len(orders) < 3:
         pc_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         try:
             resp = requests.get(pc_url, headers=HEADERS_PC, timeout=10)
@@ -739,16 +738,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
             r_title = soup.select_one(".RaceName, h1")
             if r_title and not race_name:
                 race_name = r_title.get_text(strip=True)
-
-            # PC版の全テーブル走査
-            for row in soup.select("tr"):
-                o_elem = row.select_one("td.Rank, td.Result_Num, div.Rank")
-                u_elem = row.select_one("td.Umaban, div.Umaban")
-                if o_elem and u_elem:
-                    o_txt = o_elem.get_text(strip=True)
-                    u_txt = u_elem.get_text(strip=True)
-                    if o_txt.isdigit() and u_txt.isdigit():
-                        orders[int(u_txt)] = int(o_txt)
 
             # PC版払戻テーブル
             for tr in soup.select("table.Payout_Detail_Table tr, table[class*='Payout'] tr"):
@@ -765,11 +754,21 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
                     elif "複勝" in kind:
                         for n, p in zip(nums, pays):
                             payouts["fukusho"][n] = p
+
+            # PC版着順走査
+            for tr in soup.select("table.RaceTable01 tr, table.ResultTable tr, tr.HorseList"):
+                o_elem = tr.select_one("td.Rank, td.Result_Num, div.Rank")
+                u_elem = tr.select_one("td.Umaban, div.Umaban")
+                if o_elem and u_elem:
+                    o_txt = o_elem.get_text(strip=True)
+                    u_txt = u_elem.get_text(strip=True)
+                    if o_txt.isdigit() and u_txt.isdigit():
+                        orders[int(u_txt)] = int(o_txt)
         except Exception as e:
             print(f"PC版取得エラー: {e}")
 
-    # --- 3. db.netkeiba.com (過去アーカイブ用フォールバック) ---
-    if not any(v == 1 for v in orders.values()):
+    # --- 3. db.netkeiba.com (アーカイブ用フォールバック) ---
+    if not payouts["tansho"] and not any(v == 1 for v in orders.values()):
         db_url = f"https://db.netkeiba.com/race/{race_id}/"
         try:
             resp = requests.get(db_url, headers=HEADERS_PC, timeout=10)
@@ -803,10 +802,17 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         except Exception as e:
             print(f"DB版取得エラー: {e}")
 
-    # 判定ログ
-    print(f"[{race_id}] パース完了: 着順件数={len(orders)} / 1着存在={1 in orders.values()} / 単勝払戻件数={len(payouts['tansho'])}")
+    # 確定判定（単勝払戻が存在するか、または1着が存在すれば確定とみなす）
+    is_confirmed = (len(payouts["tansho"]) > 0) or (1 in orders.values())
 
-    if not any(v == 1 for v in orders.values()):
+    # 払戻は取れているが着順セルが空文字だった場合の勝馬自動補完
+    if len(payouts["tansho"]) > 0 and 1 not in orders.values():
+        for winner_u in payouts["tansho"].keys():
+            orders[winner_u] = 1
+
+    print(f"[{race_id}] パース完了: 確定判定={is_confirmed} / 単勝払戻={payouts['tansho']} / 着順={orders}")
+
+    if not is_confirmed:
         return None
 
     return {
@@ -814,7 +820,7 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         "orders": orders,
         "payouts": payouts
     }
-    
+
 
 # --- 個別レース結果検証エンドポイント ---
 @app.get("/result/{race_id}", response_model=VerificationResult)
@@ -839,18 +845,18 @@ def verify_race_result(race_id: str):
             raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
         save_cached_result(race_id, race_res["race_name"], race_date, race_res)
 
-    # 2. 当該レースのAI推奨買い目を取得
+    # 2. 当該レースのAI推奨買い目を取得（辞書キーアクセス）
     pred_data = predict_race(race_id)
-    rec = pred_data.recommendation
-    race_name = pred_data.race_name
+    rec = pred_data["recommendation"]
+    race_name = pred_data["race_name"]
 
-    target_u = rec.target_umaban
-    h_name = rec.horse_name
-    grade = rec.grade
-    is_pass = rec.is_pass
-    b_tan = rec.tansho_amount
-    b_fuku = rec.fukusho_amount
-    total_bet = rec.total_amount
+    target_u = rec["target_umaban"]
+    h_name = rec["horse_name"]
+    grade = rec["grade"]
+    is_pass = rec["is_pass"]
+    b_tan = rec["tansho_amount"]
+    b_fuku = rec["fukusho_amount"]
+    total_bet = rec["total_amount"]
 
     # 見送り判定の場合
     if is_pass or target_u is None:
@@ -896,12 +902,12 @@ def verify_race_result(race_id: str):
     fukusho_unit_payout = race_res["payouts"]["fukusho"].get(target_u, 0)
 
     payout_t = int((b_tan / 100.0) * tansho_unit_payout) if actual_order == 1 else 0
-    payout_f = int((b_fuku / 100.0) * fukusho_unit_payout) if actual_order <= 3 else 0
+    payout_f = int((b_fuku / 100.0) * fukusho_unit_payout) if (actual_order <= 3 or fukusho_unit_payout > 0) else 0
     total_payout = payout_t + payout_f
 
     profit = total_payout - total_bet
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
-    is_hit = actual_order <= 3
+    is_hit = (actual_order <= 3) or (total_payout > 0)
 
     settlement = {
         "race_id": race_id,
@@ -922,7 +928,7 @@ def verify_race_result(race_id: str):
     }
     save_settlement(settlement)
 
-    msg = f"{h_name} は {actual_order}着でした。"
+    msg = f"{h_name} は {actual_order}着でした。" if actual_order != 99 else f"{h_name} の結果です。"
     if is_hit:
         msg += f" 的中！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
     else:
@@ -935,7 +941,7 @@ def verify_race_result(race_id: str):
         "grade": grade,
         "target_umaban": target_u,
         "horse_name": h_name,
-        "actual_order": actual_order,
+        "actual_order": actual_order if actual_order != 99 else None,
         "is_hit": is_hit,
         "total_bet": total_bet,
         "total_payout": total_payout,
