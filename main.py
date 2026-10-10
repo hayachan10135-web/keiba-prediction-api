@@ -3,13 +3,13 @@ import os
 import datetime
 import re
 import json
-import sqlite3
 import asyncio
 import requests
 import lightgbm as lgb
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
+from supabase import create_client, Client
 
 app = FastAPI(title="Keiba Prediction & Verification API")
 
@@ -20,72 +20,29 @@ HEADERS_PC = {
 
 MODEL_PATH = "lgb_model.txt"
 DICT_PATH = "stats_dict.json"
-DB_PATH = "results_cache.db"
 
-# --- SQLite データベース初期化 ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS predictions_cache (
-            race_id TEXT PRIMARY KEY,
-            race_date TEXT,
-            data_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS race_results_cache (
-            race_id TEXT PRIMARY KEY,
-            race_name TEXT,
-            race_date TEXT,
-            result_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS race_settlements (
-            race_id TEXT PRIMARY KEY,
-            race_date TEXT,
-            race_name TEXT,
-            target_umaban INTEGER,
-            horse_name TEXT,
-            grade TEXT,
-            is_pass INTEGER,
-            tansho_bet INTEGER,
-            fukusho_bet INTEGER,
-            total_bet INTEGER,
-            actual_order INTEGER,
-            tansho_payout INTEGER,
-            fukusho_payout INTEGER,
-            total_payout INTEGER,
-            is_hit INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scheduled_races (
-            race_id TEXT PRIMARY KEY,
-            race_date TEXT,
-            race_name TEXT,
-            post_datetime TEXT,
-            is_settled INTEGER DEFAULT 0,
-            retry_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+# --- Supabase クライアント初期化 ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-init_db()
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabaseクライアントを正常に初期化しました。")
+    except Exception as e:
+        print(f"Supabase初期化エラー: {e}")
+else:
+    print("警告: SUPABASE_URL または SUPABASE_KEY が環境変数に設定されていません。")
 
+# --- LightGBM & 統計辞書のロード ---
 model = None
 if os.path.exists(MODEL_PATH):
     try:
         model = lgb.Booster(model_file=MODEL_PATH)
         print("LightGBMモデルを正常にロードしました。")
     except Exception as e:
-        print(f"モデルのロードに失敗しました: {e}")
+        print(f"モデルロード失敗: {e}")
 
 stats_dict = {"jockey_stats": {}, "jockey_course_stats": {}, "trainer_stats": {}, "trainer_course_stats": {}}
 if os.path.exists(DICT_PATH):
@@ -94,7 +51,7 @@ if os.path.exists(DICT_PATH):
             stats_dict = json.load(f)
         print("統計辞書を正常にロードしました。")
     except Exception as e:
-        print(f"統計辞書のロードに失敗しました: {e}")
+        print(f"統計辞書ロード失敗: {e}")
 
 # --- Pydantic スキーマ ---
 class HorsePrediction(BaseModel):
@@ -173,7 +130,6 @@ class BatchStatusResponse(BaseModel):
     settled: int
     message: str
 
-# バッチ処理進捗状態（インメモリ管理）
 batch_status = {
     "is_running": False,
     "total": 0,
@@ -183,14 +139,15 @@ batch_status = {
     "message": "待機中"
 }
 
-
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Keiba Prediction & Verification API is running"}
+    return {"status": "ok", "message": "Keiba Prediction & Verification API (Supabase Backend) is running"}
 
 
-# --- 自動スケジュール登録ヘルパー ---
+# --- Supabase スケジュール登録 ---
 def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
+    if not supabase:
+        return
     try:
         m = re.search(r"(\d{1,2}):(\d{2})", post_time_str)
         if not m:
@@ -200,16 +157,15 @@ def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
         post_dt = datetime.datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
         post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO scheduled_races (race_id, race_date, race_name, post_datetime, is_settled)
-            VALUES (?, ?, ?, ?, 0)
-        """, (race_id, today_date, race_name, post_dt_str))
-        conn.commit()
-        conn.close()
+        supabase.table("keiba_scheduled_races").upsert({
+            "race_id": race_id,
+            "race_date": today_date,
+            "race_name": race_name,
+            "post_datetime": post_dt_str,
+            "is_settled": 0
+        }).execute()
     except Exception as e:
-        print(f"スケジュール登録エラー ({race_id}): {e}")
+        print(f"Supabaseスケジュール登録エラー ({race_id}): {e}")
 
 
 def parse_netkeiba_sp_page(html_text: str):
@@ -662,25 +618,32 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     }
 
 
+# =========================================================================
+# ★ Supabase CRUD ヘルパー関数 (keiba_ テーブルプレフィックス対応)
+# =========================================================================
+
 def get_cached_prediction(race_id: str) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT data_json FROM predictions_cache WHERE race_id = ?", (race_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
+    if not supabase:
+        return None
+    try:
+        res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", race_id).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]["data_json"]
+    except Exception as e:
+        print(f"Supabase予想取得エラー ({race_id}): {e}")
     return None
 
 def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO predictions_cache (race_id, race_date, data_json)
-        VALUES (?, ?, ?)
-    """, (race_id, race_date, json.dumps(data_dict, ensure_ascii=False)))
-    conn.commit()
-    conn.close()
+    if not supabase:
+        return
+    try:
+        supabase.table("keiba_predictions_cache").upsert({
+            "race_id": race_id,
+            "race_date": race_date,
+            "data_json": data_dict
+        }).execute()
+    except Exception as e:
+        print(f"Supabase予想保存エラー ({race_id}): {e}")
 
 
 @app.get("/predict/{race_id}", response_model=PredictResponse)
@@ -718,90 +681,100 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
 
 
 def get_cached_settlement(race_id: str) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM race_settlements WHERE race_id = ?", (race_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        d = dict(row)
-        profit = d["total_payout"] - d["total_bet"]
-        recovery = round((d["total_payout"] / d["total_bet"]) * 100.0, 2) if d["total_bet"] > 0 else 0.0
-        order = d["actual_order"]
-        
-        if order and 1 <= order <= 30:
-            order_str = f"{order}着でした。"
-        elif d["is_hit"]:
-            order_str = "馬券圏内（3着以内）に入線しました。"
-        else:
-            order_str = "着外でした。"
+    if not supabase:
+        return None
+    try:
+        res = supabase.table("keiba_race_settlements").select("*").eq("race_id", race_id).execute()
+        if res.data and len(res.data) > 0:
+            d = res.data[0]
+            profit = d["total_payout"] - d["total_bet"]
+            recovery = round((d["total_payout"] / d["total_bet"]) * 100.0, 2) if d["total_bet"] > 0 else 0.0
+            order = d["actual_order"]
 
-        if d["is_pass"]:
-            msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{order_str} / 資金保全成功)"
-        elif d["is_hit"]:
-            msg = f"{d['horse_name']} は {order_str} 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
-        else:
-            msg = f"{d['horse_name']} は {order_str} 不的中 (収支: {profit:,}円)"
+            if order and 1 <= order <= 30:
+                order_str = f"{order}着でした。"
+            elif d["is_hit"]:
+                order_str = "馬券圏内（3着以内）に入線しました。"
+            else:
+                order_str = "着外でした。"
 
-        return {
-            "race_id": d["race_id"],
-            "race_name": d["race_name"],
-            "is_pass": bool(d["is_pass"]),
-            "grade": d["grade"],
-            "target_umaban": d["target_umaban"],
-            "horse_name": d["horse_name"],
-            "actual_order": order if (order and order < 90) else (3 if d["is_hit"] else None),
-            "is_hit": bool(d["is_hit"]),
-            "total_bet": d["total_bet"],
-            "total_payout": d["total_payout"],
-            "profit": profit,
-            "recovery_rate": recovery,
-            "from_cache": True,
-            "message": msg
-        }
+            if d["is_pass"]:
+                msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{order_str} / 資金保全成功)"
+            elif d["is_hit"]:
+                msg = f"{d['horse_name']} は {order_str} 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+            else:
+                msg = f"{d['horse_name']} は {order_str} 不的中 (収支: {profit:,}円)"
+
+            return {
+                "race_id": d["race_id"],
+                "race_name": d["race_name"],
+                "is_pass": bool(d["is_pass"]),
+                "grade": d["grade"],
+                "target_umaban": d["target_umaban"],
+                "horse_name": d["horse_name"],
+                "actual_order": order if (order and order < 90) else (3 if d["is_hit"] else None),
+                "is_hit": bool(d["is_hit"]),
+                "total_bet": d["total_bet"],
+                "total_payout": d["total_payout"],
+                "profit": profit,
+                "recovery_rate": recovery,
+                "from_cache": True,
+                "message": msg
+            }
+    except Exception as e:
+        print(f"Supabase収支取得エラー ({race_id}): {e}")
     return None
 
 
 def get_cached_result(race_id: str) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT result_json FROM race_results_cache WHERE race_id = ?", (race_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
+    if not supabase:
+        return None
+    try:
+        res = supabase.table("keiba_race_results_cache").select("result_json").eq("race_id", race_id).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]["result_json"]
+    except Exception as e:
+        print(f"Supabase結果キャッシュ取得エラー ({race_id}): {e}")
     return None
 
 
 def save_cached_result(race_id: str, race_name: str, race_date: str, result_dict: dict):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO race_results_cache (race_id, race_name, race_date, result_json)
-        VALUES (?, ?, ?, ?)
-    """, (race_id, race_name, race_date, json.dumps(result_dict, ensure_ascii=False)))
-    conn.commit()
-    conn.close()
+    if not supabase:
+        return
+    try:
+        supabase.table("keiba_race_results_cache").upsert({
+            "race_id": race_id,
+            "race_name": race_name,
+            "race_date": race_date,
+            "result_json": result_dict
+        }).execute()
+    except Exception as e:
+        print(f"Supabase結果キャッシュ保存エラー ({race_id}): {e}")
 
 
 def save_settlement(data: dict):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO race_settlements (
-            race_id, race_date, race_name, target_umaban, horse_name, grade,
-            is_pass, tansho_bet, fukusho_bet, total_bet, actual_order,
-            tansho_payout, fukusho_payout, total_payout, is_hit
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data["race_id"], data["race_date"], data["race_name"], data["target_umaban"],
-        data["horse_name"], data["grade"], 1 if data["is_pass"] else 0,
-        data["tansho_bet"], data["fukusho_bet"], data["total_bet"], data["actual_order"],
-        data["tansho_payout"], data["fukusho_payout"], data["total_payout"], 1 if data["is_hit"] else 0
-    ))
-    conn.commit()
-    conn.close()
+    if not supabase:
+        return
+    try:
+        supabase.table("keiba_race_settlements").upsert({
+            "race_id": data["race_id"],
+            "race_date": data["race_date"],
+            "race_name": data["race_name"],
+            "target_umaban": data["target_umaban"],
+            "horse_name": data["horse_name"],
+            "grade": data["grade"],
+            "is_pass": 1 if data["is_pass"] else 0,
+            "tansho_bet": data["tansho_bet"],
+            "fukusho_bet": data["fukusho_bet"],
+            "total_bet": data["total_bet"],
+            "actual_order": data["actual_order"],
+            "tansho_payout": data["tansho_payout"],
+            "fukusho_payout": data["fukusho_payout"],
+            "total_payout": data["total_payout"],
+            "is_hit": 1 if data["is_hit"] else 0
+        }).execute()
+    except Exception as e:
+        print(f"Supabase収支台帳保存エラー: {e}")
 
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
@@ -1082,16 +1055,13 @@ def verify_race_result(race_id: str):
 def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
     target_date = date if date else datetime.date.today().strftime("%Y-%m-%d")
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM race_settlements
-        WHERE race_date = ?
-        ORDER BY race_id ASC
-    """, (target_date,))
-    rows = cur.fetchall()
-    conn.close()
+    rows = []
+    if supabase:
+        try:
+            res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
+            rows = res.data or []
+        except Exception as e:
+            print(f"Supabaseサマリー取得エラー: {e}")
 
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r["is_pass"] == 0)
@@ -1105,8 +1075,6 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     hit_rate = round((hit_races / bet_races) * 100.0, 2) if bet_races > 0 else 0.0
 
-    settled_list = [dict(r) for r in rows]
-
     return {
         "target_date": target_date,
         "total_races": total_races,
@@ -1118,7 +1086,7 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "total_payout_amount": total_payout,
         "total_profit": total_profit,
         "recovery_rate": recovery_rate,
-        "settled_races": settled_list
+        "settled_races": rows
     }
 
 
@@ -1172,7 +1140,7 @@ def run_batch_worker(target_date: Optional[str] = None):
                     verify_race_result(r_id)
                     batch_status["settled"] += 1
             except Exception:
-                pass  # 未確定レースは正常にスキップ
+                pass
 
         batch_status["message"] = f"完了: 全{len(all_race_ids)}R中、予想登録{batch_status['predicted']}件、検証{batch_status['settled']}件"
         print(f"[Batch] {batch_status['message']}")
@@ -1184,7 +1152,6 @@ def run_batch_worker(target_date: Optional[str] = None):
         batch_status["is_running"] = False
 
 
-# --- アプリから叩く非同期一括処理エンドポイント (即座に202開始レスポンスを返却) ---
 @app.post("/batch/today", response_model=BatchStartResponse)
 def run_today_batch(
     background_tasks: BackgroundTasks,
@@ -1197,7 +1164,6 @@ def run_today_batch(
             "message": f"現在処理中です ({batch_status['current']}/{batch_status['total']}レース進行中)"
         }
 
-    # バックグラウンドタスクとして非同期実行を開始（タイムアウトを防止）
     background_tasks.add_task(run_batch_worker, date)
 
     return {
@@ -1206,7 +1172,6 @@ def run_today_batch(
     }
 
 
-# --- バッチ進捗確認エンドポイント ---
 @app.get("/batch/status", response_model=BatchStatusResponse)
 def get_batch_status():
     return batch_status
@@ -1226,69 +1191,55 @@ async def background_maintenance_loop():
             now = datetime.datetime.now()
             today_str = now.strftime("%Y-%m-%d")
 
-            # --- A. 毎日 19:00 の全レース一括処理 (確定全レースの予想登録 ＆ 結果検証) ---
+            # --- A. 毎日 19:00 の全レース一括処理 ---
             if now.hour == 19 and last_19h_batch_date != today_str:
                 if not batch_status["is_running"]:
                     print(f"[Scheduler] 19:00 定期全レース一括バッチ処理を開始します...")
-                    # バックグラウンドワーカーを直接スレッドで呼び出し
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, run_batch_worker, today_str)
                     last_19h_batch_date = today_str
 
-            # --- B. 毎日 0:00 の一時キャッシュ削除 (収支台帳は永続保持) ---
+            # --- B. 毎日 0:00 の一時キャッシュ削除 (収支台帳 keiba_race_settlements は残す) ---
             if now.hour == 0 and last_cleaned_date != today_str:
-                print(f"[Cleanup] 0:00 定期クリーンアップを開始します (収支台帳は保持)")
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.execute("DELETE FROM predictions_cache WHERE race_date < ?", (today_str,))
-                cur.execute("DELETE FROM race_results_cache WHERE race_date < ?", (today_str,))
-                cur.execute("DELETE FROM scheduled_races WHERE race_date < ?", (today_str,))
-                cur.execute("VACUUM")
-                conn.commit()
-                conn.close()
+                if supabase:
+                    print(f"[Cleanup] 0:00 定期クリーンアップを開始します (収支台帳は永続保持)")
+                    try:
+                        supabase.table("keiba_predictions_cache").delete().lt("race_date", today_str).execute()
+                        supabase.table("keiba_race_results_cache").delete().lt("race_date", today_str).execute()
+                        supabase.table("keiba_scheduled_races").delete().lt("race_date", today_str).execute()
+                        print(f"[Cleanup] Supabaseの前日以前の一時キャッシュを削除しました。")
+                    except Exception as ce:
+                        print(f"[Cleanup] クリーンアップ失敗: {ce}")
                 last_cleaned_date = today_str
-                print(f"[Cleanup] 前日以前の一時キャッシュを削除しました。")
 
             # --- C. 発走1時間後の個別自動照合巡回 ---
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT race_id, race_name, post_datetime, retry_count
-                FROM scheduled_races
-                WHERE is_settled = 0
-            """)
-            scheduled_races = cur.fetchall()
-            conn.close()
-
-            for r in scheduled_races:
-                r_id = r["race_id"]
-                p_dt_str = r["post_datetime"]
-                retries = r["retry_count"]
-
+            if supabase:
                 try:
-                    post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    continue
+                    res = supabase.table("keiba_scheduled_races").select("*").eq("is_settled", 0).execute()
+                    scheduled_races = res.data or []
 
-                trigger_time = post_dt + datetime.timedelta(minutes=60)
-                if now >= trigger_time:
-                    try:
-                        verify_race_result(r_id)
-                        conn_up = sqlite3.connect(DB_PATH)
-                        cur_up = conn_up.cursor()
-                        cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
-                        conn_up.commit()
-                        conn_up.close()
-                    except Exception:
-                        conn_up = sqlite3.connect(DB_PATH)
-                        cur_up = conn_up.cursor()
-                        if retries >= 10:
-                            cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
-                        else:
-                            cur_up.execute("UPDATE scheduled_races SET retry_count = retry_count + 1 WHERE race_id = ?", (r_id,))
-                        conn_up.commit()
-                        conn_up.close()
+                    for r in scheduled_races:
+                        r_id = r["race_id"]
+                        p_dt_str = r["post_datetime"]
+                        retries = r.get("retry_count", 0)
+
+                        try:
+                            post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            continue
+
+                        trigger_time = post_dt + datetime.timedelta(minutes=60)
+                        if now >= trigger_time:
+                            try:
+                                verify_race_result(r_id)
+                                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
+                            except Exception:
+                                if retries >= 10:
+                                    supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
+                                else:
+                                    supabase.table("keiba_scheduled_races").update({"retry_count": retries + 1}).eq("race_id", r_id).execute()
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"[Scheduler] ループエラー: {e}")
