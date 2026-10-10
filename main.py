@@ -1,15 +1,16 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 import datetime
 import re
 import json
+import sqlite3
 import requests
 import lightgbm as lgb
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-app = FastAPI(title="Keiba Prediction API")
+app = FastAPI(title="Keiba Prediction & Verification API")
 
 HEADERS_PC = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -19,6 +20,47 @@ HEADERS_PC = {
 # --- モデル & 統計辞書のロード ---
 MODEL_PATH = "lgb_model.txt"
 DICT_PATH = "stats_dict.json"
+DB_PATH = "results_cache.db"
+
+# --- SQLite データベース初期化 ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # 確定レース結果キャッシュテーブル
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS race_results_cache (
+            race_id TEXT PRIMARY KEY,
+            race_name TEXT,
+            race_date TEXT,
+            result_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # 収支検証履歴テーブル
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS race_settlements (
+            race_id TEXT PRIMARY KEY,
+            race_date TEXT,
+            race_name TEXT,
+            target_umaban INTEGER,
+            horse_name TEXT,
+            grade TEXT,
+            is_pass INTEGER,
+            tansho_bet INTEGER,
+            fukusho_bet INTEGER,
+            total_bet INTEGER,
+            actual_order INTEGER,
+            tansho_payout INTEGER,
+            fukusho_payout INTEGER,
+            total_payout INTEGER,
+            is_hit INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
 
 model = None
 if os.path.exists(MODEL_PATH):
@@ -41,7 +83,7 @@ if os.path.exists(DICT_PATH):
 else:
     print("stats_dict.json が見つかりません。デフォルト値(0.25)を使用します。")
 
-# --- Pydantic レスポンススキーマ ---
+# --- Pydantic スキーマ ---
 class HorsePrediction(BaseModel):
     umaban: int
     wakuban: int
@@ -77,10 +119,39 @@ class PredictResponse(BaseModel):
     horses: List[HorsePrediction]
     recommendation: TanFukuRecommendation
 
+class VerificationResult(BaseModel):
+    race_id: str
+    race_name: str
+    is_pass: bool
+    grade: str
+    target_umaban: Optional[int]
+    horse_name: Optional[str]
+    actual_order: Optional[int]
+    is_hit: bool
+    total_bet: int
+    total_payout: int
+    profit: int
+    recovery_rate: float
+    from_cache: bool
+    message: str
+
+class DailySummary(BaseModel):
+    target_date: str
+    total_races: int
+    bet_races: int
+    pass_races: int
+    hit_races: int
+    hit_rate: float
+    total_bet_amount: int
+    total_payout_amount: int
+    total_profit: int
+    recovery_rate: float
+    settled_races: List[dict]
+
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Keiba Prediction API is running"}
+    return {"status": "ok", "message": "Keiba Prediction & Verification API is running"}
 
 
 # --- 開催日レース一覧 (GET /races/today) ---
@@ -186,7 +257,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-# --- 出馬表・コース詳細条件・調教師・オッズ抽出 ---
+# --- 出馬表取得 ---
 def fetch_shutuba_table(race_id: str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
@@ -352,12 +423,8 @@ def fetch_shutuba_table(race_id: str):
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
-# --- 動的資金配分ロジック (単勝2.0倍未満ケン判定ガード付き) ---
+# --- 動的資金配分ロジック (単勝2.0倍未満ケン判定付き) ---
 def calculate_dynamic_bet(score: float, odds: Optional[float] = None):
-    """
-    推論スコア分布に基づく動的配分。
-    ただし、単勝オッズが2.0倍未満（低配当・トリガミリスク）の場合は無条件で見送り(ケン)にする。
-    """
     if odds is not None and odds < 2.0:
         return "D", "見送り推奨(低オッズ)", True, 0, 0
 
@@ -451,13 +518,6 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev,
                 j_rate, jc_rate, t_rate, tc_rate
             ])
-        elif expected_num_features == 15:
-            feature_rows.append([
-                w, u, k,
-                venue_code, surface_type, distance, distance_diff, condition_code,
-                career_races, career_top3_rate,
-                prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev
-            ])
         else:
             feature_rows.append([w, u, k, o, p])
 
@@ -467,7 +527,6 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             for idx, h in enumerate(horses):
                 h["score"] = round(float(scores[idx]), 4)
         except Exception as e:
-            print(f"推論エラー (フォールバック計算に移行): {e}")
             for idx, h in enumerate(horses):
                 odds = h["odds"] if h["odds"] else 50.0
                 h["score"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
@@ -482,12 +541,10 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     for h in sorted_horses:
         h["mark"] = "-"
 
-    # 1位〜5位への印付け
     base_marks = ["◎", "◯", "▲", "△", "×"]
     for idx in range(min(5, len(sorted_horses))):
         sorted_horses[idx]["mark"] = base_marks[idx]
 
-    # 6位以降の☆（最大3頭）
     if len(sorted_horses) >= 6:
         sorted_horses[5]["mark"] = "☆"
         base_hoshi_score = sorted_horses[5]["score"]
@@ -500,7 +557,6 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                     if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
                         sorted_horses[7]["mark"] = "☆"
 
-    # 本命馬（◎）の抽出と動的配分算出（単勝2.0倍未満ガード適用）
     honmei_horse = next((h for h in sorted_horses if h["mark"] == "◎"), None)
 
     if honmei_horse:
@@ -544,7 +600,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     }
 
 
-# --- 推論エンドポイント ---
+# --- 1. 推論エンドポイント ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
@@ -567,3 +623,297 @@ def predict_race(race_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
+
+
+# =========================================================================
+# ★ 結果検証 ＆ 確定後キャッシュ永続化 ＆ 当日回収率集計
+# =========================================================================
+
+def get_cached_result(race_id: str) -> Optional[dict]:
+    """SQLiteから確定済み結果を取得（netkeibaアクセスをスキップ）"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT result_json FROM race_results_cache WHERE race_id = ?", (race_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+
+def save_cached_result(race_id: str, race_name: str, race_date: str, result_dict: dict):
+    """確定したレース結果をSQLiteに永続保存"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO race_results_cache (race_id, race_name, race_date, result_json)
+        VALUES (?, ?, ?, ?)
+    """, (race_id, race_name, race_date, json.dumps(result_dict, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+def save_settlement(data: dict):
+    """収支検証レコードをSQLiteに記録"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO race_settlements (
+            race_id, race_date, race_name, target_umaban, horse_name, grade,
+            is_pass, tansho_bet, fukusho_bet, total_bet, actual_order,
+            tansho_payout, fukusho_payout, total_payout, is_hit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data["race_id"], data["race_date"], data["race_name"], data["target_umaban"],
+        data["horse_name"], data["grade"], 1 if data["is_pass"] else 0,
+        data["tansho_bet"], data["fukusho_bet"], data["total_bet"], data["actual_order"],
+        data["tansho_payout"], data["fukusho_payout"], data["total_payout"], 1 if data["is_hit"] else 0
+    ))
+    conn.commit()
+    conn.close()
+
+
+def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
+    """
+    netkeibaの結果ページ(result.html)から確定着順と払戻金をスクレイピング
+    ※ 確定していない場合は None を返す
+    """
+    url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+    resp = requests.get(url, headers=HEADERS_PC, timeout=10)
+    try:
+        html = resp.content.decode("euc-jp")
+    except UnicodeDecodeError:
+        html = resp.content.decode("utf-8", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+
+    # レース名の抽出
+    r_name_tag = soup.select_one(".RaceName, h1")
+    race_name = r_name_tag.get_text(strip=True) if r_name_tag else f"Race {race_id}"
+
+    # 着順テーブルの確認
+    rows = soup.select("table.RaceTable01 tr.HorseList")
+    if not rows:
+        return None
+
+    orders = {}
+    for r in rows:
+        order_tag = r.select_one("td.Result_Num, td.Rank")
+        umaban_tag = r.select_one("td.Umaban")
+        if order_tag and umaban_tag:
+            o_txt = order_tag.get_text(strip=True)
+            u_txt = umaban_tag.get_text(strip=True)
+            if o_txt.isdigit() and u_txt.isdigit():
+                orders[int(u_txt)] = int(o_txt)
+
+    # 1〜3着が確定していなければ未確定とみなす
+    if not any(v == 1 for v in orders.values()):
+        return None
+
+    # 払戻金テーブル (単勝・複勝)
+    payouts = {"tansho": {}, "fukusho": {}}
+    pay_tables = soup.select("table.Payout_Detail_Table")
+    for table in pay_tables:
+        for tr in table.select("tr"):
+            th = tr.select_one("th")
+            if not th:
+                continue
+            kind = th.get_text(strip=True)
+            td_nums = tr.select("td.Result")
+            td_pays = tr.select("td.Payout")
+
+            if "単勝" in kind and td_nums and td_pays:
+                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
+                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
+                for n, p in zip(nums, pays):
+                    payouts["tansho"][n] = p
+
+            elif "複勝" in kind and td_nums and td_pays:
+                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
+                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
+                for n, p in zip(nums, pays):
+                    payouts["fukusho"][n] = p
+
+    return {
+        "race_name": race_name,
+        "orders": orders,
+        "payouts": payouts
+    }
+
+
+# --- 2. 個別レース結果検証エンドポイント ---
+@app.get("/result/{race_id}", response_model=VerificationResult)
+def verify_race_result(race_id: str):
+    if len(race_id) != 12 or not race_id.isdigit():
+        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
+
+    # レース日付 (YYYY-MM-DD)
+    r_year = race_id[:4]
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    race_date = f"{r_year}-{today_str[5:7]}-{today_str[8:]}"
+
+    # 1. まずローカルキャッシュ(DB)を確認（確定済みならnetkeibaへアクセスしない）
+    cached_data = get_cached_result(race_id)
+    from_cache = False
+
+    if cached_data:
+        from_cache = True
+        race_res = cached_data
+    else:
+        # キャッシュがなければ netkeiba へ問い合わせ
+        race_res = fetch_netkeiba_race_result(race_id)
+        if not race_res:
+            raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
+        # 確定していれば次回以降のためにDBへ永続保存
+        save_cached_result(race_id, race_res["race_name"], race_date, race_res)
+
+    # 2. 当該レースのAI推奨買い目を取得
+    pred_data = predict_race(race_id)
+    rec = pred_data.recommendation
+    race_name = pred_data.race_name
+
+    target_u = rec.target_umaban
+    h_name = rec.horse_name
+    grade = rec.grade
+    is_pass = rec.is_pass
+    b_tan = rec.tansho_amount
+    b_fuku = rec.fukusho_amount
+    total_bet = rec.total_amount
+
+    # 見送り判定の場合
+    if is_pass or target_u is None:
+        settlement = {
+            "race_id": race_id,
+            "race_date": race_date,
+            "race_name": race_name,
+            "target_umaban": target_u,
+            "horse_name": h_name,
+            "grade": grade,
+            "is_pass": True,
+            "tansho_bet": 0,
+            "fukusho_bet": 0,
+            "total_bet": 0,
+            "actual_order": race_res["orders"].get(target_u) if target_u else None,
+            "tansho_payout": 0,
+            "fukusho_payout": 0,
+            "total_payout": 0,
+            "is_hit": False
+        }
+        save_settlement(settlement)
+        return {
+            "race_id": race_id,
+            "race_name": race_name,
+            "is_pass": True,
+            "grade": grade,
+            "target_umaban": target_u,
+            "horse_name": h_name,
+            "actual_order": settlement["actual_order"],
+            "is_hit": False,
+            "total_bet": 0,
+            "total_payout": 0,
+            "profit": 0,
+            "recovery_rate": 0.0,
+            "from_cache": from_cache,
+            "message": "見送り推奨レースのため、投資・払戻はありません（資金保全成功）。"
+        }
+
+    # 3. 確定着順と払戻の照合
+    actual_order = race_res["orders"].get(target_u, 99)
+    tansho_unit_payout = race_res["payouts"]["tansho"].get(target_u, 0)
+    fukusho_unit_payout = race_res["payouts"]["fukusho"].get(target_u, 0)
+
+    # 1着: 単勝払戻 (単勝購入額 / 100 * 100円あたり払戻金)
+    payout_t = int((b_tan / 100.0) * tansho_unit_payout) if actual_order == 1 else 0
+    # 3着以内: 複勝払戻
+    payout_f = int((b_fuku / 100.0) * fukusho_unit_payout) if actual_order <= 3 else 0
+    total_payout = payout_t + payout_f
+
+    profit = total_payout - total_bet
+    recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
+    is_hit = actual_order <= 3
+
+    settlement = {
+        "race_id": race_id,
+        "race_date": race_date,
+        "race_name": race_name,
+        "target_umaban": target_u,
+        "horse_name": h_name,
+        "grade": grade,
+        "is_pass": False,
+        "tansho_bet": b_tan,
+        "fukusho_bet": b_fuku,
+        "total_bet": total_bet,
+        "actual_order": actual_order,
+        "tansho_payout": payout_t,
+        "fukusho_payout": payout_f,
+        "total_payout": total_payout,
+        "is_hit": is_hit
+    }
+    save_settlement(settlement)
+
+    msg = f"{h_name} は {actual_order}着でした。"
+    if is_hit:
+        msg += f" 的中！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+    else:
+        msg += f" 不的中 (収支: {profit:,}円)"
+
+    return {
+        "race_id": race_id,
+        "race_name": race_name,
+        "is_pass": False,
+        "grade": grade,
+        "target_umaban": target_u,
+        "horse_name": h_name,
+        "actual_order": actual_order,
+        "is_hit": is_hit,
+        "total_bet": total_bet,
+        "total_payout": total_payout,
+        "profit": profit,
+        "recovery_rate": recovery_rate,
+        "from_cache": from_cache,
+        "message": msg
+    }
+
+
+# --- 3. 当日・指定日の総合成績・回収率集計エンドポイント ---
+@app.get("/summary/today", response_model=DailySummary)
+def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
+    target_date = date if date else datetime.date.today().strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM race_settlements
+        WHERE race_date = ?
+        ORDER BY race_id ASC
+    """, (target_date,))
+    rows = cur.fetchall()
+    conn.close()
+
+    total_races = len(rows)
+    bet_races = sum(1 for r in rows if r["is_pass"] == 0)
+    pass_races = sum(1 for r in rows if r["is_pass"] == 1)
+    hit_races = sum(1 for r in rows if r["is_hit"] == 1 and r["is_pass"] == 0)
+
+    total_bet = sum(r["total_bet"] for r in rows)
+    total_payout = sum(r["total_payout"] for r in rows)
+    total_profit = total_payout - total_bet
+
+    recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
+    hit_rate = round((hit_races / bet_races) * 100.0, 2) if bet_races > 0 else 0.0
+
+    settled_list = [dict(r) for r in rows]
+
+    return {
+        "target_date": target_date,
+        "total_races": total_races,
+        "bet_races": bet_races,
+        "pass_races": pass_races,
+        "hit_races": hit_races,
+        "hit_rate": hit_rate,
+        "total_bet_amount": total_bet,
+        "total_payout_amount": total_payout,
+        "total_profit": total_profit,
+        "recovery_rate": recovery_rate,
+        "settled_races": settled_list
+    }
