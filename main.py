@@ -27,7 +27,18 @@ DB_PATH = "results_cache.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # 確定レース結果キャッシュテーブル
+    
+    # 1. 出馬表・推論結果キャッシュテーブル（当日アクセス高速化用・0時にクリア）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS predictions_cache (
+            race_id TEXT PRIMARY KEY,
+            race_date TEXT,
+            data_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 2. 確定レース結果一時キャッシュテーブル（0時にクリア）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_results_cache (
             race_id TEXT PRIMARY KEY,
@@ -37,7 +48,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 収支検証履歴テーブル
+    
+    # 3. ★ 確定収支台帳テーブル（永続保存：0時になっても削除しない）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_settlements (
             race_id TEXT PRIMARY KEY,
@@ -58,7 +70,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 自動照合監視用スケジュールテーブル
+    
+    # 4. 発走後自動照合用スケジュールテーブル（0時にクリア）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_races (
             race_id TEXT PRIMARY KEY,
@@ -169,7 +182,6 @@ def health_check():
 
 # --- 自動スケジュール登録ヘルパー ---
 def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
-    """発走時刻（例: '10:05発走'）をパースし、DBに監視対象として登録"""
     try:
         m = re.search(r"(\d{1,2}):(\d{2})", post_time_str)
         if not m:
@@ -177,7 +189,6 @@ def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
         hour, minute = int(m.group(1)), int(m.group(2))
         today_date = datetime.date.today().strftime("%Y-%m-%d")
         post_dt = datetime.datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-        
         post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         conn = sqlite3.connect(DB_PATH)
@@ -374,7 +385,6 @@ def fetch_shutuba_table(race_id: str):
         "course_details": course_details
     }
 
-    # ★ 出馬表取得時に発走時刻をスケジュールDBへ自動登録
     if post_time:
         register_race_schedule(race_id, race_name, post_time)
 
@@ -648,25 +658,63 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     }
 
 
-# --- 推論エンドポイント ---
+# =========================================================================
+# ★ 予想キャッシュ（当日初回アクセス時は保存、以降は高速参照）
+# =========================================================================
+
+def get_cached_prediction(race_id: str) -> Optional[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT data_json FROM predictions_cache WHERE race_id = ?", (race_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO predictions_cache (race_id, race_date, data_json)
+        VALUES (?, ?, ?, ?)
+    """, (race_id, race_date, json.dumps(data_dict, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+# --- 推論エンドポイント (キャッシュ優先 ＆ force_refresh対応) ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
-def predict_race(race_id: str):
+def predict_race(race_id: str, force_refresh: bool = Query(False, description="手動で予想を再実行する場合True")):
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
+    # 手動再予想でなければ、まずSQLiteキャッシュを検索（5msで即時返却）
+    if not force_refresh:
+        cached_pred = get_cached_prediction(race_id)
+        if cached_pred:
+            return cached_pred
+
+    # キャッシュがない場合、または「再予想」ボタン押下時はスクレイピング＋推論実行
     try:
         race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id)
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
-        return {
+        resp_data = {
             "race_id": race_id,
             "race_name": result["race_name"],
             "race_details": result["race_details"],
             "horses": result["horses"],
             "recommendation": result["recommendation"]
         }
+
+        # 次回アクセスの高速化のためSQLiteへ保存
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        save_cached_prediction(race_id, today_str, resp_data)
+
+        return resp_data
     except HTTPException:
         raise
     except Exception as e:
@@ -676,6 +724,45 @@ def predict_race(race_id: str):
 # =========================================================================
 # ★ 結果検証 ＆ 確定後キャッシュ永続化 ＆ 当日回収率集計
 # =========================================================================
+
+def get_cached_settlement(race_id: str) -> Optional[dict]:
+    """確定収支台帳（race_settlements）から直接取得（predict_raceをスキップして超高速化）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM race_settlements WHERE race_id = ?", (race_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        d = dict(row)
+        profit = d["total_payout"] - d["total_bet"]
+        recovery = round((d["total_payout"] / d["total_bet"]) * 100.0, 2) if d["total_bet"] > 0 else 0.0
+        
+        if d["is_pass"]:
+            msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{d['actual_order']}着 / 資金保全成功)" if d["actual_order"] else "見送り推奨レースのため、投資・払戻はありません。"
+        elif d["is_hit"]:
+            msg = f"{d['horse_name']} は {d['actual_order']}着でした。 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+        else:
+            msg = f"{d['horse_name']} は {d['actual_order']}着でした。 不的中 (収支: {profit:,}円)" if d["actual_order"] else f"{d['horse_name']} の結果です。 不的中 (収支: {profit:,}円)"
+
+        return {
+            "race_id": d["race_id"],
+            "race_name": d["race_name"],
+            "is_pass": bool(d["is_pass"]),
+            "grade": d["grade"],
+            "target_umaban": d["target_umaban"],
+            "horse_name": d["horse_name"],
+            "actual_order": d["actual_order"],
+            "is_hit": bool(d["is_hit"]),
+            "total_bet": d["total_bet"],
+            "total_payout": d["total_payout"],
+            "profit": profit,
+            "recovery_rate": recovery,
+            "from_cache": True,
+            "message": msg
+        }
+    return None
+
 
 def get_cached_result(race_id: str) -> Optional[dict]:
     conn = sqlite3.connect(DB_PATH)
@@ -719,15 +806,11 @@ def save_settlement(data: dict):
 
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
-    """
-    確定したレース結果（着順・単勝・複勝払戻）をSP版/PC版/DB版から確実にスクレイピング
-    単勝払戻が検出できれば確定済みと判定
-    """
     orders = {}
     payouts = {"tansho": {}, "fukusho": {}}
     race_name = f"Race {race_id}"
 
-    # --- 1. SP版速報ページ ---
+    # 1. SP版速報ページ
     sp_url = f"https://race.sp.netkeiba.com/race/result.html?race_id={race_id}"
     try:
         resp = requests.get(sp_url, headers=HEADERS_PC, timeout=10)
@@ -741,7 +824,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         if r_title:
             race_name = r_title.get_text(strip=True)
 
-        # 払戻テーブル（単勝・複勝）
         for tr in soup.select("table[class*='Payout'] tr, table[class*='Pay'] tr, .Payout_Detail tr"):
             th = tr.select_one("th")
             tds = tr.find_all("td")
@@ -756,7 +838,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
                     for n, p in zip(nums, pays):
                         payouts["fukusho"][n] = p
 
-        # SP版の着順走査
         for row in soup.select("tr.HorseList, .RaceResultList tr, table tr, tr"):
             o_elem = row.select_one(".Rank, td.Rank, td.Result_Num, .Result_Num")
             u_elem = row.select_one(".Umaban, td.Umaban, .umaban")
@@ -768,7 +849,7 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     except Exception as e:
         print(f"SP版取得エラー: {e}")
 
-    # --- 2. PC版速報ページ (フォールバック) ---
+    # 2. PC版速報ページ (フォールバック)
     if not payouts["tansho"] or len(orders) < 3:
         pc_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         try:
@@ -783,7 +864,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
             if r_title and not race_name:
                 race_name = r_title.get_text(strip=True)
 
-            # PC版払戻テーブル
             for tr in soup.select("table.Payout_Detail_Table tr, table[class*='Payout'] tr"):
                 th = tr.select_one("th")
                 td_res = tr.select_one("td.Result")
@@ -799,7 +879,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
                         for n, p in zip(nums, pays):
                             payouts["fukusho"][n] = p
 
-            # PC版着順走査
             for tr in soup.select("table.RaceTable01 tr, table.ResultTable tr, tr.HorseList"):
                 o_elem = tr.select_one("td.Rank, td.Result_Num, div.Rank")
                 u_elem = tr.select_one("td.Umaban, div.Umaban")
@@ -811,7 +890,7 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         except Exception as e:
             print(f"PC版取得エラー: {e}")
 
-    # --- 3. db.netkeiba.com (アーカイブ用フォールバック) ---
+    # 3. db.netkeiba.com (アーカイブ用フォールバック)
     if not payouts["tansho"] and not any(v == 1 for v in orders.values()):
         db_url = f"https://db.netkeiba.com/race/{race_id}/"
         try:
@@ -846,7 +925,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         except Exception as e:
             print(f"DB版取得エラー: {e}")
 
-    # 確定判定（単勝払戻が存在するか、または1着が存在すれば確定とみなす）
     is_confirmed = (len(payouts["tansho"]) > 0) or (1 in orders.values())
 
     if len(payouts["tansho"]) > 0 and 1 not in orders.values():
@@ -865,17 +943,22 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     }
 
 
-# --- 個別レース結果検証エンドポイント ---
+# --- 個別レース結果検証エンドポイント (確定後はミリ秒即時リターン) ---
 @app.get("/result/{race_id}", response_model=VerificationResult)
 def verify_race_result(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
+    # ★ 1. すでに確定・検証済みの場合は、推論もスクレイピングも一切スキップして即時返却 (5ms)
+    cached_settlement = get_cached_settlement(race_id)
+    if cached_settlement:
+        return cached_settlement
+
     r_year = race_id[:4]
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     race_date = f"{r_year}-{today_str[5:7]}-{today_str[8:]}"
 
-    # 1. ローカルキャッシュ(DB)を確認（確定済みならnetkeibaへアクセスしない）
+    # 2. 結果取得
     cached_data = get_cached_result(race_id)
     from_cache = False
 
@@ -888,7 +971,7 @@ def verify_race_result(race_id: str):
             raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
         save_cached_result(race_id, race_res["race_name"], race_date, race_res)
 
-    # 2. 当該レースのAI推奨買い目を取得
+    # 3. 推論結果の取得（キャッシュから読み出されるため高速）
     pred_data = predict_race(race_id)
     rec = pred_data["recommendation"]
     race_name = pred_data["race_name"]
@@ -939,7 +1022,7 @@ def verify_race_result(race_id: str):
             "message": f"見送り推奨レースです。(本命{target_u}番は{actual_order}着 / 資金保全成功)" if actual_order else "見送り推奨レースのため、投資・払戻はありません。"
         }
 
-    # 3. 確定着順と払戻の照合
+    # 4. 確定着順と払戻の照合
     actual_order = race_res["orders"].get(target_u, 99)
     tansho_unit_payout = race_res["payouts"]["tansho"].get(target_u, 0)
     fukusho_unit_payout = race_res["payouts"]["fukusho"].get(target_u, 0)
@@ -952,6 +1035,7 @@ def verify_race_result(race_id: str):
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     is_hit = (actual_order <= 3) or (total_payout > 0)
 
+    # 収支台帳へ記録（永続保存）
     settlement = {
         "race_id": race_id,
         "race_date": race_date,
@@ -1041,18 +1125,39 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 
 
 # =========================================================================
-# ★ 出走時刻から1時間後に自動で照合するバックグラウンドスケジューラー
+# ★ 出走1時間後自動照合 ＆ 毎日0時の一時キャッシュ自動クリーンアップ
 # =========================================================================
 
-async def auto_verification_scheduler_loop():
+async def background_maintenance_loop():
     """
-    バックグラウンド定期巡回ループ (90秒ごとにチェック)
-    現在時刻 >= 発走時刻 + 1時間 の未確定レースを自動検証・キャッシュ登録
+    バックグラウンド定期巡回ループ
+    1. 発走1時間後の自動照合（90秒おき）
+    2. 毎日0:00の一時キャッシュクリア（出馬表キャッシュ・結果キャッシュのみ削除、収支台帳は残す）
     """
-    print("[Scheduler] 自動照合スケジューラーを開始しました。")
+    print("[Scheduler] メンテナンススケジューラーを開始しました。")
+    last_cleaned_date = None
+
     while True:
         try:
             now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+
+            # --- A. 毎日 0:00 の一時キャッシュ削除 ---
+            if now.hour == 0 and last_cleaned_date != today_str:
+                print(f"[Cleanup] 0:00 定期クリーンアップを開始します (収支台帳は保持)")
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                # 出馬表・推論キャッシュと結果一時キャッシュをクリア
+                cur.execute("DELETE FROM predictions_cache WHERE race_date < ?", (today_str,))
+                cur.execute("DELETE FROM race_results_cache WHERE race_date < ?", (today_str,))
+                cur.execute("DELETE FROM scheduled_races WHERE race_date < ?", (today_str,))
+                cur.execute("VACUUM")  # DBファイル断片化解消と容量圧縮
+                conn.commit()
+                conn.close()
+                last_cleaned_date = today_str
+                print(f"[Cleanup] 前日以前の一時キャッシュを削除しました。")
+
+            # --- B. 発走1時間後の自動照合巡回 ---
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -1074,40 +1179,32 @@ async def auto_verification_scheduler_loop():
                 except Exception:
                     continue
 
-                # ★ 出走時刻から1時間（60分）経過しているかを判定
                 trigger_time = post_dt + datetime.timedelta(minutes=60)
                 if now >= trigger_time:
-                    print(f"[Scheduler] 自動照合を実行します: {r_id} ({r['race_name']}) - 発走: {p_dt_str}")
                     try:
-                        res = verify_race_result(r_id)
-                        # 正常に照合・確定できたら完了マーク
+                        verify_race_result(r_id)
                         conn_up = sqlite3.connect(DB_PATH)
                         cur_up = conn_up.cursor()
                         cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
                         conn_up.commit()
                         conn_up.close()
-                        print(f"[Scheduler] 自動照合完了・収支保存成功: {r_id} -> {res.message}")
+                        print(f"[Scheduler] 自動照合完了: {r_id}")
                     except Exception as err:
-                        # まだ確定していない場合（最大10回まで再試行カウント）
                         conn_up = sqlite3.connect(DB_PATH)
                         cur_up = conn_up.cursor()
                         if retries >= 10:
-                            # 10回失敗した場合は断念して完了扱いに
                             cur_up.execute("UPDATE scheduled_races SET is_settled = 1 WHERE race_id = ?", (r_id,))
                         else:
                             cur_up.execute("UPDATE scheduled_races SET retry_count = retry_count + 1 WHERE race_id = ?", (r_id,))
                         conn_up.commit()
                         conn_up.close()
-                        print(f"[Scheduler] 自動照合保留 (未確定): {r_id} ({err})")
 
         except Exception as e:
-            print(f"[Scheduler] 巡回ループエラー: {e}")
+            print(f"[Scheduler] ループエラー: {e}")
 
-        # 90秒待機して次回巡回
         await asyncio.sleep(90)
 
 
 @app.on_event("startup")
 async def startup_event():
-    # サーバー起動時に自動照合ループを非同期タスクとしてバックグラウンド実行
-    asyncio.create_task(auto_verification_scheduler_loop())
+    asyncio.create_task(background_maintenance_loop())
