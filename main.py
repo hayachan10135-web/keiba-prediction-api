@@ -26,7 +26,6 @@ DB_PATH = "results_cache.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # 確定レース結果キャッシュテーブル
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_results_cache (
             race_id TEXT PRIMARY KEY,
@@ -36,7 +35,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 収支検証履歴テーブル
     cur.execute("""
         CREATE TABLE IF NOT EXISTS race_settlements (
             race_id TEXT PRIMARY KEY,
@@ -519,7 +517,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 j_rate, jc_rate, t_rate, tc_rate
             ])
         else:
-            feature_rows.append([w, u, k, o, p])
+            feature_rows.append([
+                w, u, k,
+                venue_code, surface_type, distance, distance_diff, condition_code,
+                career_races, career_top3_rate,
+                prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev
+            ])
 
     if model:
         try:
@@ -527,6 +530,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             for idx, h in enumerate(horses):
                 h["score"] = round(float(scores[idx]), 4)
         except Exception as e:
+            print(f"推論エラー (フォールバック計算に移行): {e}")
             for idx, h in enumerate(horses):
                 odds = h["odds"] if h["odds"] else 50.0
                 h["score"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
@@ -600,7 +604,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     }
 
 
-# --- 1. 推論エンドポイント ---
+# --- 推論エンドポイント ---
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
@@ -630,7 +634,6 @@ def predict_race(race_id: str):
 # =========================================================================
 
 def get_cached_result(race_id: str) -> Optional[dict]:
-    """SQLiteから確定済み結果を取得（netkeibaアクセスをスキップ）"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT result_json FROM race_results_cache WHERE race_id = ?", (race_id,))
@@ -642,7 +645,6 @@ def get_cached_result(race_id: str) -> Optional[dict]:
 
 
 def save_cached_result(race_id: str, race_name: str, race_date: str, result_dict: dict):
-    """確定したレース結果をSQLiteに永続保存"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -654,7 +656,6 @@ def save_cached_result(race_id: str, race_name: str, race_date: str, result_dict
 
 
 def save_settlement(data: dict):
-    """収支検証レコードをSQLiteに記録"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -675,8 +676,7 @@ def save_settlement(data: dict):
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     """
-    netkeibaの結果ページから確定着順と払戻金を頑健にスクレイピング
-    PC版/SP版/速報版のHTML表記揺れに対応
+    netkeibaの結果ページ(result.html)から確定着順と払戻金を頑健にスクレイピング
     """
     url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
     try:
@@ -691,86 +691,54 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # レース名の抽出
+    # レース名
     r_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = r_name_tag.get_text(strip=True) if r_name_tag else f"Race {race_id}"
 
     # --- 1. 着順の抽出 ---
     orders = {}
-    
-    # 候補1: テーブルの全 tr 行から走査
-    table_rows = soup.select("table.RaceTable01 tr, table.ResultTable tr, table.All_Result_Table tr, tr.HorseList")
-    for r in table_rows:
-        tds = r.find_all("td")
-        if len(tds) < 3:
-            continue
-        
-        # 着順・馬番を特定
-        order_val = None
-        umaban_val = None
-
-        # クラス指定で探す
-        order_tag = r.select_one("td.Result_Num, td.Rank, td.order")
-        umaban_tag = r.select_one("td.Umaban, td.umaban")
+    rows = soup.select("table.RaceTable01 tr, table.ResultTable tr, tr.HorseList")
+    for r in rows:
+        order_tag = r.select_one("td.Rank, td.Result_Num, div.Rank")
+        umaban_tag = r.select_one("td.Umaban, div.Umaban")
 
         if order_tag and umaban_tag:
             o_txt = order_tag.get_text(strip=True)
             u_txt = umaban_tag.get_text(strip=True)
             if o_txt.isdigit() and u_txt.isdigit():
-                order_val = int(o_txt)
-                umaban_val = int(u_txt)
-        else:
-            # クラス名がない場合: 1列目着順、3列目前後の馬番を走査
-            col0 = tds[0].get_text(strip=True)
-            if col0.isdigit():
-                order_val = int(col0)
-                # 馬番を探す (通常2列目または3列目)
-                for td in tds[1:4]:
-                    txt = td.get_text(strip=True)
-                    if txt.isdigit() and 1 <= int(txt) <= 28:
-                        umaban_val = int(txt)
-                        break
+                orders[int(u_txt)] = int(o_txt)
 
-        if order_val is not None and umaban_val is not None:
-            orders[umaban_val] = order_val
-
-    # 1着が確定していなければ未確定
+    # 1着が確定しているか判定
     if not any(v == 1 for v in orders.values()):
         print(f"未確定判定: 1着が見つかりません (orders={orders})")
         return None
 
-    # --- 2. 払戻金の抽出 (単勝・複勝) ---
+    # --- 2. 払戻金テーブル (単勝・複勝) ---
     payouts = {"tansho": {}, "fukusho": {}}
-
-    # 払戻テーブル（あらゆるクラス名に対応）
-    pay_tables = soup.select("table.Payout_Detail_Table, table.Pay_Table, table[class*='Payout'], table[class*='pay']")
+    pay_tables = soup.select("table.Payout_Detail_Table, table.Pay_Table, table[class*='Payout']")
     for table in pay_tables:
         for tr in table.select("tr"):
             th = tr.select_one("th")
             if not th:
                 continue
             kind = th.get_text(strip=True)
-            td_list = tr.find_all("td")
-            if len(td_list) < 2:
-                continue
+            td_nums = tr.select("td.Result")
+            td_pays = tr.select("td.Payout")
 
-            # 馬番列と金額列の抽出
-            td_nums_txt = td_list[0].get_text(separator=" ", strip=True)
-            td_pays_txt = td_list[1].get_text(separator=" ", strip=True)
-
-            nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", td_nums_txt)]
-            pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays_txt) if x.replace(",", "").isdigit()]
-
-            if "単勝" in kind:
+            if "単勝" in kind and td_nums and td_pays:
+                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
+                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
                 for n, p in zip(nums, pays):
                     payouts["tansho"][n] = p
-            elif "複勝" in kind:
+
+            elif "複勝" in kind and td_nums and td_pays:
+                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
+                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
                 for n, p in zip(nums, pays):
                     payouts["fukusho"][n] = p
 
-    # フォールバック: テキスト全体から正規表現で単勝・複勝を拾う
+    # フォールバック抽出
     if not payouts["tansho"]:
-        # 例: 単勝 11 12,320円
         tan_m = re.findall(r"単勝\s*(\d{1,2})\s*([\d,]+)円?", html)
         for u, p in tan_m:
             payouts["tansho"][int(u)] = int(p.replace(",", ""))
@@ -780,20 +748,19 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         "orders": orders,
         "payouts": payouts
     }
-    
 
-# --- 2. 個別レース結果検証エンドポイント ---
+
+# --- 個別レース結果検証エンドポイント ---
 @app.get("/result/{race_id}", response_model=VerificationResult)
 def verify_race_result(race_id: str):
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
-    # レース日付 (YYYY-MM-DD)
     r_year = race_id[:4]
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     race_date = f"{r_year}-{today_str[5:7]}-{today_str[8:]}"
 
-    # 1. まずローカルキャッシュ(DB)を確認（確定済みならnetkeibaへアクセスしない）
+    # 1. ローカルキャッシュ(DB)を確認（確定済みならnetkeibaへアクセスしない）
     cached_data = get_cached_result(race_id)
     from_cache = False
 
@@ -801,11 +768,9 @@ def verify_race_result(race_id: str):
         from_cache = True
         race_res = cached_data
     else:
-        # キャッシュがなければ netkeiba へ問い合わせ
         race_res = fetch_netkeiba_race_result(race_id)
         if not race_res:
             raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
-        # 確定していれば次回以降のためにDBへ永続保存
         save_cached_result(race_id, race_res["race_name"], race_date, race_res)
 
     # 2. 当該レースのAI推奨買い目を取得
@@ -823,6 +788,7 @@ def verify_race_result(race_id: str):
 
     # 見送り判定の場合
     if is_pass or target_u is None:
+        actual_order = race_res["orders"].get(target_u) if target_u else None
         settlement = {
             "race_id": race_id,
             "race_date": race_date,
@@ -834,7 +800,7 @@ def verify_race_result(race_id: str):
             "tansho_bet": 0,
             "fukusho_bet": 0,
             "total_bet": 0,
-            "actual_order": race_res["orders"].get(target_u) if target_u else None,
+            "actual_order": actual_order,
             "tansho_payout": 0,
             "fukusho_payout": 0,
             "total_payout": 0,
@@ -848,14 +814,14 @@ def verify_race_result(race_id: str):
             "grade": grade,
             "target_umaban": target_u,
             "horse_name": h_name,
-            "actual_order": settlement["actual_order"],
+            "actual_order": actual_order,
             "is_hit": False,
             "total_bet": 0,
             "total_payout": 0,
             "profit": 0,
             "recovery_rate": 0.0,
             "from_cache": from_cache,
-            "message": "見送り推奨レースのため、投資・払戻はありません（資金保全成功）。"
+            "message": f"見送り推奨レースです。(本命{target_u}番は{actual_order}着 / 資金保全成功)" if actual_order else "見送り推奨レースのため、投資・払戻はありません。"
         }
 
     # 3. 確定着順と払戻の照合
@@ -863,9 +829,7 @@ def verify_race_result(race_id: str):
     tansho_unit_payout = race_res["payouts"]["tansho"].get(target_u, 0)
     fukusho_unit_payout = race_res["payouts"]["fukusho"].get(target_u, 0)
 
-    # 1着: 単勝払戻 (単勝購入額 / 100 * 100円あたり払戻金)
     payout_t = int((b_tan / 100.0) * tansho_unit_payout) if actual_order == 1 else 0
-    # 3着以内: 複勝払戻
     payout_f = int((b_fuku / 100.0) * fukusho_unit_payout) if actual_order <= 3 else 0
     total_payout = payout_t + payout_f
 
@@ -916,7 +880,7 @@ def verify_race_result(race_id: str):
     }
 
 
-# --- 3. 当日・指定日の総合成績・回収率集計エンドポイント ---
+# --- 当日・指定日の総合成績・回収率集計エンドポイント ---
 @app.get("/summary/today", response_model=DailySummary)
 def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
     target_date = date if date else datetime.date.today().strftime("%Y-%m-%d")
