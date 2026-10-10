@@ -734,14 +734,22 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
         d = dict(row)
         profit = d["total_payout"] - d["total_bet"]
         recovery = round((d["total_payout"] / d["total_bet"]) * 100.0, 2) if d["total_bet"] > 0 else 0.0
+        order = d["actual_order"]
         
-        if d["is_pass"]:
-            msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{d['actual_order']}着 / 資金保全成功)" if d["actual_order"] else "見送り推奨レースのため、投資・払戻はありません。"
+        # 着順テキストのスマート化
+        if order and 1 <= order <= 30:
+            order_str = f"{order}着でした。"
         elif d["is_hit"]:
-            msg = f"{d['horse_name']} は {d['actual_order']}着でした。 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+            order_str = "馬券圏内（3着以内）に入線しました。"
         else:
-            order_str = f"{d['actual_order']}着" if (d['actual_order'] and d['actual_order'] < 90) else "着外"
-            msg = f"{d['horse_name']} は {order_str}でした。 不的中 (収支: {profit:,}円)"
+            order_str = "着外でした。"
+
+        if d["is_pass"]:
+            msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{order_str} / 資金保全成功)"
+        elif d["is_hit"]:
+            msg = f"{d['horse_name']} は {order_str} 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+        else:
+            msg = f"{d['horse_name']} は {order_str} 不的中 (収支: {profit:,}円)"
 
         return {
             "race_id": d["race_id"],
@@ -750,7 +758,7 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
             "grade": d["grade"],
             "target_umaban": d["target_umaban"],
             "horse_name": d["horse_name"],
-            "actual_order": d["actual_order"],
+            "actual_order": order if (order and order < 90) else (3 if d["is_hit"] else None),
             "is_hit": bool(d["is_hit"]),
             "total_bet": d["total_bet"],
             "total_payout": d["total_payout"],
@@ -1025,6 +1033,12 @@ def verify_race_result(race_id: str):
     tansho_unit_payout = race_res["payouts"]["tansho"].get(target_u, 0)
     fukusho_unit_payout = race_res["payouts"]["fukusho"].get(target_u, 0)
 
+    # 着順補正: 払戻があるのに着順が99のままの場合
+    if tansho_unit_payout > 0:
+        actual_order = 1
+    elif fukusho_unit_payout > 0 and actual_order > 3:
+        actual_order = 3  # 複勝圏内補正
+
     payout_t = int((b_tan / 100.0) * tansho_unit_payout) if actual_order == 1 else 0
     payout_f = int((b_fuku / 100.0) * fukusho_unit_payout) if (actual_order <= 3 or fukusho_unit_payout > 0) else 0
     total_payout = payout_t + payout_f
@@ -1032,6 +1046,14 @@ def verify_race_result(race_id: str):
     profit = total_payout - total_bet
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     is_hit = (actual_order <= 3) or (total_payout > 0)
+
+    # 着順表示テキスト
+    if 1 <= actual_order <= 30:
+        order_str = f"{actual_order}着でした。"
+    elif is_hit:
+        order_str = "馬券圏内（3着以内）に入線しました。"
+    else:
+        order_str = "着外でした。"
 
     # 収支台帳へ記録（永続保存）
     settlement = {
@@ -1045,7 +1067,7 @@ def verify_race_result(race_id: str):
         "tansho_bet": b_tan,
         "fukusho_bet": b_fuku,
         "total_bet": total_bet,
-        "actual_order": actual_order,
+        "actual_order": actual_order if actual_order < 90 else None,
         "tansho_payout": payout_t,
         "fukusho_payout": payout_f,
         "total_payout": total_payout,
@@ -1053,12 +1075,10 @@ def verify_race_result(race_id: str):
     }
     save_settlement(settlement)
 
-    order_str = f"{actual_order}着" if actual_order < 90 else "着外"
-    msg = f"{h_name} は {order_str}でした。 不的中 (収支: {profit:,}円)"
     if is_hit:
-        msg += f" 的中！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
+        msg = f"{h_name} は {order_str} 的中！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
     else:
-        msg += f" 不的中 (収支: {profit:,}円)"
+        msg = f"{h_name} は {order_str} 不的中 (収支: {profit:,}円)"
 
     return {
         "race_id": race_id,
