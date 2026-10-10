@@ -141,11 +141,11 @@ batch_status = {
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Keiba Prediction & Verification API (Supabase Backend) is running"}
+    return {"status": "ok", "message": "Keiba Prediction & Verification API is running"}
 
 
-# --- Supabase スケジュール登録 ---
-def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
+# --- スケジュール登録ヘルパー ---
+def register_race_schedule(race_id: str, race_date: str, race_name: str, post_time_str: str):
     if not supabase:
         return
     try:
@@ -153,17 +153,19 @@ def register_race_schedule(race_id: str, race_name: str, post_time_str: str):
         if not m:
             return
         hour, minute = int(m.group(1)), int(m.group(2))
-        today_date = datetime.date.today().strftime("%Y-%m-%d")
-        post_dt = datetime.datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        # 日付パース
+        d_parts = [int(p) for p in race_date.split("-")]
+        post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
         post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         supabase.table("keiba_scheduled_races").upsert({
             "race_id": race_id,
-            "race_date": today_date,
+            "race_date": race_date,
             "race_name": race_name,
             "post_datetime": post_dt_str,
             "is_settled": 0
-        }).execute()
+        }, on_conflict="race_id").execute()
     except Exception as e:
         print(f"Supabaseスケジュール登録エラー ({race_id}): {e}")
 
@@ -203,6 +205,10 @@ def parse_netkeiba_sp_page(html_text: str):
         raw_text = a.get_text(separator=" ", strip=True)
         clean_text = " ".join(raw_text.split())
 
+        # 発走時刻の簡易抽出（例: "10:05発走" または "10:05"）
+        post_m = re.search(r"(\d{1,2}:\d{2})", clean_text)
+        post_time_est = f"{post_m.group(1)}発走" if post_m else ""
+
         if venue_name not in raw_venue_races:
             raw_venue_races[venue_name] = []
 
@@ -212,7 +218,7 @@ def parse_netkeiba_sp_page(html_text: str):
             "kai_day": kai_day,
             "race_num_int": race_num_int,
             "race_name": clean_text if clean_text else f"{race_no}",
-            "race_info": ""
+            "race_info": post_time_est
         })
 
     for v_name, r_list in raw_venue_races.items():
@@ -298,13 +304,6 @@ def fetch_shutuba_table(race_id: str):
                 race_name = m.group(1).strip()
 
     if not race_name:
-        og_title = soup.find("meta", property="og:title")
-        if og_title and og_title.get("content"):
-            m = re.search(r"\d+R\s+([^|・\-_]+)", og_title["content"])
-            if m:
-                race_name = m.group(1).strip()
-
-    if not race_name:
         race_name = f"{race_num} 一般競走"
 
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
@@ -348,8 +347,10 @@ def fetch_shutuba_table(race_id: str):
         "course_details": course_details
     }
 
+    # スケジュールテーブルへも発走時刻を登録
     if post_time:
-        register_race_schedule(race_id, race_name, post_time)
+        today_date = datetime.date.today().strftime("%Y-%m-%d")
+        register_race_schedule(race_id, today_date, race_name, post_time)
 
     odds_map = {}
     try:
@@ -619,7 +620,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
 
 
 # =========================================================================
-# ★ Supabase CRUD ヘルパー関数 (keiba_ テーブルプレフィックス対応)
+# ★ Supabase CRUD ヘルパー
 # =========================================================================
 
 def get_cached_prediction(race_id: str) -> Optional[dict]:
@@ -860,40 +861,6 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         except Exception:
             pass
 
-    if not payouts["tansho"] and not any(v == 1 for v in orders.values()):
-        db_url = f"https://db.netkeiba.com/race/{race_id}/"
-        try:
-            resp = requests.get(db_url, headers=HEADERS_PC, timeout=10)
-            try:
-                html = resp.content.decode("euc-jp")
-            except UnicodeDecodeError:
-                html = resp.content.decode("utf-8", errors="replace")
-            soup = BeautifulSoup(html, "html.parser")
-
-            for tr in soup.select("table.race_table_01 tr"):
-                tds = tr.find_all("td")
-                if len(tds) >= 4:
-                    o_txt = tds[0].get_text(strip=True)
-                    u_txt = tds[2].get_text(strip=True)
-                    if o_txt.isdigit() and u_txt.isdigit():
-                        orders[int(u_txt)] = int(o_txt)
-
-            for tr in soup.select("table.pay_table_01 tr"):
-                th = tr.select_one("th")
-                tds = tr.find_all("td")
-                if th and len(tds) >= 2:
-                    kind = th.get_text(strip=True)
-                    nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", tds[0].get_text())]
-                    pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", tds[1].get_text()) if x.replace(",", "").isdigit()]
-                    if "単勝" in kind:
-                        for n, p in zip(nums, pays):
-                            payouts["tansho"][n] = p
-                    elif "複勝" in kind:
-                        for n, p in zip(nums, pays):
-                            payouts["fukusho"][n] = p
-        except Exception:
-            pass
-
     is_confirmed = (len(payouts["tansho"]) > 0) or (1 in orders.values())
 
     if len(payouts["tansho"]) > 0 and 1 not in orders.values():
@@ -1091,7 +1058,7 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 
 
 # =========================================================================
-# ★ 全レース非同期一括処理コアロジック (タイムアウト防止ワーカー)
+# ★ 手動一括処理（アプリボタン用・確定検証と現時点の予想登録）
 # =========================================================================
 
 def run_batch_worker(target_date: Optional[str] = None):
@@ -1124,16 +1091,7 @@ def run_batch_worker(target_date: Optional[str] = None):
             batch_status["current"] = idx
             batch_status["message"] = f"処理中 ({idx}/{len(all_race_ids)}レース)"
 
-            # A. 予想未登録なら登録
-            try:
-                cached = get_cached_prediction(r_id)
-                if not cached:
-                    predict_race(r_id)
-                    batch_status["predicted"] += 1
-            except Exception as e:
-                print(f"[Batch] 予想登録スキップ ({r_id}): {e}")
-
-            # B. 確定済みなら結果検証して収支台帳へ記録
+            # 確定済みなら結果検証して収支台帳へ記録
             try:
                 settled = get_cached_settlement(r_id)
                 if not settled:
@@ -1142,12 +1100,10 @@ def run_batch_worker(target_date: Optional[str] = None):
             except Exception:
                 pass
 
-        batch_status["message"] = f"完了: 全{len(all_race_ids)}R中、予想登録{batch_status['predicted']}件、検証{batch_status['settled']}件"
-        print(f"[Batch] {batch_status['message']}")
+        batch_status["message"] = f"完了: 全{len(all_race_ids)}R中、確定検証{batch_status['settled']}件"
 
     except Exception as e:
         batch_status["message"] = f"エラー終了: {e}"
-        print(f"[Batch] エラー発生: {e}")
     finally:
         batch_status["is_running"] = False
 
@@ -1168,7 +1124,7 @@ def run_today_batch(
 
     return {
         "status": "started",
-        "message": "バックグラウンドで全レース一括処理を開始しました。完了まで自動で進行します。"
+        "message": "バックグラウンドで全レース一括照合を開始しました。"
     }
 
 
@@ -1178,72 +1134,154 @@ def get_batch_status():
 
 
 # =========================================================================
-# ★ バックグラウンドメンテナンスループ (19:00一括処理 / 0:00クリーンアップ / 発走1時間後巡回)
+# ★ バックグラウンドメンテナンスループ
+#    1. 朝の開催レース事前スケジュール登録
+#    2. 各レース【発走30分前】の自動予想実行 (最新オッズ・馬体重反映)
+#    3. 各レース【発走60分後】の自動確定照合
+#    4. 19:00 の未確定確認 (予想は行わない)
+#    5. 0:00 の一時キャッシュ削除 (収支台帳は残す)
 # =========================================================================
 
+async def sync_daily_schedules_if_needed(today_str: str):
+    """当日のレース発走時刻を走査し、keiba_scheduled_racesに事前登録"""
+    if not supabase:
+        return
+    try:
+        # すでに本日のスケジュールが登録されているか確認
+        res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", today_str).execute()
+        if res.data and len(res.data) >= 12:
+            return  # すでに登録済み
+
+        print(f"[Scheduler] {today_str} のレーススケジュールを事前走査・登録します...")
+        today_clean = today_str.replace("-", "")
+        today_info = get_today_races(today_clean)
+        venues = today_info.get("venues", [])
+
+        for v in venues:
+            for r in v.get("races", []):
+                r_id = r["race_id"]
+                # 出馬表から正確な発走時刻を取得してスケジュール登録
+                try:
+                    fetch_shutuba_table(r_id)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[Scheduler] スケジュール事前登録エラー: {e}")
+
+
 async def background_maintenance_loop():
-    print("[Scheduler] メンテナンススケジューラーを開始しました。")
+    print("[Scheduler] リアルタイム・メンテナンススケジューラーを開始しました。")
     last_cleaned_date = None
-    last_19h_batch_date = None
+    last_19h_settle_date = None
 
     while True:
         try:
             now = datetime.datetime.now()
             today_str = now.strftime("%Y-%m-%d")
 
-            # --- A. 毎日 19:00 の全レース一括処理 ---
-            if now.hour == 19 and last_19h_batch_date != today_str:
-                if not batch_status["is_running"]:
-                    print(f"[Scheduler] 19:00 定期全レース一括バッチ処理を開始します...")
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, run_batch_worker, today_str)
-                    last_19h_batch_date = today_str
+            # --- 1. 朝 8:30 以降、当日のレーススケジュールを事前初期化 ---
+            if now.hour >= 8:
+                await sync_daily_schedules_if_needed(today_str)
 
-            # --- B. 毎日 0:00 の一時キャッシュ削除 (収支台帳 keiba_race_settlements は残す) ---
-            if now.hour == 0 and last_cleaned_date != today_str:
-                if supabase:
-                    print(f"[Cleanup] 0:00 定期クリーンアップを開始します (収支台帳は永続保持)")
-                    try:
-                        supabase.table("keiba_predictions_cache").delete().lt("race_date", today_str).execute()
-                        supabase.table("keiba_race_results_cache").delete().lt("race_date", today_str).execute()
-                        supabase.table("keiba_scheduled_races").delete().lt("race_date", today_str).execute()
-                        print(f"[Cleanup] Supabaseの前日以前の一時キャッシュを削除しました。")
-                    except Exception as ce:
-                        print(f"[Cleanup] クリーンアップ失敗: {ce}")
-                last_cleaned_date = today_str
-
-            # --- C. 発走1時間後の個別自動照合巡回 ---
             if supabase:
+                # --- 2. ★ 各レース【発走30分前】の自動予想実行 ---
                 try:
-                    res = supabase.table("keiba_scheduled_races").select("*").eq("is_settled", 0).execute()
-                    scheduled_races = res.data or []
+                    res_pred = supabase.table("keiba_scheduled_races")\
+                        .select("*")\
+                        .eq("race_date", today_str)\
+                        .eq("is_predicted", 0)\
+                        .execute()
+                    unpredicted_races = res_pred.data or []
 
-                    for r in scheduled_races:
+                    for r in unpredicted_races:
                         r_id = r["race_id"]
                         p_dt_str = r["post_datetime"]
-                        retries = r.get("retry_count", 0)
-
                         try:
                             post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
                         except Exception:
                             continue
 
-                        trigger_time = post_dt + datetime.timedelta(minutes=60)
-                        if now >= trigger_time:
+                        # 発走30分前（post_dt - 30分）以降に到達しているか判定
+                        trigger_predict_time = post_dt - datetime.timedelta(minutes=30)
+                        if now >= trigger_predict_time:
+                            print(f"[Auto-Predict] 発走30分前検知: {r_id} ({r.get('race_name')}) の予想を実行します...")
+                            try:
+                                # 最新の馬体重・オッズを反映して予想を実行＆保存
+                                predict_race(r_id, force_refresh=True)
+                                supabase.table("keiba_scheduled_races")\
+                                    .update({"is_predicted": 1})\
+                                    .eq("race_id", r_id)\
+                                    .execute()
+                                print(f"[Auto-Predict] 予想完了: {r_id}")
+                            except Exception as pe:
+                                print(f"[Auto-Predict] 予想実行失敗 ({r_id}): {pe}")
+                except Exception as e:
+                    print(f"[Scheduler] 予想ループエラー: {e}")
+
+                # --- 3. ★ 各レース【発走60分後】の個別自動照合 ---
+                try:
+                    res_settle = supabase.table("keiba_scheduled_races")\
+                        .select("*")\
+                        .eq("is_settled", 0)\
+                        .execute()
+                    unsettled_races = res_settle.data or []
+
+                    for r in unsettled_races:
+                        r_id = r["race_id"]
+                        p_dt_str = r["post_datetime"]
+                        retries = r.get("retry_count", 0)
+                        try:
+                            post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            continue
+
+                        trigger_settle_time = post_dt + datetime.timedelta(minutes=60)
+                        if now >= trigger_settle_time:
                             try:
                                 verify_race_result(r_id)
-                                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
+                                supabase.table("keiba_scheduled_races")\
+                                    .update({"is_settled": 1})\
+                                    .eq("race_id", r_id)\
+                                    .execute()
+                                print(f"[Auto-Settle] 結果照合完了: {r_id}")
                             except Exception:
                                 if retries >= 10:
-                                    supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
+                                    supabase.table("keiba_scheduled_races")\
+                                        .update({"is_settled": 1})\
+                                        .eq("race_id", r_id)\
+                                        .execute()
                                 else:
-                                    supabase.table("keiba_scheduled_races").update({"retry_count": retries + 1}).eq("race_id", r_id).execute()
-                except Exception:
-                    pass
+                                    supabase.table("keiba_scheduled_races")\
+                                        .update({"retry_count": retries + 1})\
+                                        .eq("race_id", r_id)\
+                                        .execute()
+                except Exception as e:
+                    print(f"[Scheduler] 照合ループエラー: {e}")
+
+            # --- 4. 毎日 19:00 の確定未照合レースの最終検証（予想は行わない） ---
+            if now.hour == 19 and last_19h_settle_date != today_str:
+                if not batch_status["is_running"]:
+                    print(f"[Scheduler] 19:00 当日レースの最終結果照合を実行します...")
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, run_batch_worker, today_str)
+                    last_19h_settle_date = today_str
+
+            # --- 5. 毎日 0:00 の一時キャッシュ削除 (収支台帳は永続保持) ---
+            if now.hour == 0 and last_cleaned_date != today_str:
+                if supabase:
+                    try:
+                        supabase.table("keiba_predictions_cache").delete().lt("race_date", today_str).execute()
+                        supabase.table("keiba_race_results_cache").delete().lt("race_date", today_str).execute()
+                        supabase.table("keiba_scheduled_races").delete().lt("race_date", today_str).execute()
+                        print(f"[Cleanup] 0:00 前日以前の一時キャッシュを削除しました。")
+                    except Exception as ce:
+                        print(f"[Cleanup] 失敗: {ce}")
+                last_cleaned_date = today_str
 
         except Exception as e:
-            print(f"[Scheduler] ループエラー: {e}")
+            print(f"[Scheduler] 全体ループエラー: {e}")
 
+        # 60秒ごとに巡回監視
         await asyncio.sleep(60)
 
 
