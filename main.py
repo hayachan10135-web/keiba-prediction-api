@@ -675,70 +675,112 @@ def save_settlement(data: dict):
 
 def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     """
-    netkeibaの結果ページ(result.html)から確定着順と払戻金をスクレイピング
-    ※ 確定していない場合は None を返す
+    netkeibaの結果ページから確定着順と払戻金を頑健にスクレイピング
+    PC版/SP版/速報版のHTML表記揺れに対応
     """
     url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
-    resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
-        html = resp.content.decode("euc-jp")
-    except UnicodeDecodeError:
-        html = resp.content.decode("utf-8", errors="replace")
+        resp = requests.get(url, headers=HEADERS_PC, timeout=10)
+        try:
+            html = resp.content.decode("euc-jp")
+        except UnicodeDecodeError:
+            html = resp.content.decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"結果ページ取得通信エラー: {e}")
+        return None
+
     soup = BeautifulSoup(html, "html.parser")
 
     # レース名の抽出
-    r_name_tag = soup.select_one(".RaceName, h1")
+    r_name_tag = soup.select_one(".RaceName, .RaceName_Text, h1")
     race_name = r_name_tag.get_text(strip=True) if r_name_tag else f"Race {race_id}"
 
-    # 着順テーブルの確認
-    rows = soup.select("table.RaceTable01 tr.HorseList")
-    if not rows:
-        return None
-
+    # --- 1. 着順の抽出 ---
     orders = {}
-    for r in rows:
-        order_tag = r.select_one("td.Result_Num, td.Rank")
-        umaban_tag = r.select_one("td.Umaban")
+    
+    # 候補1: テーブルの全 tr 行から走査
+    table_rows = soup.select("table.RaceTable01 tr, table.ResultTable tr, table.All_Result_Table tr, tr.HorseList")
+    for r in table_rows:
+        tds = r.find_all("td")
+        if len(tds) < 3:
+            continue
+        
+        # 着順・馬番を特定
+        order_val = None
+        umaban_val = None
+
+        # クラス指定で探す
+        order_tag = r.select_one("td.Result_Num, td.Rank, td.order")
+        umaban_tag = r.select_one("td.Umaban, td.umaban")
+
         if order_tag and umaban_tag:
             o_txt = order_tag.get_text(strip=True)
             u_txt = umaban_tag.get_text(strip=True)
             if o_txt.isdigit() and u_txt.isdigit():
-                orders[int(u_txt)] = int(o_txt)
+                order_val = int(o_txt)
+                umaban_val = int(u_txt)
+        else:
+            # クラス名がない場合: 1列目着順、3列目前後の馬番を走査
+            col0 = tds[0].get_text(strip=True)
+            if col0.isdigit():
+                order_val = int(col0)
+                # 馬番を探す (通常2列目または3列目)
+                for td in tds[1:4]:
+                    txt = td.get_text(strip=True)
+                    if txt.isdigit() and 1 <= int(txt) <= 28:
+                        umaban_val = int(txt)
+                        break
 
-    # 1〜3着が確定していなければ未確定とみなす
+        if order_val is not None and umaban_val is not None:
+            orders[umaban_val] = order_val
+
+    # 1着が確定していなければ未確定
     if not any(v == 1 for v in orders.values()):
+        print(f"未確定判定: 1着が見つかりません (orders={orders})")
         return None
 
-    # 払戻金テーブル (単勝・複勝)
+    # --- 2. 払戻金の抽出 (単勝・複勝) ---
     payouts = {"tansho": {}, "fukusho": {}}
-    pay_tables = soup.select("table.Payout_Detail_Table")
+
+    # 払戻テーブル（あらゆるクラス名に対応）
+    pay_tables = soup.select("table.Payout_Detail_Table, table.Pay_Table, table[class*='Payout'], table[class*='pay']")
     for table in pay_tables:
         for tr in table.select("tr"):
             th = tr.select_one("th")
             if not th:
                 continue
             kind = th.get_text(strip=True)
-            td_nums = tr.select("td.Result")
-            td_pays = tr.select("td.Payout")
+            td_list = tr.find_all("td")
+            if len(td_list) < 2:
+                continue
 
-            if "単勝" in kind and td_nums and td_pays:
-                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
-                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
+            # 馬番列と金額列の抽出
+            td_nums_txt = td_list[0].get_text(separator=" ", strip=True)
+            td_pays_txt = td_list[1].get_text(separator=" ", strip=True)
+
+            nums = [int(x) for x in re.findall(r"\b\d{1,2}\b", td_nums_txt)]
+            pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays_txt) if x.replace(",", "").isdigit()]
+
+            if "単勝" in kind:
                 for n, p in zip(nums, pays):
                     payouts["tansho"][n] = p
-
-            elif "複勝" in kind and td_nums and td_pays:
-                nums = [int(x) for x in re.findall(r"\d+", td_nums[0].get_text())]
-                pays = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+", td_pays[0].get_text()) if x.replace(",", "").isdigit()]
+            elif "複勝" in kind:
                 for n, p in zip(nums, pays):
                     payouts["fukusho"][n] = p
+
+    # フォールバック: テキスト全体から正規表現で単勝・複勝を拾う
+    if not payouts["tansho"]:
+        # 例: 単勝 11 12,320円
+        tan_m = re.findall(r"単勝\s*(\d{1,2})\s*([\d,]+)円?", html)
+        for u, p in tan_m:
+            payouts["tansho"][int(u)] = int(p.replace(",", ""))
 
     return {
         "race_name": race_name,
         "orders": orders,
         "payouts": payouts
     }
-
+    
 
 # --- 2. 個別レース結果検証エンドポイント ---
 @app.get("/result/{race_id}", response_model=VerificationResult)
