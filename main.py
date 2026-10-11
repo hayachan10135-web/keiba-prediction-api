@@ -1798,6 +1798,9 @@ def fix_mislabeled_20261011_races():
         return {"status": "error", "message": str(e)}
 
 
+# --- DB構成・スキーマバージョン管理 ---
+CURRENT_DB_VERSION = "v2_hybrid_tickets_blinker"
+
 def clear_all_database():
     """Supabaseの全テーブル（キャッシュ、台帳、スケジュール）を完全クリア・初期化"""
     if not supabase:
@@ -1845,9 +1848,44 @@ def clear_all_database():
         return {"status": "error", "message": str(e)}
 
 
+def check_and_apply_db_migration():
+    """DB構成・スキーマバージョンが変更された場合のみ、旧データをまっさらにしてバージョンを更新"""
+    if not supabase:
+        return
+    try:
+        res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", "SCHEMA_VERSION").execute()
+        saved_version = None
+        if res.data and len(res.data) > 0:
+            saved_version = res.data[0]["data_json"].get("version")
+
+        if saved_version != CURRENT_DB_VERSION:
+            print(f"[DB Migration] DB構成変更検知 ({saved_version} -> {CURRENT_DB_VERSION}): DBを初期化します。")
+            clear_all_database()
+            supabase.table("keiba_predictions_cache").upsert({
+                "race_id": "SCHEMA_VERSION",
+                "race_date": "9999-12-31",
+                "data_json": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
+            }).execute()
+            print(f"[DB Migration] 新バージョン {CURRENT_DB_VERSION} を正常に保存しました。")
+        else:
+            print(f"[DB Migration] DBバージョン ({saved_version}) は最新です。データ初期化はスキップします。")
+    except Exception as e:
+        print(f"[DB Migration] バージョン確認エラー: {e}")
+
+
 @app.post("/admin/clear-db")
 def endpoint_clear_db():
-    return clear_all_database()
+    res = clear_all_database()
+    if supabase and res.get("status") == "ok":
+        try:
+            supabase.table("keiba_predictions_cache").upsert({
+                "race_id": "SCHEMA_VERSION",
+                "race_date": "9999-12-31",
+                "data_json": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
+            }).execute()
+        except Exception:
+            pass
+    return res
 
 
 @app.post("/admin/fix-20261011")
@@ -1857,6 +1895,6 @@ def endpoint_fix_20261011():
 
 @app.on_event("startup")
 async def startup_event():
-    # ユーザー指示に従い、DBを一度綺麗にして本日スケジュールを再構築
-    clear_all_database()
+    # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
+    check_and_apply_db_migration()
     asyncio.create_task(background_maintenance_loop())
