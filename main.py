@@ -82,6 +82,25 @@ class HorsePrediction(BaseModel):
     popularity: Optional[int]
     score: float
     mark: str
+    is_blinker: Optional[bool] = False
+    is_first_blinker: Optional[bool] = False
+
+class TicketBet(BaseModel):
+    ticket_type: str
+    combination: List[int]
+    combination_str: str
+    amount: int
+    odds: Optional[float] = None
+    memo: Optional[str] = None
+
+class HybridRecommendation(BaseModel):
+    is_participate: bool
+    strategy_name: str = "馬連・超高配当三連複ハイブリッド"
+    total_amount: int
+    summary: str
+    umaren_bets: List[TicketBet] = []
+    trio_bet: Optional[TicketBet] = None
+    reason: Optional[str] = None
 
 class TanFukuRecommendation(BaseModel):
     target_umaban: Optional[int]
@@ -105,6 +124,22 @@ class PredictResponse(BaseModel):
     race_details: RaceDetails
     horses: List[HorsePrediction]
     recommendation: TanFukuRecommendation
+    hybrid_recommendation: Optional[HybridRecommendation] = None
+
+
+def calc_trio_odds(o1: float, o2: float, o3: float) -> float:
+    """Harville確率モデルに基づく三連複推定オッズ計算"""
+    p1 = 0.80 / max(1.1, float(o1))
+    p2 = 0.80 / max(1.1, float(o2))
+    p3 = 0.80 / max(1.1, float(o3))
+    p_sum = 0.0
+    for a, b, c in [(p1, p2, p3), (p1, p3, p2), (p2, p1, p3), (p2, p3, p1), (p3, p1, p2), (p3, p2, p1)]:
+        denom1 = max(0.01, 1.0 - a)
+        denom2 = max(0.01, 1.0 - a - b)
+        p_sum += a * (b / denom1) * (c / denom2)
+    if p_sum <= 0:
+        return 10.0
+    return max(2.0, min(1000.0, 0.75 / p_sum))
 
 class VerificationResult(BaseModel):
     race_id: str
@@ -485,6 +520,22 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         odds = odds_item.get("odds")
         popularity = odds_item.get("popularity")
 
+        # --- ブリンカー判定 (初B / B) ---
+        is_blinker = False
+        is_first_blinker = False
+        blinker_tag = row.select_one(".Blinker, .Blink, [class*='Blink'], [class*='blinker']")
+        row_raw_text = row.get_text(separator=" ", strip=True)
+        if blinker_tag:
+            b_txt = blinker_tag.get_text(strip=True)
+            is_blinker = True
+            if "初" in b_txt:
+                is_first_blinker = True
+        elif re.search(r"初[BＢ]|初ブリンカー", row_raw_text):
+            is_blinker = True
+            is_first_blinker = True
+        elif re.search(r"[BＢ]|\bB\b", row_raw_text) and any(t.get_text(strip=True) in ["B", "Ｂ"] for t in row.select("span, em, font")):
+            is_blinker = True
+
         horses.append({
             "umaban": umaban,
             "wakuban": wakuban,
@@ -493,7 +544,9 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
             "trainer": trainer,
             "kinryo": kinryo,
             "odds": odds,
-            "popularity": popularity
+            "popularity": popularity,
+            "is_blinker": is_blinker,
+            "is_first_blinker": is_first_blinker
         })
 
     course_meta = {
@@ -749,13 +802,121 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     else:
         recommendation = empty_recommendation
 
+    # -------------------------------------------------------------
+    # ★ 馬連・超高配当三連複ハイブリッド推奨ロジック (黒字最適化)
+    # -------------------------------------------------------------
+    hybrid_rec: Optional[dict] = None
+    if len(sorted_horses) >= 3:
+        h0, h1, h2 = sorted_horses[0], sorted_horses[1], sorted_horses[2]
+        s0 = float(h0.get("score", 0.0))
+        o0 = float(h0.get("odds") or 0.0)
+        o1 = float(h1.get("odds") or 0.0)
+        o2 = float(h2.get("odds") or 0.0)
+        u0, u1, u2 = int(h0["umaban"]), int(h1["umaban"]), int(h2["umaban"])
+
+        est_u01 = round(max(2.5, 0.65 * o0 * o1), 1) if (o0 > 0 and o1 > 0) else 0.0
+        est_u02 = round(max(2.5, 0.65 * o0 * o2), 1) if (o0 > 0 and o2 > 0) else 0.0
+
+        can_bet = True
+        reasons = []
+        if surface_type == 2:
+            can_bet = False
+            reasons.append("障害レース除外")
+        if not (1.5 <= o0 <= 2.8):
+            can_bet = False
+            reasons.append(f"◎単勝オッズ範囲外({o0}倍: 推奨1.5〜2.8倍)")
+        if s0 < 0.52:
+            can_bet = False
+            reasons.append(f"◎AIスコア不足({s0:.3f}: 推奨0.520以上)")
+        if est_u01 < 3.2:
+            can_bet = False
+            reasons.append(f"本線想定馬連配当不足({est_u01}倍: 推奨3.2倍以上)")
+
+        if not can_bet:
+            hybrid_rec = {
+                "is_participate": False,
+                "strategy_name": "馬連・超高配当三連複ハイブリッド",
+                "total_amount": 0,
+                "summary": "見送り推奨 (期待値基準外)",
+                "umaren_bets": [],
+                "trio_bet": None,
+                "reason": " / ".join(reasons)
+            }
+        else:
+            umaren_bets = [
+                {
+                    "ticket_type": "馬連",
+                    "combination": [u0, u1],
+                    "combination_str": f"{u0}-{u1}",
+                    "amount": 300,
+                    "odds": est_u01,
+                    "memo": "本線 (300円)"
+                },
+                {
+                    "ticket_type": "馬連",
+                    "combination": [u0, u2],
+                    "combination_str": f"{u0}-{u2}",
+                    "amount": 100,
+                    "odds": est_u02,
+                    "memo": "抑え (100円)"
+                }
+            ]
+
+            # 三連複相手（★）の選定: 3〜6位の中で想定配当 >= 35倍
+            # ★初ブリンカー馬がいれば最優先でヒモ穴に指名！
+            trio_target = None
+            candidates = []
+            for idx in range(2, min(7, len(sorted_horses))):
+                hx = sorted_horses[idx]
+                ox = float(hx.get("odds") or 0.0)
+                if ox <= 0:
+                    continue
+                est_trio = round(calc_trio_odds(o0, o1, ox), 1)
+                if est_trio >= 35.0:
+                    candidates.append({
+                        "horse": hx,
+                        "odds": est_trio,
+                        "is_first_blinker": bool(hx.get("is_first_blinker", False))
+                    })
+
+            if candidates:
+                candidates.sort(key=lambda c: (1 if c["is_first_blinker"] else 0), reverse=True)
+                best_c = candidates[0]
+                target_h = best_c["horse"]
+                target_ux = int(target_h["umaban"])
+                target_odds = best_c["odds"]
+                blinker_note = "【初ブリンカー激走期待！】" if best_c["is_first_blinker"] else ""
+
+                trio_target = {
+                    "ticket_type": "三連複",
+                    "combination": [u0, u1, target_ux],
+                    "combination_str": f"{u0}-{u1}-{target_ux}",
+                    "amount": 100,
+                    "odds": target_odds,
+                    "memo": f"超高配当ボーナス{blinker_note} (想定{target_odds}倍 / 相手{target_ux}番:{target_h['horse_name']})"
+                }
+
+            total_amt = 400 + (100 if trio_target else 0)
+            trio_summary = f" ＋ 三連複1点({trio_target['combination_str']}: 100円)" if trio_target else " (三連複は見送り)"
+
+            hybrid_rec = {
+                "is_participate": True,
+                "strategy_name": "馬連・超高配当三連複ハイブリッド",
+                "total_amount": total_amt,
+                "summary": f"参戦推奨: 馬連2点(400円){trio_summary} / 計{total_amt}円",
+                "umaren_bets": umaren_bets,
+                "trio_bet": trio_target,
+                "reason": "基準クリア（◎勝負気配 ＆ 本線妙味あり）"
+            }
+
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
 
     return {
         "race_name": race_name,
         "race_details": race_details,
         "horses": horses_sorted_by_num,
-        "recommendation": recommendation
+        "recommendation": recommendation,
+        "hybrid_recommendation": hybrid_rec
     }
 
 
@@ -819,7 +980,8 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
             "race_name": result["race_name"],
             "race_details": result["race_details"],
             "horses": result["horses"],
-            "recommendation": result["recommendation"]
+            "recommendation": result["recommendation"],
+            "hybrid_recommendation": result.get("hybrid_recommendation")
         }
 
         save_cached_prediction(race_id, target_race_date, resp_data)
