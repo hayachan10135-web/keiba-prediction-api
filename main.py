@@ -121,6 +121,9 @@ class VerificationResult(BaseModel):
     recovery_rate: float
     from_cache: bool
     message: str
+    hypothetical_bet: Optional[int] = None
+    hypothetical_payout: Optional[int] = None
+    pass_benefit: Optional[int] = None
 
 class DailySummary(BaseModel):
     target_date: str
@@ -134,6 +137,9 @@ class DailySummary(BaseModel):
     total_profit: int
     recovery_rate: float
     settled_races: List[dict]
+    pass_benefit_total: Optional[int] = 0
+    pass_avoided_losses: Optional[int] = 0
+    pass_missed_profits: Optional[int] = 0
 
 class BatchStartResponse(BaseModel):
     status: str
@@ -751,6 +757,56 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
         raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
 
 
+def calculate_pass_benefit_info(target_umaban: Optional[int], actual_order: Optional[int], payouts: dict, conf_label: str = "") -> Optional[dict]:
+    if target_umaban is None:
+        return None
+    u = target_umaban
+    tansho_dict = payouts.get("tansho", {}) if payouts else {}
+    fukusho_dict = payouts.get("fukusho", {}) if payouts else {}
+
+    t_pay = tansho_dict.get(u) or tansho_dict.get(str(u)) or 0
+    f_pay = fukusho_dict.get(u) or fukusho_dict.get(str(u)) or 0
+
+    order = actual_order
+    # 1着判定 (単勝払戻がある場合も1着とみなす)
+    if order == 1 or (t_pay > 0 and (order is None or order > 30)):
+        order = 1
+        hypo_payout = t_pay + f_pay
+        pass_benefit = 200 - hypo_payout
+        order_str = "1着でした。"
+        detail_str = f"単勝{t_pay:,}円 + 複勝{f_pay:,}円"
+        benefit_str = f"見送り損益: {pass_benefit:+,}円 (機会損失)"
+    # 2〜3着判定 (複勝払戻がある場合)
+    elif (order is not None and 2 <= order <= 3) or f_pay > 0:
+        order = order if (order is not None and 2 <= order <= 3) else 3
+        hypo_payout = f_pay
+        pass_benefit = 200 - hypo_payout
+        order_str = f"{order}着でした。"
+        detail_str = f"複勝{f_pay:,}円"
+        if pass_benefit > 0:
+            benefit_str = f"見送り損益: {pass_benefit:+,}円 (トリガミ回避成功！)"
+        else:
+            benefit_str = f"見送り損益: {pass_benefit:+,}円"
+    # 4着以下判定 (不的中)
+    else:
+        hypo_payout = 0
+        pass_benefit = 200
+        order_str = f"{order}着でした。" if (order and order < 90) else "着外でした。"
+        detail_str = "払戻0円"
+        benefit_str = f"見送り損益: +200円 (資金保全成功！)"
+
+    tag = "見送り推奨(低オッズ)" if "低オッズ" in conf_label else "見送り推奨"
+    msg = f"{tag}レースです。(本命{u}番は{order_str})\n【単複100円仮想比較】仮想払戻: {hypo_payout:,}円 ({detail_str}) → {benefit_str}"
+
+    return {
+        "hypothetical_bet": 200,
+        "hypothetical_payout": hypo_payout,
+        "pass_benefit": pass_benefit,
+        "actual_order": order,
+        "message": msg
+    }
+
+
 def get_cached_settlement(race_id: str) -> Optional[dict]:
     if not supabase:
         return None
@@ -769,8 +825,28 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
             else:
                 order_str = "着外でした。"
 
+            hypo_bet = None
+            hypo_pay = None
+            pass_benefit = None
+
             if d["is_pass"]:
-                msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{order_str} / 資金保全成功)"
+                # 見送りレースの場合、結果キャッシュから払戻を取得して仮想収支・見送り損益を計算
+                res_cache = get_cached_result(race_id)
+                pass_info = calculate_pass_benefit_info(
+                    d.get("target_umaban"),
+                    order,
+                    res_cache.get("payouts", {}) if res_cache else {},
+                    d.get("grade", "")
+                )
+                if pass_info:
+                    msg = pass_info["message"]
+                    hypo_bet = pass_info["hypothetical_bet"]
+                    hypo_pay = pass_info["hypothetical_payout"]
+                    pass_benefit = pass_info["pass_benefit"]
+                    if pass_info["actual_order"]:
+                        order = pass_info["actual_order"]
+                else:
+                    msg = f"見送り推奨レースです。(本命{d['target_umaban']}番は{order_str} / 資金保全成功)" if d.get('target_umaban') else "見送り推奨レースのため、投資・払戻はありません。"
             elif d["is_hit"]:
                 msg = f"{d['horse_name']} は {order_str} 的中！ 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円)"
             else:
@@ -790,7 +866,10 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 "profit": profit,
                 "recovery_rate": recovery,
                 "from_cache": True,
-                "message": msg
+                "message": msg,
+                "hypothetical_bet": hypo_bet,
+                "hypothetical_payout": hypo_pay,
+                "pass_benefit": pass_benefit
             }
     except Exception as e:
         print(f"Supabase収支取得エラー ({race_id}): {e}")
@@ -987,6 +1066,7 @@ def verify_race_result(race_id: str):
     target_u = rec["target_umaban"]
     h_name = rec["horse_name"]
     grade = rec["grade"]
+    conf_label = rec.get("confidence_label", "")
     is_pass = rec["is_pass"]
     b_tan = rec["tansho_amount"]
     b_fuku = rec["fukusho_amount"]
@@ -1012,7 +1092,22 @@ def verify_race_result(race_id: str):
             "is_hit": False
         }
         save_settlement(settlement)
-        order_str = f"{actual_order}着でした。" if actual_order else "着外でした。"
+
+        pass_info = calculate_pass_benefit_info(target_u, actual_order, race_res.get("payouts", {}), conf_label)
+        if pass_info:
+            msg = pass_info["message"]
+            hypo_bet = pass_info["hypothetical_bet"]
+            hypo_pay = pass_info["hypothetical_payout"]
+            pass_benefit = pass_info["pass_benefit"]
+            if pass_info["actual_order"]:
+                actual_order = pass_info["actual_order"]
+        else:
+            order_str = f"{actual_order}着でした。" if actual_order else "着外でした。"
+            msg = f"見送り推奨レースです。(本命{target_u}番は{order_str} / 資金保全成功)" if target_u else "見送り推奨レースのため、投資・払戻はありません。"
+            hypo_bet = None
+            hypo_pay = None
+            pass_benefit = None
+
         return {
             "race_id": race_id,
             "race_name": race_name,
@@ -1027,7 +1122,10 @@ def verify_race_result(race_id: str):
             "profit": 0,
             "recovery_rate": 0.0,
             "from_cache": from_cache,
-            "message": f"見送り推奨レースです。(本命{target_u}番は{order_str} / 資金保全成功)" if target_u else "見送り推奨レースのため、投資・払戻はありません。"
+            "message": msg,
+            "hypothetical_bet": hypo_bet,
+            "hypothetical_payout": hypo_pay,
+            "pass_benefit": pass_benefit
         }
 
     actual_order = race_res["orders"].get(target_u, 99)
@@ -1108,6 +1206,39 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         except Exception as e:
             print(f"Supabaseサマリー取得エラー: {e}")
 
+    # 結果キャッシュを一括取得して見送り損益を計算
+    cache_map = {}
+    if supabase and rows:
+        try:
+            res_cache = supabase.table("keiba_race_results_cache").select("race_id, result_json").eq("race_date", target_date).execute()
+            cache_map = {item["race_id"]: item.get("result_json", {}) for item in (res_cache.data or [])}
+        except Exception as e:
+            print(f"Supabaseサマリー用結果キャッシュ取得エラー: {e}")
+
+    pass_benefit_total = 0
+    pass_avoided_losses = 0
+    pass_missed_profits = 0
+
+    for r in rows:
+        if r.get("is_pass") == 1 and r.get("target_umaban"):
+            c_res = cache_map.get(r["race_id"], {})
+            pass_info = calculate_pass_benefit_info(
+                r.get("target_umaban"),
+                r.get("actual_order"),
+                c_res.get("payouts", {}) if c_res else {},
+                r.get("grade", "")
+            )
+            if pass_info:
+                r["hypothetical_bet"] = pass_info["hypothetical_bet"]
+                r["hypothetical_payout"] = pass_info["hypothetical_payout"]
+                r["pass_benefit"] = pass_info["pass_benefit"]
+                pb = pass_info["pass_benefit"]
+                pass_benefit_total += pb
+                if pb > 0:
+                    pass_avoided_losses += pb
+                elif pb < 0:
+                    pass_missed_profits += abs(pb)
+
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r["is_pass"] == 0)
     pass_races = sum(1 for r in rows if r["is_pass"] == 1)
@@ -1131,7 +1262,10 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "total_payout_amount": total_payout,
         "total_profit": total_profit,
         "recovery_rate": recovery_rate,
-        "settled_races": rows
+        "settled_races": rows,
+        "pass_benefit_total": pass_benefit_total,
+        "pass_avoided_losses": pass_avoided_losses,
+        "pass_missed_profits": pass_missed_profits
     }
 
 
