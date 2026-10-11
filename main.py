@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Any
 import os
 import datetime
+import zoneinfo
 import re
 import json
 import asyncio
@@ -12,6 +13,22 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 
 app = FastAPI(title="Keiba Prediction & Verification API")
+
+# --- 日本時間 (JST) ユーティリティ ---
+JST = zoneinfo.ZoneInfo("Asia/Tokyo")
+
+def now_jst() -> datetime.datetime:
+    """日本時間の現在時刻を取得"""
+    return datetime.datetime.now(JST)
+
+def now_jst_naive() -> datetime.datetime:
+    """比較用のタイムゾーンなしJST現在日時を取得"""
+    return now_jst().replace(tzinfo=None)
+
+def today_jst_str() -> str:
+    """日本時間の当日日付 (YYYY-MM-DD)"""
+    return now_jst().strftime("%Y-%m-%d")
+
 
 HEADERS_PC = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -141,7 +158,7 @@ batch_status = {
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Keiba Prediction & Verification API is running"}
+    return {"status": "ok", "message": "Keiba Prediction & Verification API is running", "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")}
 
 
 # --- スケジュール登録ヘルパー ---
@@ -154,7 +171,6 @@ def register_race_schedule(race_id: str, race_date: str, race_name: str, post_ti
             return
         hour, minute = int(m.group(1)), int(m.group(2))
         
-        # 日付パース
         d_parts = [int(p) for p in race_date.split("-")]
         post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
         post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -170,13 +186,12 @@ def register_race_schedule(race_id: str, race_date: str, race_name: str, post_ti
         print(f"Supabaseスケジュール登録エラー ({race_id}): {e}")
 
 
-def parse_netkeiba_sp_page(html_text: str):
+# =========================================================================
+# ★ レース一覧パーサー（前日誤取得防止・当日レース確実抽出ロジック）
+# =========================================================================
+def parse_netkeiba_race_list_html(html_text: str):
     soup = BeautifulSoup(html_text, "html.parser")
     venues_data = []
-
-    race_links = soup.find_all("a", href=re.compile(r"race_id=(\d{12})"))
-    if not race_links:
-        return []
 
     VENUE_CODE_MAP = {
         "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
@@ -186,7 +201,7 @@ def parse_netkeiba_sp_page(html_text: str):
     raw_venue_races = {}
     seen_ids = set()
 
-    for a in race_links:
+    for a in soup.find_all("a", href=re.compile(r"race_id=(\d{12})")):
         href = a["href"]
         m = re.search(r"race_id=(\d{12})", href)
         if not m:
@@ -205,7 +220,6 @@ def parse_netkeiba_sp_page(html_text: str):
         raw_text = a.get_text(separator=" ", strip=True)
         clean_text = " ".join(raw_text.split())
 
-        # 発走時刻の簡易抽出（例: "10:05発走" または "10:05"）
         post_m = re.search(r"(\d{1,2}:\d{2})", clean_text)
         post_time_est = f"{post_m.group(1)}発走" if post_m else ""
 
@@ -221,10 +235,17 @@ def parse_netkeiba_sp_page(html_text: str):
             "race_info": post_time_est
         })
 
+    # 会場ごとに「レース数が最も多い kai_day」を採用（同数なら最新の max(kai_day) を採用）
     for v_name, r_list in raw_venue_races.items():
-        earliest_kai_day = min(r["kai_day"] for r in r_list)
-        day_races = [r for r in r_list if r["kai_day"] == earliest_kai_day]
+        counts = {}
+        for r in r_list:
+            kd = r["kai_day"]
+            counts[kd] = counts.get(kd, 0) + 1
+
+        best_kai_day = sorted(counts.keys(), key=lambda kd: (counts[kd], kd), reverse=True)[0]
+        day_races = [r for r in r_list if r["kai_day"] == best_kai_day]
         day_races.sort(key=lambda x: x["race_num_int"])
+
         venues_data.append({
             "venue_name": v_name,
             "races": [
@@ -243,34 +264,39 @@ def parse_netkeiba_sp_page(html_text: str):
 
 @app.get("/races/today")
 def get_today_races(date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)")):
-    today = datetime.date.today()
+    today_dt = now_jst().date()
     if date:
         clean_date = date.replace("-", "")
         target_dates = [clean_date]
     else:
         target_dates = [
-            (today + datetime.timedelta(days=i)).strftime("%Y%m%d")
+            (today_dt + datetime.timedelta(days=i)).strftime("%Y%m%d")
             for i in range(7)
         ]
 
     for d_str in target_dates:
-        url = f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={d_str}"
-        try:
-            resp = requests.get(url, headers=HEADERS_PC, timeout=10)
+        # PC版を優先取得し、フォールバックでSP版を使用
+        urls = [
+            f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d_str}",
+            f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={d_str}"
+        ]
+        for url in urls:
             try:
-                text = resp.content.decode("euc-jp")
-            except UnicodeDecodeError:
-                text = resp.content.decode("utf-8", errors="replace")
+                resp = requests.get(url, headers=HEADERS_PC, timeout=10)
+                try:
+                    text = resp.content.decode("euc-jp")
+                except UnicodeDecodeError:
+                    text = resp.content.decode("utf-8", errors="replace")
 
-            venues = parse_netkeiba_sp_page(text)
-            if venues:
-                formatted_date = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
-                return {"date": formatted_date, "venues": venues}
-        except Exception:
-            continue
+                venues = parse_netkeiba_race_list_html(text)
+                if venues:
+                    formatted_date = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
+                    return {"date": formatted_date, "venues": venues}
+            except Exception:
+                continue
 
     return {
-        "date": today.strftime("%Y-%m-%d"),
+        "date": today_dt.strftime("%Y-%m-%d"),
         "message": "直近7日間の開催情報が見つかりませんでした。",
         "venues": []
     }
@@ -300,6 +326,13 @@ def fetch_shutuba_table(race_id: str):
         title_tag = soup.find("title")
         if title_tag:
             m = re.search(r"\d+R\s+([^|・\-_]+)", title_tag.get_text(strip=True))
+            if m:
+                race_name = m.group(1).strip()
+
+    if not race_name:
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            m = re.search(r"\d+R\s+([^|・\-_]+)", og_title["content"])
             if m:
                 race_name = m.group(1).strip()
 
@@ -347,9 +380,9 @@ def fetch_shutuba_table(race_id: str):
         "course_details": course_details
     }
 
-    # スケジュールテーブルへも発走時刻を登録
+    # スケジュール登録（JST日付を使用）
     if post_time:
-        today_date = datetime.date.today().strftime("%Y-%m-%d")
+        today_date = today_jst_str()
         register_race_schedule(race_id, today_date, race_name, post_time)
 
     odds_map = {}
@@ -671,7 +704,7 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
             "recommendation": result["recommendation"]
         }
 
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        today_str = today_jst_str()
         save_cached_prediction(race_id, today_str, resp_data)
 
         return resp_data
@@ -887,7 +920,7 @@ def verify_race_result(race_id: str):
         return cached_settlement
 
     r_year = race_id[:4]
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    today_str = today_jst_str()
     race_date = f"{r_year}-{today_str[5:7]}-{today_str[8:]}"
 
     cached_data = get_cached_result(race_id)
@@ -1020,7 +1053,7 @@ def verify_race_result(race_id: str):
 
 @app.get("/summary/today", response_model=DailySummary)
 def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
-    target_date = date if date else datetime.date.today().strftime("%Y-%m-%d")
+    target_date = date if date else today_jst_str()
 
     rows = []
     if supabase:
@@ -1070,7 +1103,7 @@ def run_batch_worker(target_date: Optional[str] = None):
     batch_status["message"] = "開催レース走査中..."
 
     try:
-        today_str = target_date if target_date else datetime.date.today().strftime("%Y-%m-%d")
+        today_str = target_date if target_date else today_jst_str()
         today_clean = today_str.replace("-", "")
 
         today_info = get_today_races(today_clean)
@@ -1134,12 +1167,7 @@ def get_batch_status():
 
 
 # =========================================================================
-# ★ バックグラウンドメンテナンスループ
-#    1. 朝の開催レース事前スケジュール登録
-#    2. 各レース【発走30分前】の自動予想実行 (最新オッズ・馬体重反映)
-#    3. 各レース【発走60分後】の自動確定照合
-#    4. 19:00 の未確定確認 (予想は行わない)
-#    5. 0:00 の一時キャッシュ削除 (収支台帳は残す)
+# ★ バックグラウンドメンテナンスループ (JST完全同期版)
 # =========================================================================
 
 async def sync_daily_schedules_if_needed(today_str: str):
@@ -1147,12 +1175,11 @@ async def sync_daily_schedules_if_needed(today_str: str):
     if not supabase:
         return
     try:
-        # すでに本日のスケジュールが登録されているか確認
         res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", today_str).execute()
         if res.data and len(res.data) >= 12:
-            return  # すでに登録済み
+            return  # すでに本日のスケジュールが12R以上登録済み
 
-        print(f"[Scheduler] {today_str} のレーススケジュールを事前走査・登録します...")
+        print(f"[Scheduler] {today_str} (JST) のレーススケジュールを事前走査・登録します...")
         today_clean = today_str.replace("-", "")
         today_info = get_today_races(today_clean)
         venues = today_info.get("venues", [])
@@ -1160,7 +1187,6 @@ async def sync_daily_schedules_if_needed(today_str: str):
         for v in venues:
             for r in v.get("races", []):
                 r_id = r["race_id"]
-                # 出馬表から正確な発走時刻を取得してスケジュール登録
                 try:
                     fetch_shutuba_table(r_id)
                 except Exception:
@@ -1170,21 +1196,22 @@ async def sync_daily_schedules_if_needed(today_str: str):
 
 
 async def background_maintenance_loop():
-    print("[Scheduler] リアルタイム・メンテナンススケジューラーを開始しました。")
+    print("[Scheduler] リアルタイム・メンテナンススケジューラー (JST同期) を開始しました。")
     last_cleaned_date = None
     last_19h_settle_date = None
 
     while True:
         try:
-            now = datetime.datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
+            # JST（日本時間）ベースで日時を取得
+            now_dt = now_jst_naive()
+            today_str = today_jst_str()
 
-            # --- 1. 朝 8:30 以降、当日のレーススケジュールを事前初期化 ---
-            if now.hour >= 8:
+            # --- 1. JST朝 8:00 以降、当日のレーススケジュールを事前登録 ---
+            if now_dt.hour >= 8:
                 await sync_daily_schedules_if_needed(today_str)
 
             if supabase:
-                # --- 2. ★ 各レース【発走30分前】の自動予想実行 ---
+                # --- 2. 各レース【発走30分前】の自動予想実行 ---
                 try:
                     res_pred = supabase.table("keiba_scheduled_races")\
                         .select("*")\
@@ -1201,12 +1228,10 @@ async def background_maintenance_loop():
                         except Exception:
                             continue
 
-                        # 発走30分前（post_dt - 30分）以降に到達しているか判定
                         trigger_predict_time = post_dt - datetime.timedelta(minutes=30)
-                        if now >= trigger_predict_time:
+                        if now_dt >= trigger_predict_time:
                             print(f"[Auto-Predict] 発走30分前検知: {r_id} ({r.get('race_name')}) の予想を実行します...")
                             try:
-                                # 最新の馬体重・オッズを反映して予想を実行＆保存
                                 predict_race(r_id, force_refresh=True)
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 1})\
@@ -1218,7 +1243,7 @@ async def background_maintenance_loop():
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
 
-                # --- 3. ★ 各レース【発走60分後】の個別自動照合 ---
+                # --- 3. 各レース【発走60分後】の個別自動照合 ---
                 try:
                     res_settle = supabase.table("keiba_scheduled_races")\
                         .select("*")\
@@ -1236,7 +1261,7 @@ async def background_maintenance_loop():
                             continue
 
                         trigger_settle_time = post_dt + datetime.timedelta(minutes=60)
-                        if now >= trigger_settle_time:
+                        if now_dt >= trigger_settle_time:
                             try:
                                 verify_race_result(r_id)
                                 supabase.table("keiba_scheduled_races")\
@@ -1258,22 +1283,22 @@ async def background_maintenance_loop():
                 except Exception as e:
                     print(f"[Scheduler] 照合ループエラー: {e}")
 
-            # --- 4. 毎日 19:00 の確定未照合レースの最終検証（予想は行わない） ---
-            if now.hour == 19 and last_19h_settle_date != today_str:
+            # --- 4. JST 19:00 の未確定確認 ---
+            if now_dt.hour == 19 and last_19h_settle_date != today_str:
                 if not batch_status["is_running"]:
                     print(f"[Scheduler] 19:00 当日レースの最終結果照合を実行します...")
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, run_batch_worker, today_str)
                     last_19h_settle_date = today_str
 
-            # --- 5. 毎日 0:00 の一時キャッシュ削除 (収支台帳は永続保持) ---
-            if now.hour == 0 and last_cleaned_date != today_str:
+            # --- 5. JST 0:00 (深夜0時) の一時キャッシュ削除 ---
+            if now_dt.hour == 0 and last_cleaned_date != today_str:
                 if supabase:
                     try:
                         supabase.table("keiba_predictions_cache").delete().lt("race_date", today_str).execute()
                         supabase.table("keiba_race_results_cache").delete().lt("race_date", today_str).execute()
                         supabase.table("keiba_scheduled_races").delete().lt("race_date", today_str).execute()
-                        print(f"[Cleanup] 0:00 前日以前の一時キャッシュを削除しました。")
+                        print(f"[Cleanup] JST 0:00 前日以前の一時キャッシュを削除しました。")
                     except Exception as ce:
                         print(f"[Cleanup] 失敗: {ce}")
                 last_cleaned_date = today_str
@@ -1281,7 +1306,6 @@ async def background_maintenance_loop():
         except Exception as e:
             print(f"[Scheduler] 全体ループエラー: {e}")
 
-        # 60秒ごとに巡回監視
         await asyncio.sleep(60)
 
 
