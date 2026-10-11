@@ -61,7 +61,7 @@ if os.path.exists(MODEL_PATH):
     except Exception as e:
         print(f"モデルロード失敗: {e}")
 
-stats_dict = {"jockey_stats": {}, "jockey_course_stats": {}, "trainer_stats": {}, "trainer_course_stats": {}}
+stats_dict = {"jockey_stats": {}, "jockey_course_stats": {}, "trainer_stats": {}, "trainer_course_stats": {}, "horse_stats": {}}
 if os.path.exists(DICT_PATH):
     try:
         with open(DICT_PATH, "r", encoding="utf-8") as f:
@@ -505,8 +505,30 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
+def rank_min_desc(values: List[float]) -> List[int]:
+    """降順ランク (値が大きいほど1位、同率は同率最小順位: pandas rank(ascending=False, method='min') と同等)"""
+    sorted_unique = sorted(list(set(values)), reverse=True)
+    val_to_rank = {}
+    current_rank = 1
+    for v in sorted_unique:
+        val_to_rank[v] = current_rank
+        current_rank += values.count(v)
+    return [val_to_rank[v] for v in values]
+
+
+def rank_min_asc(values: List[float]) -> List[int]:
+    """昇順ランク (値が小さいほど1位、同率は同率最小順位: pandas rank(ascending=True, method='min') と同等)"""
+    sorted_unique = sorted(list(set(values)), reverse=False)
+    val_to_rank = {}
+    current_rank = 1
+    for v in sorted_unique:
+        val_to_rank[v] = current_rank
+        current_rank += values.count(v)
+    return [val_to_rank[v] for v in values]
+
+
 def calculate_dynamic_bet(score: float, odds: Optional[float] = None):
-    if odds is not None and odds < 2.0:
+    if odds is not None and odds < 2.5:
         return "D", "見送り推奨(低オッズ)", True, 0, 0
 
     if score >= 0.650:
@@ -542,12 +564,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "recommendation": empty_recommendation
         }
 
-    expected_num_features = 19
+    expected_num_features = 25
     if model:
         try:
             expected_num_features = model.num_feature()
         except Exception:
-            expected_num_features = 19
+            expected_num_features = 25
 
     try:
         venue_code = int(race_id[4:6])
@@ -557,54 +579,106 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     distance = course_meta.get("distance", 1600.0)
     surface_type = course_meta.get("surface_type", 0)
     condition_code = course_meta.get("condition_code", 0)
-    distance_diff = 0.0
 
-    course_key = f"{venue_code:02d}_{surface_type}"
+    course_key = f"{venue_code}_{surface_type}"
 
     j_stats = stats_dict.get("jockey_stats", {})
     jc_stats = stats_dict.get("jockey_course_stats", {})
     t_stats = stats_dict.get("trainer_stats", {})
     tc_stats = stats_dict.get("trainer_course_stats", {})
+    h_stats = stats_dict.get("horse_stats", {})
 
-    feature_rows = []
+    head_count = len(horses)
+    kinryo_list = [float(h.get("kinryo", 55.0)) for h in horses]
+    mean_kinryo = sum(kinryo_list) / max(head_count, 1)
+
+    today_date = now_jst().date()
+
+    horse_feature_data = []
+    jc_rates = []
+    tc_rates = []
+    p1_orders = []
+
     for h in horses:
         w = h["wakuban"]
         u = h["umaban"]
-        k = h["kinryo"]
-        o = h["odds"] if h["odds"] is not None else 50.0
-        p = h["popularity"] if h["popularity"] is not None else 10.0
+        k = float(h.get("kinryo", 55.0))
 
-        career_races = h.get("career_races", 5.0)
-        career_top3_rate = h.get("career_top3_rate", 0.25)
-        prev1_order = h.get("prev1_order", 5.0)
-        prev1_pop = h.get("prev1_pop", 5.0)
-        prev1_odds = h.get("prev1_odds", 15.0)
-        prev2_order = h.get("prev2_order", 5.0)
-        days_since_prev = h.get("days_since_prev", 35.0)
+        # 馬名の正規化
+        raw_name = h.get("horse_name", "")
+        h_clean = re.sub(r"[\s\u3000]", "", raw_name)
 
-        j_clean = re.sub(r"[▲△◇☆\s]", "", h["jockey"])
-        t_clean = re.sub(r"\[.*?\]|\s", "", h.get("trainer", "") or "")
+        stat = h_stats.get(h_clean)
+        if stat:
+            career_races = float(stat.get("career_races", 0.0))
+            career_top3_rate = float(stat.get("career_top3_rate", 0.25))
+            prev1_order = float(stat.get("prev1_order", 99.0))
+            prev1_pop = float(stat.get("prev1_pop", 10.0))
+            prev1_odds = float(stat.get("prev1_odds", 50.0))
+            prev2_order = float(stat.get("prev2_order", 99.0))
+
+            last_date_str = stat.get("last_date", "")
+            if last_date_str:
+                try:
+                    last_date = datetime.datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                    days_since_prev = float(max(0, (today_date - last_date).days))
+                except Exception:
+                    days_since_prev = 35.0
+            else:
+                days_since_prev = 35.0
+
+            last_dist = float(stat.get("last_dist", distance))
+            dist_diff = float(distance - last_dist)
+        else:
+            # 過去3年出走データなし（新馬など）
+            career_races = 0.0
+            career_top3_rate = 0.25
+            prev1_order = 99.0
+            prev1_pop = 10.0
+            prev1_odds = 50.0
+            prev2_order = 99.0
+            days_since_prev = 999.0
+            dist_diff = 0.0
+
+        j_clean = re.sub(r"[▲△◇☆\s\u3000]", "", h.get("jockey", ""))
+        t_clean = re.sub(r"\[.*?\]|[\s\u3000]", "", h.get("trainer", "") or "")
 
         j_rate = j_stats.get(j_clean, 0.25)
         jc_rate = jc_stats.get(f"{j_clean}_{course_key}", j_rate)
         t_rate = t_stats.get(t_clean, 0.25)
         tc_rate = tc_stats.get(f"{t_clean}_{course_key}", t_rate)
 
-        if expected_num_features == 19:
-            feature_rows.append([
+        rel_umaban = u / max(head_count, 1)
+        kinryo_diff = k - mean_kinryo
+
+        jc_rates.append(jc_rate)
+        tc_rates.append(tc_rate)
+        p1_orders.append(prev1_order)
+
+        horse_feature_data.append({
+            "base_feats": [
                 w, u, k,
-                venue_code, surface_type, distance, distance_diff, condition_code,
+                venue_code, surface_type, distance, dist_diff, condition_code,
                 career_races, career_top3_rate,
                 prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev,
-                j_rate, jc_rate, t_rate, tc_rate
-            ])
+                j_rate, jc_rate, t_rate, tc_rate,
+                float(head_count), float(rel_umaban), float(kinryo_diff)
+            ]
+        })
+
+    j_ranks = rank_min_desc(jc_rates)
+    t_ranks = rank_min_desc(tc_rates)
+    p1_ranks = rank_min_asc(p1_orders)
+
+    feature_rows = []
+    for idx, fd in enumerate(horse_feature_data):
+        row25 = fd["base_feats"] + [float(j_ranks[idx]), float(t_ranks[idx]), float(p1_ranks[idx])]
+        if expected_num_features == 25:
+            feature_rows.append(row25)
+        elif expected_num_features == 19:
+            feature_rows.append(row25[:19])
         else:
-            feature_rows.append([
-                w, u, k,
-                venue_code, surface_type, distance, distance_diff, condition_code,
-                career_races, career_top3_rate,
-                prev1_order, prev1_pop, prev1_odds, prev2_order, days_since_prev
-            ])
+            feature_rows.append(row25[:expected_num_features])
 
     if model:
         try:
@@ -654,7 +728,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         total_amt = b_tan + b_fuku
 
         if is_pass:
-            if h_odds is not None and h_odds < 2.0:
+            if h_odds is not None and h_odds < 2.5:
                 summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{h_odds}倍のためトリガミ回避・見送り推奨)"
             else:
                 summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
