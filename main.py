@@ -1798,6 +1798,58 @@ def fix_mislabeled_20261011_races():
         return {"status": "error", "message": str(e)}
 
 
+def clear_all_database():
+    """Supabaseの全テーブル（キャッシュ、台帳、スケジュール）を完全クリア・初期化"""
+    if not supabase:
+        print("[ClearDB] Supabase未接続のためスキップします。")
+        return {"status": "skipped", "message": "Supabase not connected"}
+    try:
+        print("[ClearDB] Supabase全テーブルの初期化クリーンアップを開始します...")
+        try:
+            supabase.table("keiba_predictions_cache").delete().neq("race_id", "0").execute()
+        except Exception as e:
+            print(f"[ClearDB] predictions_cache clear warning: {e}")
+        try:
+            supabase.table("keiba_race_results_cache").delete().neq("race_id", "0").execute()
+        except Exception as e:
+            print(f"[ClearDB] results_cache clear warning: {e}")
+        try:
+            supabase.table("keiba_race_settlements").delete().neq("race_id", "0").execute()
+        except Exception as e:
+            print(f"[ClearDB] race_settlements clear warning: {e}")
+        try:
+            supabase.table("keiba_scheduled_races").delete().neq("race_id", "0").execute()
+        except Exception as e:
+            print(f"[ClearDB] scheduled_races clear warning: {e}")
+
+        # 初期化後、直ちに本日（JST）のレーススケジュールを再取得・再登録
+        today_str = today_jst_str()
+        today_clean = today_str.replace("-", "")
+        today_info = get_today_races(today_clean)
+        venues = today_info.get("venues", [])
+        synced = 0
+        for v in venues:
+            for r in v.get("races", []):
+                try:
+                    fetch_shutuba_table(r["race_id"], race_date=today_str)
+                    synced += 1
+                except Exception:
+                    pass
+
+        msg = f"全DBテーブル初期化完了 ＆ 本日レーススケジュール再登録完了 ({synced}レース)"
+        print(f"[ClearDB] {msg}")
+        return {"status": "ok", "message": msg, "synced_races": synced}
+    except Exception as e:
+        err_msg = f"[ClearDB] 初期化エラー: {e}"
+        print(err_msg)
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/clear-db")
+def endpoint_clear_db():
+    return clear_all_database()
+
+
 @app.post("/admin/fix-20261011")
 def endpoint_fix_20261011():
     return fix_mislabeled_20261011_races()
@@ -1805,6 +1857,6 @@ def endpoint_fix_20261011():
 
 @app.on_event("startup")
 async def startup_event():
-    # 起動時に10/11誤登録データを自動修復
-    fix_mislabeled_20261011_races()
+    # ユーザー指示に従い、DBを一度綺麗にして本日スケジュールを再構築
+    clear_all_database()
     asyncio.create_task(background_maintenance_loop())
