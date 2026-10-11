@@ -198,6 +198,18 @@ def parse_netkeiba_race_list_html(html_text: str):
         "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
     }
 
+    # kaisai_id を探して各会場の正確な kai_day を抽出 (例: payback_list.html?kaisai_id=2026050404)
+    venue_target_kai_day = {}
+    for a in soup.find_all("a", href=re.compile(r"kaisai_id=(\d{10})")):
+        m = re.search(r"kaisai_id=(\d{10})", a["href"])
+        if m:
+            kid = m.group(1)
+            v_code = kid[4:6]
+            kai_day = kid[6:10]
+            v_name = VENUE_CODE_MAP.get(v_code)
+            if v_name:
+                venue_target_kai_day[v_name] = kai_day
+
     raw_venue_races = {}
     seen_ids = set()
 
@@ -235,15 +247,24 @@ def parse_netkeiba_race_list_html(html_text: str):
             "race_info": post_time_est
         })
 
-    # 会場ごとに「レース数が最も多い kai_day」を採用（同数なら最新の max(kai_day) を採用）
     for v_name, r_list in raw_venue_races.items():
-        counts = {}
-        for r in r_list:
-            kd = r["kai_day"]
-            counts[kd] = counts.get(kd, 0) + 1
+        # kaisai_id から対象の kai_day が判明していれば最優先
+        target_kd = venue_target_kai_day.get(v_name)
+        if target_kd:
+            day_races = [r for r in r_list if r["kai_day"] == target_kd]
+        else:
+            day_races = []
 
-        best_kai_day = sorted(counts.keys(), key=lambda kd: (counts[kd], kd), reverse=True)[0]
-        day_races = [r for r in r_list if r["kai_day"] == best_kai_day]
+        if not day_races:
+            counts = {}
+            for r in r_list:
+                kd = r["kai_day"]
+                counts[kd] = counts.get(kd, 0) + 1
+
+            # レース数が最も多いものを採用、同数の場合はkai_dayが若い方（当日優先）を採用
+            best_kai_day = sorted(counts.keys(), key=lambda kd: (counts[kd], -int(kd) if kd.isdigit() else 0), reverse=True)[0]
+            day_races = [r for r in r_list if r["kai_day"] == best_kai_day]
+
         day_races.sort(key=lambda x: x["race_num_int"])
 
         venues_data.append({
@@ -275,18 +296,24 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
         ]
 
     for d_str in target_dates:
-        # PC版を優先取得し、フォールバックでSP版を使用
+        # PC版サブHTML(レース一覧本体)を最優先取得し、フォールバックでPC版・SP版を使用
         urls = [
+            f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={d_str}",
             f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d_str}",
             f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={d_str}"
         ]
         for url in urls:
             try:
                 resp = requests.get(url, headers=HEADERS_PC, timeout=10)
-                try:
-                    text = resp.content.decode("euc-jp")
-                except UnicodeDecodeError:
+                # UTF-8が明記されているか判定
+                raw_head = resp.content[:300].lower()
+                if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head:
                     text = resp.content.decode("utf-8", errors="replace")
+                else:
+                    try:
+                        text = resp.content.decode("euc-jp")
+                    except UnicodeDecodeError:
+                        text = resp.content.decode("utf-8", errors="replace")
 
                 venues = parse_netkeiba_race_list_html(text)
                 if venues:
@@ -302,7 +329,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
     }
 
 
-def fetch_shutuba_table(race_id: str):
+def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
     try:
@@ -380,10 +407,10 @@ def fetch_shutuba_table(race_id: str):
         "course_details": course_details
     }
 
-    # スケジュール登録（JST日付を使用）
+    # スケジュール登録（指定日付またはJST日付を使用）
     if post_time:
-        today_date = today_jst_str()
-        register_race_schedule(race_id, today_date, race_name, post_time)
+        target_date = race_date if race_date else today_jst_str()
+        register_race_schedule(race_id, target_date, race_name, post_time)
 
     odds_map = {}
     try:
@@ -691,7 +718,18 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
             return cached_pred
 
     try:
-        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id)
+        target_race_date = None
+        if supabase:
+            try:
+                s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
+                if s_res.data and len(s_res.data) > 0:
+                    target_race_date = s_res.data[0]["race_date"]
+            except Exception:
+                pass
+        if not target_race_date:
+            target_race_date = today_jst_str()
+
+        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id, race_date=target_race_date)
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
@@ -704,8 +742,7 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
             "recommendation": result["recommendation"]
         }
 
-        today_str = today_jst_str()
-        save_cached_prediction(race_id, today_str, resp_data)
+        save_cached_prediction(race_id, target_race_date, resp_data)
 
         return resp_data
     except HTTPException:
@@ -919,9 +956,17 @@ def verify_race_result(race_id: str):
     if cached_settlement:
         return cached_settlement
 
-    r_year = race_id[:4]
-    today_str = today_jst_str()
-    race_date = f"{r_year}-{today_str[5:7]}-{today_str[8:]}"
+    race_date = None
+    if supabase:
+        try:
+            s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
+            if s_res.data and len(s_res.data) > 0:
+                race_date = s_res.data[0]["race_date"]
+        except Exception:
+            pass
+    if not race_date:
+        today_str = today_jst_str()
+        race_date = f"{race_id[:4]}-{today_str[5:7]}-{today_str[8:]}"
 
     cached_data = get_cached_result(race_id)
     from_cache = False
@@ -1176,8 +1221,10 @@ async def sync_daily_schedules_if_needed(today_str: str):
         return
     try:
         res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", today_str).execute()
-        if res.data and len(res.data) >= 12:
-            return  # すでに本日のスケジュールが12R以上登録済み
+        # 0405など別日のレースが混入している場合はカウントから除外
+        valid_ids = [r["race_id"] for r in (res.data or []) if len(r["race_id"]) == 12 and r["race_id"][6:10] != "0405"]
+        if len(valid_ids) >= 20:
+            return  # すでに本日のスケジュールが20R以上登録済み
 
         print(f"[Scheduler] {today_str} (JST) のレーススケジュールを事前走査・登録します...")
         today_clean = today_str.replace("-", "")
@@ -1188,7 +1235,7 @@ async def sync_daily_schedules_if_needed(today_str: str):
             for r in v.get("races", []):
                 r_id = r["race_id"]
                 try:
-                    fetch_shutuba_table(r_id)
+                    fetch_shutuba_table(r_id, race_date=today_str)
                 except Exception:
                     pass
     except Exception as e:
@@ -1309,6 +1356,85 @@ async def background_maintenance_loop():
         await asyncio.sleep(60)
 
 
+def fix_mislabeled_20261011_races():
+    """10/11に誤登録された10/12(0405: 4回5日目)レースを10/12へ移行し、10/11当日の0404レースを再登録"""
+    if not supabase:
+        print("[Fix] Supabase未接続のため修正処理をスキップします。")
+        return {"status": "skipped", "message": "Supabase not connected"}
+
+    try:
+        print("[Fix] 10/11誤登録データの修正・移行処理を開始します...")
+
+        # 1. keiba_scheduled_races: 10/11に登録された0405レースを10/12に移行
+        res_sched = supabase.table("keiba_scheduled_races").select("*").eq("race_date", "2026-10-11").execute()
+        sched_rows = res_sched.data or []
+        migrated_sched = 0
+        for r in sched_rows:
+            r_id = r["race_id"]
+            if len(r_id) == 12 and r_id[6:10] == "0405":
+                new_post_dt = r["post_datetime"].replace("2026-10-11", "2026-10-12")
+                supabase.table("keiba_scheduled_races").update({
+                    "race_date": "2026-10-12",
+                    "post_datetime": new_post_dt,
+                    "is_settled": 0,
+                    "retry_count": 0,
+                    "is_predicted": 0
+                }).eq("race_id", r_id).execute()
+                migrated_sched += 1
+
+        # 2. keiba_predictions_cache: 0405レースのrace_dateを2026-10-12に移行
+        res_cache = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", "2026-10-11").execute()
+        cache_rows = res_cache.data or []
+        migrated_cache = 0
+        for c in cache_rows:
+            r_id = c["race_id"]
+            if len(r_id) == 12 and r_id[6:10] == "0405":
+                supabase.table("keiba_predictions_cache").update({
+                    "race_date": "2026-10-12"
+                }).eq("race_id", r_id).execute()
+                migrated_cache += 1
+
+        # 3. keiba_race_settlements: 0405レースが誤って保存されていれば削除
+        try:
+            supabase.table("keiba_race_settlements").delete().filter("race_date", "eq", "2026-10-11").like("race_id", "%0405%").execute()
+        except Exception:
+            pass
+
+        # 4. keiba_race_results_cache: 0405レースが誤って保存されていれば削除
+        try:
+            supabase.table("keiba_race_results_cache").delete().filter("race_date", "eq", "2026-10-11").like("race_id", "%0405%").execute()
+        except Exception:
+            pass
+
+        # 5. 正しい本日 (2026-10-11 / 0404) のレーススケジュールを即時取得・登録
+        today_info = get_today_races("20261011")
+        venues = today_info.get("venues", [])
+        synced_count = 0
+        for v in venues:
+            for r in v.get("races", []):
+                r_id = r["race_id"]
+                try:
+                    fetch_shutuba_table(r_id, race_date="2026-10-11")
+                    synced_count += 1
+                except Exception as fe:
+                    print(f"[Fix] 出馬表登録エラー ({r_id}): {fe}")
+
+        msg = f"修正完了: 10/12移行(スケジュール={migrated_sched}件, 予想キャッシュ={migrated_cache}件), 本日(10/11)登録={synced_count}件"
+        print(f"[Fix] {msg}")
+        return {"status": "ok", "message": msg}
+    except Exception as e:
+        err_msg = f"[Fix] 修正処理エラー: {e}"
+        print(err_msg)
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/fix-20261011")
+def endpoint_fix_20261011():
+    return fix_mislabeled_20261011_races()
+
+
 @app.on_event("startup")
 async def startup_event():
+    # 起動時に10/11誤登録データを自動修復
+    fix_mislabeled_20261011_races()
     asyncio.create_task(background_maintenance_loop())
