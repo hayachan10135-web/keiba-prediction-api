@@ -37,6 +37,10 @@ HEADERS_PC = {
 }
 
 MODEL_PATH = "lgb_model.txt"
+WIN_MODEL_PATH = "lgb_win_model.txt"
+TOP3_MODEL_PATH = "lgb_top3_model.txt"
+GACHI_MODEL_PATH = "lgb_gachi_model.txt"
+HIMO_MODEL_PATH = "lgb_himo_model.txt"
 DICT_PATH = "stats_dict.json"
 
 # --- Supabase クライアント初期化 ---
@@ -58,9 +62,41 @@ model = None
 if os.path.exists(MODEL_PATH):
     try:
         model = lgb.Booster(model_file=MODEL_PATH)
-        print("LightGBMモデルを正常にロードしました。")
+        print("現行LightGBMモデルを正常にロードしました。")
     except Exception as e:
-        print(f"モデルロード失敗: {e}")
+        print(f"現行モデルロード失敗: {e}")
+
+model_win = None
+if os.path.exists(WIN_MODEL_PATH):
+    try:
+        model_win = lgb.Booster(model_file=WIN_MODEL_PATH)
+        print("1着特化モデル (m_win) を正常にロードしました。")
+    except Exception as e:
+        print(f"1着特化モデルロード失敗: {e}")
+
+model_top3 = None
+if os.path.exists(TOP3_MODEL_PATH):
+    try:
+        model_top3 = lgb.Booster(model_file=TOP3_MODEL_PATH)
+        print("3着内特化モデル (m_top3) を正常にロードしました。")
+    except Exception as e:
+        print(f"3着内特化モデルロード失敗: {e}")
+
+model_gachi = None
+if os.path.exists(GACHI_MODEL_PATH):
+    try:
+        model_gachi = lgb.Booster(model_file=GACHI_MODEL_PATH)
+        print("ガチガチ判定メタモデル (m_gachi) を正常にロードしました。")
+    except Exception as e:
+        print(f"ガチガチ判定メタモデルロード失敗: {e}")
+
+model_himo = None
+if os.path.exists(HIMO_MODEL_PATH):
+    try:
+        model_himo = lgb.Booster(model_file=HIMO_MODEL_PATH)
+        print("中波乱判定メタモデル (m_himo) を正常にロードしました。")
+    except Exception as e:
+        print(f"中波乱判定メタモデルロード失敗: {e}")
 
 stats_dict = {"jockey_stats": {}, "jockey_course_stats": {}, "trainer_stats": {}, "trainer_course_stats": {}, "horse_stats": {}}
 if os.path.exists(DICT_PATH):
@@ -98,15 +134,19 @@ class TicketBet(BaseModel):
 
 class HybridRecommendation(BaseModel):
     is_participate: bool
-    strategy_name: str = "馬連・超高配当三連複ハイブリッド"
+    strategy_name: str = "波乱度メタモデル最適化"
+    strategy_type: Optional[str] = "daiharan"
     total_amount: int
     summary: str
     umaren_bets: List[TicketBet] = []
+    sanrentan_bets: Optional[List[TicketBet]] = []
     hypothetical_umaren_bets: Optional[List[TicketBet]] = []
     trio_bet: Optional[TicketBet] = None
     reason: Optional[str] = None
     is_real_odds_applied: Optional[bool] = False
     total_expected_payout: Optional[int] = None
+    prob_gachi: Optional[float] = None
+    prob_himo: Optional[float] = None
 
 class TanFukuRecommendation(BaseModel):
     target_umaban: Optional[int]
@@ -885,42 +925,62 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             feature_rows.append(row36[:expected_num_features])
 
-    if model:
+    if model_win and model_top3:
+        try:
+            w_scores = model_win.predict(feature_rows)
+            t_scores = model_top3.predict(feature_rows)
+            for idx, h in enumerate(horses):
+                h["prob_win"] = round(float(w_scores[idx]), 4)
+                h["prob_top3"] = round(float(t_scores[idx]), 4)
+                h["score"] = h["prob_win"]
+        except Exception:
+            for idx, h in enumerate(horses):
+                odds = h["odds"] if h["odds"] else 50.0
+                h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                h["score"] = h["prob_win"]
+    elif model:
         try:
             scores = model.predict(feature_rows)
             for idx, h in enumerate(horses):
+                h["prob_win"] = round(float(scores[idx]), 4)
+                h["prob_top3"] = round(float(scores[idx]), 4)
                 h["score"] = round(float(scores[idx]), 4)
         except Exception:
             for idx, h in enumerate(horses):
                 odds = h["odds"] if h["odds"] else 50.0
-                h["score"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                h["score"] = h["prob_win"]
     else:
         for idx, h in enumerate(horses):
             odds = h["odds"] if h["odds"] else 50.0
             base_score = 1.0 / (1.0 + (odds ** 0.5))
+            h["prob_win"] = round(float(base_score), 4)
+            h["prob_top3"] = round(float(base_score), 4)
             h["score"] = round(float(base_score), 4)
 
-    sorted_horses = sorted(horses, key=lambda x: x["score"], reverse=True)
-
-    for h in sorted_horses:
+    # 1着特化モデルのスコア順で◎, ◯を決定
+    sorted_by_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+    for h in horses:
         h["mark"] = "-"
 
-    base_marks = ["◎", "◯", "▲", "△", "×"]
-    for idx in range(min(5, len(sorted_horses))):
-        sorted_horses[idx]["mark"] = base_marks[idx]
+    if len(sorted_by_win) >= 1:
+        sorted_by_win[0]["mark"] = "◎"
+    if len(sorted_by_win) >= 2:
+        sorted_by_win[1]["mark"] = "◯"
 
-    if len(sorted_horses) >= 6:
-        sorted_horses[5]["mark"] = "☆"
-        base_hoshi_score = sorted_horses[5]["score"]
-        DIFF_THRESHOLD = 0.015
+    # 残りの馬の中から、3着内特化モデルのスコア順で ▲, △, ☆ を決定
+    remaining_horses = [h for h in sorted_by_win if h["mark"] == "-"]
+    sorted_by_top3 = sorted(remaining_horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
+    if len(sorted_by_top3) >= 1:
+        sorted_by_top3[0]["mark"] = "▲"
+    if len(sorted_by_top3) >= 2:
+        sorted_by_top3[1]["mark"] = "△"
+    if len(sorted_by_top3) >= 3:
+        sorted_by_top3[2]["mark"] = "☆"
 
-        if len(sorted_horses) >= 7:
-            if (base_hoshi_score - sorted_horses[6]["score"]) <= DIFF_THRESHOLD:
-                sorted_horses[6]["mark"] = "☆"
-                if len(sorted_horses) >= 8:
-                    if (base_hoshi_score - sorted_horses[7]["score"]) <= DIFF_THRESHOLD:
-                        sorted_horses[7]["mark"] = "☆"
-
+    sorted_horses = sorted_by_win
     honmei_horse = next((h for h in sorted_horses if h["mark"] == "◎"), None)
 
     if honmei_horse:
@@ -957,172 +1017,189 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     # -------------------------------------------------------------
     # ★ 馬連・超高配当三連複ハイブリッド推奨ロジック (黒字最適化)
     # -------------------------------------------------------------
+    # -------------------------------------------------------------
+    # ★ 波乱度メタモデル × 動的資金配分・券種切り替え戦略
+    # -------------------------------------------------------------
     hybrid_rec: Optional[dict] = None
-    if len(sorted_horses) >= 3:
-        h0, h1, h2 = sorted_horses[0], sorted_horses[1], sorted_horses[2]
-        s0 = float(h0.get("score", 0.0))
-        o0 = float(h0.get("odds") or 0.0)
-        o1 = float(h1.get("odds") or 0.0)
-        o2 = float(h2.get("odds") or 0.0)
-        u0, u1, u2 = int(h0["umaban"]), int(h1["umaban"]), int(h2["umaban"])
+    if len(horses) >= 3:
+        # 馬番・印の取得
+        h_honmei = next((h for h in horses if h["mark"] == "◎"), sorted_horses[0])
+        h_taiko = next((h for h in horses if h["mark"] == "◯"), (sorted_horses[1] if len(sorted_horses) > 1 else sorted_horses[0]))
+        h_kuro = next((h for h in horses if h["mark"] == "▲"), (sorted_horses[2] if len(sorted_horses) > 2 else sorted_horses[0]))
+        h_osae = next((h for h in horses if h["mark"] == "△"), (sorted_horses[3] if len(sorted_horses) > 3 else sorted_horses[0]))
+        h_ana = next((h for h in horses if h["mark"] == "☆"), (sorted_horses[4] if len(sorted_horses) > 4 else sorted_horses[0]))
 
-        # Webリアルタイムオッズ取得 (馬連 type=4, 三連複 type=7)
+        u0 = int(h_honmei["umaban"])
+        u1 = int(h_taiko["umaban"])
+        u2 = int(h_kuro["umaban"])
+        u3 = int(h_osae["umaban"])
+        u4 = int(h_ana["umaban"])
+
+        # オッズの集計
+        s_odds = sorted(horses, key=lambda x: (x.get("odds") if x.get("odds") is not None and x.get("odds") > 0 else 999.0))
+        o1 = float(s_odds[0].get("odds") or 50.0) if len(s_odds) >= 1 else 50.0
+        o2 = float(s_odds[1].get("odds") or 50.0) if len(s_odds) >= 2 else 50.0
+        o3 = float(s_odds[2].get("odds") or 50.0) if len(s_odds) >= 3 else 50.0
+
+        inv_sum = sum(1.0 / max(float(h.get("odds") or 50.0), 1.01) for h in horses)
+        shares = [(1.0 / max(float(h.get("odds") or 50.0), 1.01)) / inv_sum for h in horses]
+        top3_share = sum(sorted(shares, reverse=True)[:3])
+        entropy = -sum(p * math.log(max(p, 1e-6)) for p in shares)
+
+        s_ai = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+        ai_w1 = float(s_ai[0].get("prob_win", 0.0)) if len(s_ai) >= 1 else 0.0
+        ai_w2 = float(s_ai[1].get("prob_win", 0.0)) if len(s_ai) >= 2 else 0.0
+        ai_diff = ai_w1 - ai_w2
+
+        front_runners = 0
+        for h in horses:
+            h_clean = re.sub(r"[\s\u3000]", "", h.get("horse_name", ""))
+            st = h_stats.get(h_clean, {})
+            if float(st.get("last_corner_final", 8.0)) <= 3.0:
+                front_runners += 1
+        front_ratio = front_runners / max(len(horses), 1)
+
+        race_feat_row = [
+            float(head_count), float(distance), float(surface_type), float(condition_code), float(venue_code),
+            float(o1), float(o2), float(o3), float(o2 / max(o1, 0.5)),
+            float(top3_share), float(entropy),
+            float(ai_w1), float(ai_w2), float(ai_diff),
+            float(front_runners), float(front_ratio)
+        ]
+
+        prob_gachi = 0.0
+        prob_himo = 0.0
+        if model_gachi:
+            try:
+                prob_gachi = round(float(model_gachi.predict([race_feat_row])[0]), 4)
+            except Exception:
+                prob_gachi = 0.0
+        if model_himo:
+            try:
+                prob_himo = round(float(model_himo.predict([race_feat_row])[0]), 4)
+            except Exception:
+                prob_himo = 0.0
+
+        # Webリアルタイムオッズ取得
         real_odds_data = fetch_real_odds(race_id)
         umaren_real_map = real_odds_data.get("umaren", {})
-        trio_real_map = real_odds_data.get("trio", {})
 
-        # 本線 (◎-◯) オッズ
         comb_01 = (min(u0, u1), max(u0, u1))
         if comb_01 in umaren_real_map:
             u01_odds = umaren_real_map[comb_01]
             u01_is_real = True
         else:
-            u01_odds = round(max(2.5, 0.65 * o0 * o1), 1) if (o0 > 0 and o1 > 0) else 0.0
+            o_u0 = float(h_honmei.get("odds") or 0.0)
+            o_u1 = float(h_taiko.get("odds") or 0.0)
+            u01_odds = round(max(2.5, 0.65 * o_u0 * o_u1), 1) if (o_u0 > 0 and o_u1 > 0) else 0.0
             u01_is_real = False
 
-        # 抑え (◎-▲) オッズ
-        comb_02 = (min(u0, u2), max(u0, u2))
-        if comb_02 in umaren_real_map:
-            u02_odds = umaren_real_map[comb_02]
-            u02_is_real = True
-        else:
-            u02_odds = round(max(2.5, 0.65 * o0 * o2), 1) if (o0 > 0 and o2 > 0) else 0.0
-            u02_is_real = False
+        # 仮想買い目 (見送り時の仮想損益検証用: 本命馬連800円)
+        exp_pay_hypo = int(round(800 * u01_odds)) if u01_odds > 0 else 0
+        hypothetical_umaren_bets = [{
+            "ticket_type": "馬連",
+            "combination": [u0, u1],
+            "combination_str": f"{u0}-{u1}",
+            "amount": 800,
+            "odds": u01_odds,
+            "expected_payout": exp_pay_hypo,
+            "is_real_odds": u01_is_real,
+            "memo": f"仮想本命馬連 (800円 / {'実オッズ' if u01_is_real else '想定'}{u01_odds}倍)"
+        }]
 
-        is_real_applied = u01_is_real or u02_is_real
+        # ルール判定
+        is_target_gachi = (prob_gachi >= 0.28) and (o1 <= 2.8) and (surface_type != 2)
+        is_target_himo = (prob_himo >= 0.50) and (prob_gachi <= 0.25) and (o1 >= 2.0) and (surface_type != 2)
 
-        # 見送り判定
-        can_bet = True
-        reasons = []
-        if surface_type == 2:
-            can_bet = False
-            reasons.append("障害レース除外")
-
-        if o0 <= 0:
-            can_bet = False
-            reasons.append("オッズ未発表のため見送り")
-        elif not (1.5 <= o0 <= 2.8):
-            can_bet = False
-            reasons.append(f"◎単勝オッズ範囲外({o0}倍: 推奨1.5〜2.8倍)")
-
-        if s0 < 0.52:
-            can_bet = False
-            reasons.append(f"◎AIスコア不足({s0:.3f}: 推奨0.520以上)")
-
-        odds_type_label = "実オッズ" if u01_is_real else "想定"
-        if u01_odds < 3.2:
-            can_bet = False
-            reasons.append(f"本線{odds_type_label}馬連配当不足({u01_odds}倍: 推奨3.2倍以上)")
-
-        exp_pay_01 = int(round(300 * u01_odds)) if u01_odds > 0 else 0
-        exp_pay_02 = int(round(100 * u02_odds)) if u02_odds > 0 else 0
-
-        memo_01 = f"本線 (300円 / {'Web実オッズ' if u01_is_real else '想定'}{u01_odds}倍 → 想定払戻{exp_pay_01:,}円)"
-        memo_02 = f"抑え (100円 / {'Web実オッズ' if u02_is_real else '想定'}{u02_odds}倍 → 想定払戻{exp_pay_02:,}円)"
-
-        hypothetical_umaren_bets = [
-            {
+        if is_target_gachi and len(horses) >= 5:
+            # 【ルール1】ガチガチ判定 → 本命ライン「◎-◯」の1点だけに厚張り（800円）！
+            exp_pay_01 = int(round(800 * u01_odds)) if u01_odds > 0 else 0
+            memo_01 = f"本命1点厚張り (800円 / {'Web実オッズ' if u01_is_real else '想定'}{u01_odds}倍 → 想定払戻{exp_pay_01:,}円)"
+            umaren_bets = [{
                 "ticket_type": "馬連",
                 "combination": [u0, u1],
                 "combination_str": f"{u0}-{u1}",
-                "amount": 300,
+                "amount": 800,
                 "odds": u01_odds,
                 "expected_payout": exp_pay_01,
                 "is_real_odds": u01_is_real,
                 "memo": memo_01
-            },
-            {
-                "ticket_type": "馬連",
-                "combination": [u0, u2],
-                "combination_str": f"{u0}-{u2}",
-                "amount": 100,
-                "odds": u02_odds,
-                "expected_payout": exp_pay_02,
-                "is_real_odds": u02_is_real,
-                "memo": memo_02
-            }
-        ]
-
-        if not can_bet:
-            hybrid_rec = {
-                "is_participate": False,
-                "strategy_name": "馬連・超高配当三連複ハイブリッド",
-                "total_amount": 0,
-                "summary": f"見送り推奨 (期待値基準外: {' / '.join(reasons)})",
-                "umaren_bets": [],
-                "hypothetical_umaren_bets": hypothetical_umaren_bets,
-                "trio_bet": None,
-                "reason": " / ".join(reasons),
-                "is_real_odds_applied": is_real_applied,
-                "total_expected_payout": 0
-            }
-        else:
-            umaren_bets = hypothetical_umaren_bets
-
-            # 三連複相手（★）の選定: 3〜6位の中で配当 >= 35倍
-            trio_target = None
-            candidates = []
-            for idx in range(2, min(7, len(sorted_horses))):
-                hx = sorted_horses[idx]
-                ox = float(hx.get("odds") or 0.0)
-                ux = int(hx["umaban"])
-                t_comb = tuple(sorted([u0, u1, ux]))
-
-                if t_comb in trio_real_map:
-                    t_odds = trio_real_map[t_comb]
-                    t_is_real = True
-                elif ox > 0:
-                    t_odds = round(calc_trio_odds(o0, o1, ox), 1)
-                    t_is_real = False
-                else:
-                    continue
-
-                if t_odds >= 35.0:
-                    candidates.append({
-                        "horse": hx,
-                        "odds": t_odds,
-                        "is_real_odds": t_is_real,
-                        "is_first_blinker": bool(hx.get("is_first_blinker", False))
-                    })
-
-            if candidates:
-                candidates.sort(key=lambda c: (1 if c["is_first_blinker"] else 0), reverse=True)
-                best_c = candidates[0]
-                target_h = best_c["horse"]
-                target_ux = int(target_h["umaban"])
-                target_odds = best_c["odds"]
-                target_is_real = best_c["is_real_odds"]
-                trio_exp_pay = int(round(100 * target_odds))
-                blinker_note = "【初ブリンカー激走期待！】" if best_c["is_first_blinker"] else ""
-                trio_odds_tag = "Web実オッズ" if target_is_real else "想定"
-
-                trio_target = {
-                    "ticket_type": "三連複",
-                    "combination": [u0, u1, target_ux],
-                    "combination_str": f"{u0}-{u1}-{target_ux}",
-                    "amount": 100,
-                    "odds": target_odds,
-                    "expected_payout": trio_exp_pay,
-                    "is_real_odds": target_is_real,
-                    "memo": f"三連複{blinker_note} ({trio_odds_tag}{target_odds}倍 → 想定払戻{trio_exp_pay:,}円 / 相手{target_ux}番:{target_h['horse_name']})"
-                }
-
-            total_amt = 400 + (100 if trio_target else 0)
-            trio_summary = f" ＋ 三連複1点({trio_target['combination_str']}: 100円)" if trio_target else " (三連複は見送り)"
-            tag_name = "Web実オッズ" if u01_is_real else "想定"
-            tot_exp_summary = f"[本線{tag_name}{u01_odds}倍 → 想定払戻{exp_pay_01:,}円]"
-
+            }]
             hybrid_rec = {
                 "is_participate": True,
-                "strategy_name": "馬連・超高配当三連複ハイブリッド",
-                "total_amount": total_amt,
-                "summary": f"参戦推奨: 馬連2点(400円){trio_summary} / 計{total_amt}円 {tot_exp_summary}",
+                "strategy_name": "ガチガチ本命戦 (馬連1点厚張り)",
+                "strategy_type": "gachigachi",
+                "total_amount": 800,
+                "summary": f"参戦推奨: 馬連1点厚張り(800円) [{u0}-{u1}] 想定払戻{exp_pay_01:,}円 (堅実度{prob_gachi*100:.1f}%)",
                 "umaren_bets": umaren_bets,
+                "sanrentan_bets": [],
+                "hypothetical_umaren_bets": umaren_bets,
+                "trio_bet": None,
+                "reason": f"ガチガチ判定クリア (堅実度{prob_gachi*100:.1f}% / 1番人気{o1}倍)",
+                "is_real_odds_applied": u01_is_real,
+                "total_expected_payout": exp_pay_01,
+                "prob_gachi": prob_gachi,
+                "prob_himo": prob_himo
+            }
+        elif is_target_himo and len(horses) >= 5:
+            # 【ルール2】中波乱・混戦判定 → 3連単フォーメーション（18点 各100円 = 1,800円）！
+            first_group = [u0, u1]
+            second_group = [u0, u1, u2, u3]
+            third_group = [u0, u1, u2, u3, u4]
+            sanrentan_bets = []
+            for f in first_group:
+                for s in second_group:
+                    for t in third_group:
+                        if f != s and f != t and s != t:
+                            sanrentan_bets.append({
+                                "ticket_type": "3連単",
+                                "combination": [f, s, t],
+                                "combination_str": f"{f}→{s}→{t}",
+                                "amount": 100,
+                                "memo": f"3連単F (1着:{f} / 2着:{s} / 3着:{t})"
+                            })
+            total_amt = len(sanrentan_bets) * 100
+            hybrid_rec = {
+                "is_participate": True,
+                "strategy_name": "中波乱・混戦 (3連単18点フォーメーション)",
+                "strategy_type": "chuharan",
+                "total_amount": total_amt,
+                "summary": f"参戦推奨: 3連単フォーメーション18点(1,800円) [1着:{u0},{u1} / 2着:4頭 / 3着:5頭] (中波乱度{prob_himo*100:.1f}%)",
+                "umaren_bets": [],
+                "sanrentan_bets": sanrentan_bets,
                 "hypothetical_umaren_bets": hypothetical_umaren_bets,
-                "trio_bet": trio_target,
-                "reason": "基準クリア（◎勝負気配 ＆ 本線妙味あり）",
-                "is_real_odds_applied": is_real_applied,
-                "total_expected_payout": exp_pay_01 + (trio_target["expected_payout"] if trio_target else 0)
+                "trio_bet": None,
+                "reason": f"中波乱・ヒモ荒れ判定クリア (中波乱度{prob_himo*100:.1f}% / 堅実度{prob_gachi*100:.1f}%)",
+                "is_real_odds_applied": False,
+                "total_expected_payout": 0,
+                "prob_gachi": prob_gachi,
+                "prob_himo": prob_himo
+            }
+        else:
+            # 【ルール3】大波乱・難解判定 → 馬連は完全見送り（0円）で資金を守る！
+            reason_detail = []
+            if surface_type == 2:
+                reason_detail.append("障害レース除外")
+            elif len(horses) < 5:
+                reason_detail.append("少頭数レース除外")
+            else:
+                reason_detail.append(f"波乱度メタ判定 (堅実度:{prob_gachi*100:.1f}%, 中波乱度:{prob_himo*100:.1f}%, 1番人気:{o1}倍)")
+            reason_str = " / ".join(reason_detail)
+            hybrid_rec = {
+                "is_participate": False,
+                "strategy_name": "大波乱・難解 (完全見送り)",
+                "strategy_type": "daiharan",
+                "total_amount": 0,
+                "summary": f"見送り推奨 (大波乱・難解判定: 資金保全のため0円見送り)",
+                "umaren_bets": [],
+                "sanrentan_bets": [],
+                "hypothetical_umaren_bets": hypothetical_umaren_bets,
+                "trio_bet": None,
+                "reason": reason_str,
+                "is_real_odds_applied": u01_is_real,
+                "total_expected_payout": 0,
+                "prob_gachi": prob_gachi,
+                "prob_himo": prob_himo
             }
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
@@ -1848,12 +1925,16 @@ def process_settlement_calculation(
 
     # 参戦レースの場合
     umaren_bets = hybrid_rec.get("umaren_bets", [])
+    sanrentan_bets = hybrid_rec.get("sanrentan_bets", [])
     trio_bet = hybrid_rec.get("trio_bet")
     u_bet_tot = sum(b.get("amount", 0) for b in umaren_bets)
+    s_bet_tot = sum(b.get("amount", 0) for b in sanrentan_bets)
     t_bet_tot = trio_bet.get("amount", 0) if trio_bet else 0
-    total_bet = u_bet_tot + t_bet_tot
+    total_bet = u_bet_tot + s_bet_tot + t_bet_tot
 
     payouts_data = race_res.get("payouts", {})
+
+    # 1. 馬連照合
     umaren_payout = 0
     umaren_hits = []
     for ub in umaren_bets:
@@ -1872,6 +1953,26 @@ def process_settlement_calculation(
                     "payout": pay
                 })
 
+    # 2. 3連単照合
+    sanrentan_payout = 0
+    sanrentan_hits = []
+    for sb in sanrentan_bets:
+        comb = sb.get("combination", [])
+        if len(comb) == 3:
+            comb_key = f"{comb[0]}-{comb[1]}-{comb[2]}"
+            unit_p = payouts_data.get("tierce", {}).get(comb_key, 0)
+            if unit_p > 0:
+                pay = int((sb.get("amount", 100) / 100.0) * unit_p)
+                sanrentan_payout += pay
+                sanrentan_hits.append({
+                    "type": "3連単",
+                    "comb": f"{comb[0]}→{comb[1]}→{comb[2]}",
+                    "amount": sb.get("amount"),
+                    "unit_payout": unit_p,
+                    "payout": pay
+                })
+
+    # 3. 三連複照合
     trio_payout = 0
     trio_hits = []
     if trio_bet and trio_bet.get("combination"):
@@ -1890,13 +1991,15 @@ def process_settlement_calculation(
                     "payout": pay
                 })
 
-    total_payout = umaren_payout + trio_payout
+    total_payout = umaren_payout + sanrentan_payout + trio_payout
     profit = total_payout - total_bet
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     is_hit = total_payout > 0
 
-    if len(umaren_hits) > 0 and len(trio_hits) > 0:
+    if len(sanrentan_hits) > 0 and len(umaren_hits) > 0:
         hit_type = "W的中🔥"
+    elif len(sanrentan_hits) > 0:
+        hit_type = "3連単的中🎯"
     elif len(umaren_hits) > 0:
         hit_type = "馬連的中🎯"
     elif len(trio_hits) > 0:
@@ -1910,7 +2013,7 @@ def process_settlement_calculation(
     marks_summary = format_mark_orders_text(mark_orders)
     marks_line = f"\n{marks_summary}" if marks_summary else ""
 
-    all_hits = umaren_hits + trio_hits
+    all_hits = sanrentan_hits + umaren_hits + trio_hits
     if is_hit:
         hit_texts = [f"{h['type']}{h['comb']}({h['payout']:,}円)" for h in all_hits]
         msg = f"【{hit_type}】{' ＆ '.join(hit_texts)}！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery_rate}%){marks_line}"
@@ -1918,8 +2021,14 @@ def process_settlement_calculation(
         order_info = f" (◎{target_u}番: {actual_order}着)" if (actual_order and actual_order < 90) else ""
         msg = f"不的中{order_info} (投資: {total_bet:,}円 / 払戻: 0円 / 収支: {profit:,}円 / 回収率: 0.0%){marks_line}"
 
-    bet_breakdown = {"馬連": u_bet_tot}
-    payout_breakdown = {"馬連": umaren_payout}
+    bet_breakdown = {}
+    payout_breakdown = {}
+    if u_bet_tot > 0:
+        bet_breakdown["馬連"] = u_bet_tot
+        payout_breakdown["馬連"] = umaren_payout
+    if s_bet_tot > 0:
+        bet_breakdown["3連単"] = s_bet_tot
+        payout_breakdown["3連単"] = sanrentan_payout
     if t_bet_tot > 0:
         bet_breakdown["三連複"] = t_bet_tot
         payout_breakdown["三連複"] = trio_payout
@@ -1928,7 +2037,7 @@ def process_settlement_calculation(
         "race_id": race_id,
         "race_date": race_date,
         "race_name": race_name,
-        "strategy_type": "hybrid",
+        "strategy_type": hybrid_rec.get("strategy_type", "hybrid"),
         "target_umaban": target_u,
         "horse_name": h_name,
         "grade": grade,
@@ -1949,6 +2058,7 @@ def process_settlement_calculation(
         "payout_breakdown": payout_breakdown,
         "bet_details": {
             "umaren_bets": umaren_bets,
+            "sanrentan_bets": sanrentan_bets,
             "trio_bet": trio_bet
         },
         "payout_details": all_hits,
@@ -1981,12 +2091,13 @@ def process_settlement_calculation(
         "recovery_rate": recovery_rate,
         "from_cache": from_cache,
         "message": msg,
-        "strategy_type": "hybrid",
+        "strategy_type": hybrid_rec.get("strategy_type", "hybrid"),
         "hit_type": hit_type,
         "bet_breakdown": bet_breakdown,
         "payout_breakdown": payout_breakdown,
         "bet_details": {
             "umaren_bets": umaren_bets,
+            "sanrentan_bets": sanrentan_bets,
             "trio_bet": trio_bet
         },
         "payout_details": all_hits,
@@ -2074,6 +2185,30 @@ def verify_race_result(
         race_res=race_res,
         from_cache=from_cache
     )
+
+
+@app.get("/summary/dates", response_model=List[str])
+@app.get("/daily-summary/dates", response_model=List[str])
+def get_summary_dates():
+    """過去の集計可能日付一覧を取得 (降順)"""
+    if not supabase:
+        return [today_jst_str()]
+    try:
+        res = supabase.table("keiba_race_settlements").select("race_date").order("race_date", desc=True).execute()
+        dates = []
+        seen = set()
+        for row in (res.data or []):
+            d = row.get("race_date")
+            if d and d not in seen:
+                seen.add(d)
+                dates.append(d)
+        today_str = today_jst_str()
+        if today_str not in seen:
+            dates.insert(0, today_str)
+        return dates if dates else [today_str]
+    except Exception as e:
+        print(f"日付一覧取得エラー: {e}")
+        return [today_jst_str()]
 
 
 @app.get("/summary/today", response_model=DailySummary)
