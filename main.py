@@ -179,6 +179,16 @@ class VerificationResult(BaseModel):
     umaren_payout: Optional[int] = 0
     trio_payout: Optional[int] = 0
 
+class ManualVerificationRequest(BaseModel):
+    target_order: Optional[int] = None       # ◎本命馬の着順 (1〜18等)
+    first_umaban: Optional[int] = None       # 1着馬番
+    second_umaban: Optional[int] = None      # 2着馬番
+    third_umaban: Optional[int] = None       # 3着馬番
+    umaren_payout: Optional[int] = None      # 馬連払戻金 (100円あたり, 任意)
+    trio_payout: Optional[int] = None        # 三連複払戻金 (100円あたり, 任意)
+    is_cancelled: Optional[bool] = False     # 取消・中止フラグ
+    note: Optional[str] = None               # メモ
+
 class DailySummary(BaseModel):
     target_date: str
     total_races: int
@@ -1499,56 +1509,93 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     }
 
 
-@app.get("/result/{race_id}", response_model=VerificationResult)
-def verify_race_result(race_id: str):
-    if len(race_id) != 12 or not race_id.isdigit():
-        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
-
-    cached_settlement = get_cached_settlement(race_id)
-    if cached_settlement:
-        return cached_settlement
-
-    race_date = None
-    if supabase:
-        try:
-            s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
-            if s_res.data and len(s_res.data) > 0:
-                race_date = s_res.data[0]["race_date"]
-        except Exception:
-            pass
-    if not race_date:
-        today_str = today_jst_str()
-        race_date = f"{race_id[:4]}-{today_str[5:7]}-{today_str[8:]}"
-
-    cached_data = get_cached_result(race_id)
-    from_cache = False
-
-    if cached_data:
-        from_cache = True
-        race_res = cached_data
-    else:
-        race_res = fetch_netkeiba_race_result(race_id)
-        if not race_res:
-            raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
-        save_cached_result(race_id, race_res["race_name"], race_date, race_res)
-
-    pred_data = predict_race(race_id)
+def process_settlement_calculation(
+    race_id: str,
+    race_date: str,
+    race_name: str,
+    pred_data: dict,
+    race_res: dict,
+    from_cache: bool = False,
+    is_manual: bool = False,
+    is_cancelled: bool = False,
+    note: Optional[str] = None
+) -> dict:
     rec = pred_data.get("recommendation", {})
     hybrid_rec = pred_data.get("hybrid_recommendation")
-    race_name = pred_data.get("race_name", race_res["race_name"])
 
     target_u = rec.get("target_umaban")
     h_name = rec.get("horse_name")
     grade = rec.get("grade", "B")
-    actual_order = race_res["orders"].get(target_u) if target_u else None
+    orders = race_res.get("orders", {})
+    actual_order = orders.get(target_u) if target_u else None
 
-    # ハイブリッド推奨を最優先で照合
+    # 出走取消または競走中止
+    if is_cancelled:
+        msg = f"【出走取消/競走中止】全額返還・ノーカウント扱い (メモ: {note or '手動登録'})"
+        settlement = {
+            "race_id": race_id,
+            "race_date": race_date,
+            "race_name": race_name,
+            "strategy_type": "hybrid",
+            "target_umaban": target_u,
+            "horse_name": h_name,
+            "grade": grade,
+            "is_pass": True,
+            "umaren_bet": 0,
+            "trio_bet": 0,
+            "total_bet": 0,
+            "actual_order": None,
+            "umaren_payout": 0,
+            "trio_payout": 0,
+            "total_payout": 0,
+            "is_hit": False,
+            "hit_type": "取消/中止",
+            "hypothetical_bet": 0,
+            "hypothetical_payout": 0,
+            "pass_benefit": 0,
+            "bet_breakdown": {},
+            "payout_breakdown": {},
+            "bet_details": None,
+            "payout_details": None,
+            "tansho_bet": 0,
+            "fukusho_bet": 0,
+            "tansho_payout": 0,
+            "fukusho_payout": 0
+        }
+        save_settlement(settlement)
+        if supabase:
+            try:
+                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+            except Exception:
+                pass
+        return {
+            "race_id": race_id,
+            "race_name": race_name,
+            "is_pass": True,
+            "grade": grade,
+            "target_umaban": target_u,
+            "horse_name": h_name,
+            "actual_order": None,
+            "is_hit": False,
+            "total_bet": 0,
+            "total_payout": 0,
+            "profit": 0,
+            "recovery_rate": 0.0,
+            "from_cache": from_cache,
+            "message": msg,
+            "strategy_type": "hybrid",
+            "hit_type": "取消/中止"
+        }
+
+    # ハイブリッド推奨を最優先で照合（見送りレース）
     if not hybrid_rec or not hybrid_rec.get("is_participate", False):
         pass_info = calculate_hybrid_pass_benefit_info(hybrid_rec, race_res, target_u, actual_order)
         hypo_bet = pass_info["hypothetical_bet"]
         hypo_pay = pass_info["hypothetical_payout"]
         pass_benefit = pass_info["pass_benefit"]
         msg = pass_info["message"]
+        if is_manual:
+            msg = f"[手動登録] {msg}"
 
         settlement = {
             "race_id": race_id,
@@ -1581,6 +1628,11 @@ def verify_race_result(race_id: str):
             "fukusho_payout": 0
         }
         save_settlement(settlement)
+        if supabase:
+            try:
+                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+            except Exception:
+                pass
 
         return {
             "race_id": race_id,
@@ -1671,11 +1723,13 @@ def verify_race_result(race_id: str):
         hit_type = "不的中"
 
     all_hits = umaren_hits + trio_hits
+    manual_prefix = "[手動登録] " if is_manual else ""
     if is_hit:
         hit_texts = [f"{h['type']}{h['comb']}({h['payout']:,}円)" for h in all_hits]
-        msg = f"【{hit_type}】{' ＆ '.join(hit_texts)}！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery_rate}%)"
+        msg = f"{manual_prefix}【{hit_type}】{' ＆ '.join(hit_texts)}！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery_rate}%)"
     else:
-        msg = f"不的中 (投資: {total_bet:,}円 / 払戻: 0円 / 収支: {profit:,}円 / 回収率: 0.0%)"
+        order_info = f" (◎{target_u}番: {actual_order}着)" if (actual_order and actual_order < 90) else ""
+        msg = f"{manual_prefix}不的中{order_info} (投資: {total_bet:,}円 / 払戻: 0円 / 収支: {profit:,}円 / 回収率: 0.0%)"
 
     bet_breakdown = {"馬連": u_bet_tot}
     payout_breakdown = {"馬連": umaren_payout}
@@ -1717,6 +1771,11 @@ def verify_race_result(race_id: str):
         "fukusho_payout": 0
     }
     save_settlement(settlement)
+    if supabase:
+        try:
+            supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+        except Exception:
+            pass
 
     return {
         "race_id": race_id,
@@ -1747,6 +1806,168 @@ def verify_race_result(race_id: str):
         "umaren_payout": umaren_payout,
         "trio_payout": trio_payout
     }
+
+
+@app.get("/result/{race_id}", response_model=VerificationResult)
+def verify_race_result(
+    race_id: str,
+    bypass_cache: bool = Query(False, description="キャッシュをバイパスして最新結果を取得"),
+    is_19h_settle: bool = Query(False, description="19時の一括確定モード")
+):
+    if len(race_id) != 12 or not race_id.isdigit():
+        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
+
+    if not bypass_cache:
+        cached_settlement = get_cached_settlement(race_id)
+        # 過去に実数値なし(None)で誤保存されたレコードは再検証させる
+        if cached_settlement and cached_settlement.get("actual_order") is not None:
+            return cached_settlement
+
+    race_date = None
+    if supabase:
+        try:
+            s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
+            if s_res.data and len(s_res.data) > 0:
+                race_date = s_res.data[0]["race_date"]
+        except Exception:
+            pass
+    if not race_date:
+        today_str = today_jst_str()
+        race_date = f"{race_id[:4]}-{today_str[5:7]}-{today_str[8:]}"
+
+    cached_data = get_cached_result(race_id) if not bypass_cache else None
+    from_cache = False
+
+    if cached_data:
+        from_cache = True
+        race_res = cached_data
+    else:
+        race_res = fetch_netkeiba_race_result(race_id)
+        if not race_res:
+            raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
+
+    # 予想情報を取得
+    pred_data = predict_race(race_id)
+    rec = pred_data.get("recommendation", {})
+    race_name = pred_data.get("race_name", race_res.get("race_name", f"Race {race_id}"))
+
+    target_u = rec.get("target_umaban")
+    orders = race_res.get("orders", {})
+    payouts = race_res.get("payouts", {})
+    actual_order = orders.get(target_u) if target_u else None
+
+    # ★ 着順および払戻金が実数値で確認できるかの厳格チェック
+    # 1. 1〜3着が実数値で確定しているか
+    has_top3 = (1 in orders.values()) and (2 in orders.values()) and (3 in orders.values())
+    # 2. 払戻金が公開されているか (単勝または馬連などの払戻金が存在するか)
+    has_payouts = (len(payouts.get("tansho", {})) > 0) or (len(payouts.get("umaren", {})) > 0) or (len(payouts.get("fukusho", {})) > 0)
+    # 3. 予想対象馬(◎)の確定着順が実数値として判明しているか (1〜30着)
+    has_target_order = (actual_order is not None and isinstance(actual_order, int) and 1 <= actual_order <= 30)
+
+    # 19時の全体確認以外は、着順・払戻が実数値で揃っていない場合は照合済みにしない！
+    is_fully_confirmed = has_top3 and has_payouts and (has_target_order or target_u is None)
+    if not is_19h_settle and not is_fully_confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"着順または払戻金が実数値で確定していません（入線直後・審議中等のため未確定）。確定後に再度照合してください。(確認状況: 1〜3着確定={has_top3}, 払戻金確定={has_payouts}, ◎着順確定={has_target_order})"
+        )
+
+    # 実数値で確認できた場合のみ、キャッシュ保存
+    save_cached_result(race_id, race_name, race_date, race_res)
+
+    return process_settlement_calculation(
+        race_id=race_id,
+        race_date=race_date,
+        race_name=race_name,
+        pred_data=pred_data,
+        race_res=race_res,
+        from_cache=from_cache,
+        is_manual=False
+    )
+
+
+@app.post("/result/{race_id}/manual", response_model=VerificationResult)
+def manual_verify_race_result(
+    race_id: str,
+    manual_data: ManualVerificationRequest
+):
+    if len(race_id) != 12 or not race_id.isdigit():
+        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
+
+    pred_data = predict_race(race_id)
+    rec = pred_data.get("recommendation", {})
+    target_u = rec.get("target_umaban")
+    race_name = pred_data.get("race_name", f"Race {race_id}")
+
+    race_date = None
+    if supabase:
+        try:
+            s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
+            if s_res.data and len(s_res.data) > 0:
+                race_date = s_res.data[0]["race_date"]
+        except Exception:
+            pass
+    if not race_date:
+        today_str = today_jst_str()
+        race_date = f"{race_id[:4]}-{today_str[5:7]}-{today_str[8:]}"
+
+    # 既存のキャッシュまたはネット競馬結果があればベースにする
+    race_res = get_cached_result(race_id) or fetch_netkeiba_race_result(race_id) or {
+        "race_name": race_name,
+        "orders": {},
+        "payouts": {
+            "tansho": {}, "fukusho": {}, "wakuren": {},
+            "umaren": {}, "wide": {}, "umatan": {}, "trio": {}, "tierce": {}
+        }
+    }
+
+    orders = race_res.setdefault("orders", {})
+    payouts = race_res.setdefault("payouts", {})
+
+    # 手動着順の反映
+    if manual_data.first_umaban is not None:
+        orders[manual_data.first_umaban] = 1
+    if manual_data.second_umaban is not None:
+        orders[manual_data.second_umaban] = 2
+    if manual_data.third_umaban is not None:
+        orders[manual_data.third_umaban] = 3
+
+    if target_u is not None:
+        if manual_data.target_order is not None:
+            orders[target_u] = manual_data.target_order
+        elif manual_data.first_umaban == target_u:
+            orders[target_u] = 1
+        elif manual_data.second_umaban == target_u:
+            orders[target_u] = 2
+        elif manual_data.third_umaban == target_u:
+            orders[target_u] = 3
+
+    # 手動払戻金の反映
+    if manual_data.first_umaban is not None and manual_data.second_umaban is not None:
+        u_key = f"{min(manual_data.first_umaban, manual_data.second_umaban)}-{max(manual_data.first_umaban, manual_data.second_umaban)}"
+        if manual_data.umaren_payout is not None:
+            payouts.setdefault("umaren", {})[u_key] = manual_data.umaren_payout
+
+    if manual_data.first_umaban is not None and manual_data.second_umaban is not None and manual_data.third_umaban is not None:
+        s_t = sorted([manual_data.first_umaban, manual_data.second_umaban, manual_data.third_umaban])
+        t_key = f"{s_t[0]}-{s_t[1]}-{s_t[2]}"
+        if manual_data.trio_payout is not None:
+            payouts.setdefault("trio", {})[t_key] = manual_data.trio_payout
+
+    # キャッシュを上書き保存
+    save_cached_result(race_id, race_name, race_date, race_res)
+
+    return process_settlement_calculation(
+        race_id=race_id,
+        race_date=race_date,
+        race_name=race_name,
+        pred_data=pred_data,
+        race_res=race_res,
+        from_cache=False,
+        is_manual=True,
+        is_cancelled=bool(manual_data.is_cancelled),
+        note=manual_data.note
+    )
 
 
 @app.get("/summary/today", response_model=DailySummary)
@@ -1888,7 +2109,12 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 # ★ 手動一括処理（アプリボタン用・確定検証と現時点の予想登録）
 # =========================================================================
 
-def run_batch_worker(target_date: Optional[str] = None, mode: str = "all", force_predict: bool = False):
+def run_batch_worker(
+    target_date: Optional[str] = None,
+    mode: str = "all",
+    force_predict: bool = False,
+    is_19h_settle: bool = False
+):
     global batch_status
     batch_status["is_running"] = True
     batch_status["current"] = 0
@@ -1936,8 +2162,8 @@ def run_batch_worker(target_date: Optional[str] = None, mode: str = "all", force
             if mode in ("all", "settle"):
                 try:
                     settled = get_cached_settlement(r_id)
-                    if not settled:
-                        verify_race_result(r_id)
+                    if not settled or settled.get("actual_order") is None:
+                        verify_race_result(r_id, is_19h_settle=is_19h_settle)
                         batch_status["settled"] += 1
                 except Exception:
                     pass
@@ -2119,7 +2345,7 @@ async def background_maintenance_loop():
                 if not batch_status["is_running"]:
                     print(f"[Scheduler] 19:00 当日レースの最終結果照合を実行します...")
                     loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, run_batch_worker, today_str)
+                    await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "all", False, True))
                     last_19h_settle_date = today_str
 
             # --- 5. JST 0:00 (深夜0時) の一時キャッシュ削除 ---
