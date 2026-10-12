@@ -184,6 +184,7 @@ class VerificationResult(BaseModel):
     umaren_payout: Optional[int] = 0
     trio_payout: Optional[int] = 0
     mark_orders: Optional[List[dict]] = None
+    top3_orders: Optional[List[dict]] = None
 
 class DailySummary(BaseModel):
     target_date: str
@@ -1103,7 +1104,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                     "odds": target_odds,
                     "expected_payout": trio_exp_pay,
                     "is_real_odds": target_is_real,
-                    "memo": f"超高配当ボーナス{blinker_note} ({trio_odds_tag}{target_odds}倍 → 想定払戻{trio_exp_pay:,}円 / 相手{target_ux}番:{target_h['horse_name']})"
+                    "memo": f"三連複{blinker_note} ({trio_odds_tag}{target_odds}倍 → 想定払戻{trio_exp_pay:,}円 / 相手{target_ux}番:{target_h['horse_name']})"
                 }
 
             total_amt = 400 + (100 if trio_target else 0)
@@ -1208,12 +1209,50 @@ def predict_race(race_id: str, force_refresh: bool = Query(False, description="�
         raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
 
 
+def extract_top3_orders(pred_data: Optional[dict], orders: Optional[dict]) -> List[dict]:
+    """【確定】 1着・2着・3着の確定馬番・馬名・印情報を抽出 (キーがstr/int両対応)"""
+    if not orders:
+        return []
+    orders_int = {}
+    for k, v in orders.items():
+        try:
+            orders_int[int(k)] = int(v)
+        except (ValueError, TypeError):
+            pass
+
+    horses = pred_data.get("horses", []) if pred_data else []
+    horse_by_num = {int(h["umaban"]): h for h in horses if "umaban" in h and str(h["umaban"]).isdigit()}
+
+    top3 = []
+    for rank in [1, 2, 3]:
+        for u, o in orders_int.items():
+            if o == rank:
+                h = horse_by_num.get(u, {})
+                mark = h.get("mark", "-")
+                if mark in ("〇", "○"):
+                    mark = "◯"
+                top3.append({
+                    "order": rank,
+                    "order_text": f"{rank}着",
+                    "umaban": u,
+                    "horse_name": h.get("horse_name", f"馬{u}"),
+                    "mark": mark
+                })
+    top3.sort(key=lambda x: x["order"])
+    return top3[:3]
+
+
 def extract_mark_orders(pred_data: Optional[dict], orders: Optional[dict]) -> List[dict]:
-    """◎, ◯(または〇), ▲ の各馬の確定着順情報を抽出"""
+    """◎, ◯, ▲ の各馬の確定着順情報を抽出 (キーがstr/int両対応)"""
     if not pred_data:
         return []
     horses = pred_data.get("horses", [])
-    orders_map = orders or {}
+    orders_int = {}
+    for k, v in (orders or {}).items():
+        try:
+            orders_int[int(k)] = int(v)
+        except (ValueError, TypeError):
+            pass
 
     target_marks = ["◎", "◯", "▲"]
     found = []
@@ -1223,11 +1262,11 @@ def extract_mark_orders(pred_data: Optional[dict], orders: Optional[dict]) -> Li
         if h:
             u = int(h["umaban"])
             name = h.get("horse_name", f"馬{u}")
-            ord_num = orders_map.get(u)
+            ord_num = orders_int.get(u)
             if ord_num is not None and isinstance(ord_num, int) and 1 <= ord_num < 90:
                 ord_text = f"{ord_num}着"
             else:
-                ord_text = "着外" if orders_map else "未確定"
+                ord_text = "着外" if orders_int else "未確定"
             found.append({
                 "mark": mark,
                 "umaban": u,
@@ -1300,6 +1339,7 @@ def calculate_hybrid_pass_benefit_info(
 
     orders = race_res.get("orders", {}) if race_res else {}
     mark_orders = extract_mark_orders(pred_data, orders)
+    top3_orders = extract_top3_orders(pred_data, orders)
     marks_summary = format_mark_orders_text(mark_orders)
 
     reason_str = h_rec.get("reason", "期待値基準外") if h_rec else "見送り推奨"
@@ -1315,6 +1355,7 @@ def calculate_hybrid_pass_benefit_info(
         "pass_benefit": pass_benefit,
         "actual_order": actual_order,
         "mark_orders": mark_orders,
+        "top3_orders": top3_orders,
         "message": msg
     }
 
@@ -1343,6 +1384,8 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
 
             res_cache = get_cached_result(race_id) or {}
             pred_cache = get_cached_prediction(race_id)
+            orders = res_cache.get("orders", {})
+            top3_orders = d.get("top3_orders") or extract_top3_orders(pred_cache, orders)
 
             if d["is_pass"]:
                 h_rec = pred_cache.get("hybrid_recommendation") if pred_cache else None
@@ -1352,8 +1395,9 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 pass_benefit = pass_info["pass_benefit"]
                 msg = pass_info["message"]
                 mark_orders = pass_info.get("mark_orders")
+                top3_orders = pass_info.get("top3_orders") or top3_orders
             elif d["is_hit"]:
-                mark_orders = d.get("mark_orders") or extract_mark_orders(pred_cache, res_cache.get("orders", {}))
+                mark_orders = d.get("mark_orders") or extract_mark_orders(pred_cache, orders)
                 marks_summary = format_mark_orders_text(mark_orders)
                 marks_line = f"\n{marks_summary}" if marks_summary else ""
 
@@ -1370,7 +1414,7 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 else:
                     msg = f"【{hit_label}】 払戻: {d['total_payout']:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery}%){marks_line}"
             else:
-                mark_orders = d.get("mark_orders") or extract_mark_orders(pred_cache, res_cache.get("orders", {}))
+                mark_orders = d.get("mark_orders") or extract_mark_orders(pred_cache, orders)
                 marks_summary = format_mark_orders_text(mark_orders)
                 marks_line = f"\n{marks_summary}" if marks_summary else ""
                 order_info = f" (◎{d.get('target_umaban')}番: {order}着)" if (order and order < 90) else ""
@@ -1420,7 +1464,8 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 "trio_bet": t_bet,
                 "umaren_payout": u_pay,
                 "trio_payout": t_pay,
-                "mark_orders": mark_orders
+                "mark_orders": mark_orders,
+                "top3_orders": top3_orders
             }
     except Exception as e:
         print(f"Supabase収支取得エラー ({race_id}): {e}")
@@ -1727,6 +1772,7 @@ def process_settlement_calculation(
         hypo_pay = pass_info["hypothetical_payout"]
         pass_benefit = pass_info["pass_benefit"]
         mark_orders = pass_info.get("mark_orders", [])
+        top3_orders = pass_info.get("top3_orders", [])
         msg = pass_info["message"]
 
         settlement = {
@@ -1758,7 +1804,8 @@ def process_settlement_calculation(
             "fukusho_bet": 0,
             "tansho_payout": 0,
             "fukusho_payout": 0,
-            "mark_orders": mark_orders
+            "mark_orders": mark_orders,
+            "top3_orders": top3_orders
         }
         save_settlement(settlement)
         if supabase:
@@ -1795,7 +1842,8 @@ def process_settlement_calculation(
             "trio_bet": 0,
             "umaren_payout": 0,
             "trio_payout": 0,
-            "mark_orders": mark_orders
+            "mark_orders": mark_orders,
+            "top3_orders": top3_orders
         }
 
     # 参戦レースの場合
@@ -1858,6 +1906,7 @@ def process_settlement_calculation(
 
     orders = race_res.get("orders", {})
     mark_orders = extract_mark_orders(pred_data, orders)
+    top3_orders = extract_top3_orders(pred_data, orders)
     marks_summary = format_mark_orders_text(mark_orders)
     marks_line = f"\n{marks_summary}" if marks_summary else ""
 
@@ -1907,7 +1956,8 @@ def process_settlement_calculation(
         "fukusho_bet": 0,
         "tansho_payout": 0,
         "fukusho_payout": 0,
-        "mark_orders": mark_orders
+        "mark_orders": mark_orders,
+        "top3_orders": top3_orders
     }
     save_settlement(settlement)
     if supabase:
@@ -1944,7 +1994,8 @@ def process_settlement_calculation(
         "trio_bet": t_bet_tot,
         "umaren_payout": umaren_payout,
         "trio_payout": trio_payout,
-        "mark_orders": mark_orders
+        "mark_orders": mark_orders,
+        "top3_orders": top3_orders
     }
 
 
@@ -2064,16 +2115,19 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             r["hypothetical_payout"] = pass_info["hypothetical_payout"]
             r["pass_benefit"] = pb
             r["mark_orders"] = pass_info.get("mark_orders")
+            r["top3_orders"] = pass_info.get("top3_orders")
             pass_benefit_total += pb
             if pb > 0:
                 pass_avoided_losses += pb
             elif pb < 0:
                 pass_missed_profits += abs(pb)
         else:
+            p_data = pred_cache_map.get(r["race_id"], {})
+            c_res = res_cache_map.get(r["race_id"], {})
             if not r.get("mark_orders"):
-                p_data = pred_cache_map.get(r["race_id"], {})
-                c_res = res_cache_map.get(r["race_id"], {})
                 r["mark_orders"] = extract_mark_orders(p_data, c_res.get("orders", {}))
+            if not r.get("top3_orders"):
+                r["top3_orders"] = extract_top3_orders(p_data, c_res.get("orders", {}))
 
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r["is_pass"] == 0)
