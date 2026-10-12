@@ -336,6 +336,9 @@ batch_status = {
 }
 
 @app.get("/")
+@app.get("/health")
+@app.head("/")
+@app.head("/health")
 def health_check():
     return {
         "status": "ok",
