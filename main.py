@@ -148,6 +148,11 @@ class HybridRecommendation(BaseModel):
     total_expected_payout: Optional[int] = None
     prob_gachi: Optional[float] = None
     prob_himo: Optional[float] = None
+    edge_ratio: Optional[float] = None
+    is_real_bet_target: Optional[bool] = False
+    real_bet_badge: Optional[str] = None
+    real_bet_level: Optional[str] = None
+    is_final_odds: Optional[bool] = False
 
 class TanFukuRecommendation(BaseModel):
     target_umaban: Optional[int]
@@ -251,6 +256,13 @@ class DailySummary(BaseModel):
     trio_payout_total: Optional[int] = 0
     umaren_recovery_rate: Optional[float] = 0.0
     trio_recovery_rate: Optional[float] = 0.0
+    real_bet_races: Optional[int] = 0
+    real_bet_hits: Optional[int] = 0
+    real_bet_hit_rate: Optional[float] = 0.0
+    real_bet_amount: Optional[int] = 0
+    real_bet_payout: Optional[int] = 0
+    real_bet_profit: Optional[int] = 0
+    real_bet_recovery_rate: Optional[float] = 0.0
 
 class BatchStartResponse(BaseModel):
     status: str
@@ -497,6 +509,37 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
                 venues = parse_netkeiba_race_list_html(text)
                 if venues:
                     formatted_date = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
+                    cached_preds_map = {}
+                    if supabase:
+                        try:
+                            p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
+                            if p_res.data:
+                                for row in p_res.data:
+                                    h_rec = row.get("data_json", {}).get("hybrid_recommendation")
+                                    if h_rec:
+                                        cached_preds_map[row["race_id"]] = {
+                                            "is_real_bet_target": h_rec.get("is_real_bet_target", False),
+                                            "real_bet_badge": h_rec.get("real_bet_badge"),
+                                            "edge_ratio": h_rec.get("edge_ratio"),
+                                            "is_final_odds": h_rec.get("is_final_odds", False)
+                                        }
+                        except Exception as e:
+                            print(f"レース一覧キャッシュ付与エラー: {e}")
+
+                    for venue in venues:
+                        for race in venue.get("races", []):
+                            info = cached_preds_map.get(race["race_id"])
+                            if info:
+                                race["is_real_bet_target"] = info["is_real_bet_target"]
+                                race["real_bet_badge"] = info["real_bet_badge"]
+                                race["edge_ratio"] = info["edge_ratio"]
+                                race["is_final_odds"] = info["is_final_odds"]
+                            else:
+                                race["is_real_bet_target"] = False
+                                race["real_bet_badge"] = None
+                                race["edge_ratio"] = None
+                                race["is_final_odds"] = False
+
                     return {"date": formatted_date, "venues": venues}
             except Exception:
                 continue
@@ -1242,6 +1285,43 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 "prob_gachi": prob_gachi,
                 "prob_himo": prob_himo
             }
+
+        # エッジ（期待値）および実戦推奨バッジの計算 (暫定 / 確定)
+        is_final_odds = False
+        post_time_str = race_details.get("post_time", "") if race_details else ""
+        m_time = re.search(r"(\d{1,2}):(\d{2})", post_time_str)
+        if m_time:
+            try:
+                hh, mm = int(m_time.group(1)), int(m_time.group(2))
+                now_dt = now_jst_naive()
+                post_dt = datetime.datetime(now_dt.year, now_dt.month, now_dt.day, hh, mm)
+                if now_dt >= post_dt - datetime.timedelta(minutes=35):
+                    is_final_odds = True
+            except Exception:
+                pass
+
+        honmei_score = float(honmei_horse.get("prob_win", honmei_horse.get("score", 0.0))) if honmei_horse else 0.0
+        honmei_odds = float(honmei_horse.get("odds") or 0.0) if honmei_horse else 0.0
+        edge_ratio = round(honmei_score * honmei_odds, 2) if honmei_odds > 0 else 0.0
+
+        is_part = hybrid_rec.get("is_participate", False)
+        is_real_bet_target = bool(is_part and edge_ratio >= 1.05)
+        real_bet_badge = None
+        real_bet_level = "none"
+        if is_real_bet_target:
+            suffix = " (確定)" if is_final_odds else " (暫定)"
+            if edge_ratio >= 1.30:
+                real_bet_badge = f"🚀 超勝負R{suffix}"
+                real_bet_level = "high"
+            else:
+                real_bet_badge = f"🔥 実戦推奨{suffix}"
+                real_bet_level = "standard"
+
+        hybrid_rec["edge_ratio"] = edge_ratio
+        hybrid_rec["is_real_bet_target"] = is_real_bet_target
+        hybrid_rec["real_bet_badge"] = real_bet_badge
+        hybrid_rec["real_bet_level"] = real_bet_level
+        hybrid_rec["is_final_odds"] = is_final_odds
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
 
@@ -2312,9 +2392,17 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     pass_missed_profits = 0
 
     for r in rows:
+        p_data = pred_cache_map.get(r["race_id"], {})
+        h_rec = p_data.get("hybrid_recommendation") or {}
+
+        # 実戦推奨情報を settled_races の各要素にも付与
+        r["is_real_bet_target"] = h_rec.get("is_real_bet_target", False)
+        r["real_bet_badge"] = h_rec.get("real_bet_badge")
+        r["real_bet_level"] = h_rec.get("real_bet_level", "none")
+        r["edge_ratio"] = h_rec.get("edge_ratio")
+        r["is_final_odds"] = h_rec.get("is_final_odds", False)
+
         if r.get("is_pass") == 1:
-            p_data = pred_cache_map.get(r["race_id"], {})
-            h_rec = p_data.get("hybrid_recommendation")
             c_res = res_cache_map.get(r["race_id"], {})
             pass_info = calculate_hybrid_pass_benefit_info(h_rec, c_res, r.get("target_umaban"), r.get("actual_order"), pred_data=p_data)
             pb = pass_info["pass_benefit"]
@@ -2329,7 +2417,6 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             elif pb < 0:
                 pass_missed_profits += abs(pb)
         else:
-            p_data = pred_cache_map.get(r["race_id"], {})
             c_res = res_cache_map.get(r["race_id"], {})
             if not r.get("mark_orders"):
                 r["mark_orders"] = extract_mark_orders(p_data, c_res.get("orders", {}))
@@ -2347,6 +2434,16 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     hit_rate = round((hit_races / bet_races) * 100.0, 2) if bet_races > 0 else 0.0
+
+    # 実戦推奨レースのみの収支集計
+    real_bet_rows = [r for r in rows if r.get("is_real_bet_target") and r.get("is_pass") == 0]
+    real_bet_races = len(real_bet_rows)
+    real_bet_hits = sum(1 for r in real_bet_rows if r.get("is_hit") == 1)
+    real_bet_hit_rate = round((real_bet_hits / real_bet_races) * 100.0, 2) if real_bet_races > 0 else 0.0
+    real_bet_amount = sum(r.get("total_bet", 0) for r in real_bet_rows)
+    real_bet_payout = sum(r.get("total_payout", 0) for r in real_bet_rows)
+    real_bet_profit = real_bet_payout - real_bet_amount
+    real_bet_recovery_rate = round((real_bet_payout / real_bet_amount) * 100.0, 2) if real_bet_amount > 0 else 0.0
 
     # 汎用券種別内訳集計 (動的)
     ticket_stats = {}
@@ -2423,7 +2520,14 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "umaren_payout_total": umaren_payout_total,
         "trio_payout_total": trio_payout_total,
         "umaren_recovery_rate": umaren_rec,
-        "trio_recovery_rate": trio_rec
+        "trio_recovery_rate": trio_rec,
+        "real_bet_races": real_bet_races,
+        "real_bet_hits": real_bet_hits,
+        "real_bet_hit_rate": real_bet_hit_rate,
+        "real_bet_amount": real_bet_amount,
+        "real_bet_payout": real_bet_payout,
+        "real_bet_profit": real_bet_profit,
+        "real_bet_recovery_rate": real_bet_recovery_rate
     }
 
 
@@ -2472,14 +2576,28 @@ def run_batch_worker(
             # 1. AI予想の実行 (未キャッシュまたはforce_predictの場合)
             if mode in ("all", "predict"):
                 try:
+                    p_res = None
                     if force_predict:
-                        predict_race(r_id, force_refresh=True)
+                        p_res = predict_race(r_id, force_refresh=True)
                         batch_status["predicted"] += 1
                     else:
                         cached_p = get_cached_prediction(r_id)
                         if not cached_p:
-                            predict_race(r_id)
+                            p_res = predict_race(r_id)
                             batch_status["predicted"] += 1
+                        else:
+                            p_res = cached_p
+
+                    # 朝の一括予想時は is_predicted を 1 (暫定予想完了) にマーク (すでに本確定2の場合は上書きしない)
+                    if supabase and p_res:
+                        try:
+                            supabase.table("keiba_scheduled_races")\
+                                .update({"is_predicted": 1})\
+                                .eq("race_id", r_id)\
+                                .neq("is_predicted", 2)\
+                                .execute()
+                        except Exception:
+                            pass
                 except Exception as pe:
                     print(f"[Batch] 予想スキップ/エラー ({r_id}): {pe}")
 
@@ -2594,6 +2712,7 @@ async def background_maintenance_loop():
     print("[Scheduler] リアルタイム・メンテナンススケジューラー (JST同期) を開始しました。")
     last_cleaned_date = None
     last_19h_settle_date = None
+    last_9h_predict_date = None
 
     while True:
         try:
@@ -2605,13 +2724,21 @@ async def background_maintenance_loop():
             if now_dt.hour >= 8:
                 await sync_daily_schedules_if_needed(today_str)
 
+            # --- 1.5 JST朝 9:00 以降、当日の全レース事前予想（朝オッズによる暫定判定）を一括実行 ---
+            if now_dt.hour >= 9 and last_9h_predict_date != today_str:
+                if not batch_status["is_running"]:
+                    print(f"[Scheduler] 朝9:00 当日全レースの一括事前予想（暫定判定）を実行します...")
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "predict", False, False))
+                    last_9h_predict_date = today_str
+
             if supabase:
-                # --- 2. 各レース【発走30分前】の自動予想実行 ---
+                # --- 2. 各レース【発走30分前】の直前再予想実行（直前オッズで本確定へ昇格） ---
                 try:
                     res_pred = supabase.table("keiba_scheduled_races")\
                         .select("*")\
                         .eq("race_date", today_str)\
-                        .eq("is_predicted", 0)\
+                        .lt("is_predicted", 2)\
                         .execute()
                     unpredicted_races = res_pred.data or []
 
@@ -2625,14 +2752,14 @@ async def background_maintenance_loop():
 
                         trigger_predict_time = post_dt - datetime.timedelta(minutes=30)
                         if now_dt >= trigger_predict_time:
-                            print(f"[Auto-Predict] 発走30分前検知: {r_id} ({r.get('race_name')}) の予想を実行します...")
+                            print(f"[Auto-Predict] 発走30分前検知: {r_id} ({r.get('race_name')}) の確定予想を実行します...")
                             try:
                                 predict_race(r_id, force_refresh=True)
                                 supabase.table("keiba_scheduled_races")\
-                                    .update({"is_predicted": 1})\
+                                    .update({"is_predicted": 2})\
                                     .eq("race_id", r_id)\
                                     .execute()
-                                print(f"[Auto-Predict] 予想完了: {r_id}")
+                                print(f"[Auto-Predict] 確定予想完了: {r_id}")
                             except Exception as pe:
                                 print(f"[Auto-Predict] 予想実行失敗 ({r_id}): {pe}")
                 except Exception as e:
@@ -2697,6 +2824,8 @@ async def background_maintenance_loop():
                     except Exception as ce:
                         print(f"[Cleanup] 失敗: {ce}")
                 last_cleaned_date = today_str
+                last_9h_predict_date = None
+                last_19h_settle_date = None
 
         except Exception as e:
             print(f"[Scheduler] 全体ループエラー: {e}")
