@@ -337,7 +337,34 @@ batch_status = {
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Keiba Prediction & Verification API is running", "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")}
+    return {
+        "status": "ok",
+        "message": "Keiba Prediction & Verification API is running",
+        "firebase_configured": bool(firebase_app is not None),
+        "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+@app.get("/notify/test")
+@app.post("/notify/test")
+def trigger_test_notification():
+    """テスト用のプッシュ通知をFirebaseトピック (keiba_real_bet) へ送信"""
+    if not firebase_app:
+        return {
+            "status": "error",
+            "message": "Firebaseが未初期化です。Renderの環境変数 FIREBASE_SERVICE_ACCOUNT_KEY に秘密鍵JSONを設定してください。"
+        }
+    success = send_fcm_notification(
+        title="🔔【テスト通知】実戦推奨レース速報",
+        body="これはFirebaseプッシュ通知の疎通テストです。正常に受信できています！",
+        data={
+            "type": "TEST",
+            "message": "FCM test notification successful"
+        }
+    )
+    if success:
+        return {"status": "ok", "message": "テスト通知をトピック (keiba_real_bet) へ送信しました。スマホをご確認ください！"}
+    else:
+        return {"status": "error", "message": "FCM送信に失敗しました。サーバーログをご確認ください。"}
 
 
 def fetch_real_odds(race_id: str) -> dict:
