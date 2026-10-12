@@ -2010,8 +2010,8 @@ def verify_race_result(
 
     if not bypass_cache:
         cached_settlement = get_cached_settlement(race_id)
-        # 過去に実数値なし(None)で誤保存されたレコードは再検証させる
-        if cached_settlement and cached_settlement.get("actual_order") is not None:
+        # 照合済みキャッシュが存在し、確定着順が判明しているか、または見送り確定レースの場合は即座に返却
+        if cached_settlement and (cached_settlement.get("actual_order") is not None or cached_settlement.get("is_pass")):
             return cached_settlement
 
     race_date = None
