@@ -1131,12 +1131,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 "strategy_name": "ガチガチ本命戦 (馬連1点厚張り)",
                 "strategy_type": "gachi",
                 "total_amount": 800,
-                "summary": f"参戦推奨: 馬連1点厚張り(800円) [{u0}-{u1}] 想定払戻{exp_pay_01:,}円 (堅実度{prob_gachi*100:.1f}%)",
+                "summary": f"参戦推奨: 馬連1点厚張り(800円) [{u0}-{u1}] 想定払戻{exp_pay_01:,}円 (ガチ度{prob_gachi*100:.1f}%)",
                 "umaren_bets": umaren_bets,
                 "sanrentan_bets": [],
                 "hypothetical_umaren_bets": umaren_bets,
                 "trio_bet": None,
-                "reason": f"ガチガチ判定クリア (堅実度{prob_gachi*100:.1f}% / 1番人気{o1}倍)",
+                "reason": f"ガチガチ判定クリア（1番人気{o1}倍・ガチ度基準合致 / 本命1点厚張り）",
                 "is_real_odds_applied": u01_is_real,
                 "total_expected_payout": exp_pay_01,
                 "prob_gachi": prob_gachi,
@@ -1165,12 +1165,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 "strategy_name": "中波乱・混戦 (3連単18点フォーメーション)",
                 "strategy_type": "himo",
                 "total_amount": total_amt,
-                "summary": f"参戦推奨: 3連単フォーメーション18点(1,800円) [1着:{u0},{u1} / 2着:4頭 / 3着:5頭] (中波乱度{prob_himo*100:.1f}%)",
+                "summary": f"参戦推奨: 3連単フォーメーション18点(1,800円) [1着:{u0},{u1} / 2着:4頭 / 3着:5頭] (混戦度{prob_himo*100:.1f}%)",
                 "umaren_bets": [],
                 "sanrentan_bets": sanrentan_bets,
                 "hypothetical_umaren_bets": hypothetical_umaren_bets,
                 "trio_bet": None,
-                "reason": f"中波乱・ヒモ荒れ判定クリア (中波乱度{prob_himo*100:.1f}% / 堅実度{prob_gachi*100:.1f}%)",
+                "reason": f"中波乱・混戦判定クリア（ヒモ荒れ期待値高 / 3連単フォーメーション）",
                 "is_real_odds_applied": False,
                 "total_expected_payout": 0,
                 "prob_gachi": prob_gachi,
@@ -1184,7 +1184,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             elif len(horses) < 5:
                 reason_detail.append("少頭数レース除外")
             else:
-                reason_detail.append(f"波乱度メタ判定 (堅実度:{prob_gachi*100:.1f}%, 中波乱度:{prob_himo*100:.1f}%, 1番人気:{o1}倍)")
+                reason_detail.append(f"波乱度基準外のため資金保全（1番人気:{o1}倍）")
             reason_str = " / ".join(reason_detail)
             hybrid_rec = {
                 "is_participate": False,
