@@ -2240,24 +2240,27 @@ def run_batch_worker(
     try:
         today_str = target_date if target_date else today_jst_str()
         today_clean = today_str.replace("-", "")
+        now_dt = now_jst()
 
         today_info = get_today_races(today_clean)
         venues = today_info.get("venues", [])
 
-        all_race_ids = []
+        all_races = []
         for v in venues:
             for r in v.get("races", []):
-                all_race_ids.append(r["race_id"])
+                all_races.append(r)
 
-        batch_status["total"] = len(all_race_ids)
+        batch_status["total"] = len(all_races)
 
-        if not all_race_ids:
+        if not all_races:
             batch_status["message"] = f"{today_str}: 開催レースが見つかりませんでした。"
             return
 
-        for idx, r_id in enumerate(all_race_ids, 1):
+        for idx, race_item in enumerate(all_races, 1):
+            r_id = race_item["race_id"]
+            r_info = race_item.get("race_info", "")
             batch_status["current"] = idx
-            batch_status["message"] = f"処理中 ({idx}/{len(all_race_ids)}R: 予想{batch_status['predicted']}件 / 確定{batch_status['settled']}件)"
+            batch_status["message"] = f"処理中 ({idx}/{len(all_races)}R: 予想{batch_status['predicted']}件 / 確定{batch_status['settled']}件)"
 
             # 1. AI予想の実行 (未キャッシュまたはforce_predictの場合)
             if mode in ("all", "predict"):
@@ -2275,15 +2278,28 @@ def run_batch_worker(
 
             # 2. 確定済みなら結果検証して収支台帳へ記録
             if mode in ("all", "settle"):
-                try:
-                    settled = get_cached_settlement(r_id)
-                    if not settled or settled.get("actual_order") is None:
-                        verify_race_result(r_id, is_19h_settle=is_19h_settle)
-                        batch_status["settled"] += 1
-                except Exception:
-                    pass
+                # 発走前の未来レースは結果照合をスキップ（無駄なnetkeibaスクレイピングとタイムアウトを完全防止）
+                is_past_post = True
+                m = re.search(r"(\d{1,2}):(\d{2})", r_info)
+                if m and not is_19h_settle:
+                    try:
+                        p_hour, p_minute = int(m.group(1)), int(m.group(2))
+                        p_dt = now_dt.replace(hour=p_hour, minute=p_minute, second=0, microsecond=0)
+                        if now_dt < p_dt:
+                            is_past_post = False
+                    except Exception:
+                        pass
 
-        batch_status["message"] = f"完了: 全{len(all_race_ids)}R (予想{batch_status['predicted']}件 / 確定検証{batch_status['settled']}件)"
+                if is_past_post:
+                    try:
+                        settled = get_cached_settlement(r_id)
+                        if not settled or (settled.get("actual_order") is None and not settled.get("is_pass")):
+                            verify_race_result(r_id, is_19h_settle=is_19h_settle)
+                            batch_status["settled"] += 1
+                    except Exception:
+                        pass
+
+        batch_status["message"] = f"完了: 全{len(all_races)}R (予想{batch_status['predicted']}件 / 確定検証{batch_status['settled']}件)"
 
     except Exception as e:
         batch_status["message"] = f"エラー終了: {e}"
