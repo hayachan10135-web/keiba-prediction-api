@@ -231,6 +231,32 @@ def health_check():
     return {"status": "ok", "message": "Keiba Prediction & Verification API is running", "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")}
 
 
+@app.get("/debug/check_odds/{race_id}")
+def debug_check_odds(race_id: str):
+    results = {}
+    for t in [1, 2, 3, 4, 5, 6, 7, "b4", "b7"]:
+        try:
+            u = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type={t}&action=init&output=json"
+            r = requests.get(u, headers=HEADERS_PC, timeout=5)
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, str):
+                    d = json.loads(d)
+                db = d.get("data", {})
+                if isinstance(db, str):
+                    db = json.loads(db)
+                odds_dict = db.get("odds", {}) if isinstance(db, dict) else {}
+                sample = {}
+                for k, v in list(odds_dict.items())[:3]:
+                    sample[k] = list(v.items())[:3] if isinstance(v, dict) else str(v)[:100]
+                results[str(t)] = {"status": r.status_code, "odds_keys": list(odds_dict.keys()), "sample": sample}
+            else:
+                results[str(t)] = {"status": r.status_code}
+        except Exception as e:
+            results[str(t)] = {"error": str(e)}
+    return results
+
+
 # --- スケジュール登録ヘルパー ---
 def register_race_schedule(race_id: str, race_date: str, race_name: str, post_time_str: str):
     if not supabase:
