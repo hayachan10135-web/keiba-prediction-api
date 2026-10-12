@@ -2195,25 +2195,48 @@ def verify_race_result(
 @app.get("/summary/dates", response_model=List[str])
 @app.get("/daily-summary/dates", response_model=List[str])
 def get_summary_dates():
-    """過去の集計可能日付一覧を取得 (降順)"""
+    """過去の予想・集計可能日付一覧を取得 (降順)"""
+    today_str = today_jst_str()
     if not supabase:
-        return [today_jst_str()]
+        return [today_str]
     try:
-        res = supabase.table("keiba_race_settlements").select("race_date").order("race_date", desc=True).execute()
-        dates = []
-        seen = set()
-        for row in (res.data or []):
-            d = row.get("race_date")
-            if d and d not in seen:
-                seen.add(d)
-                dates.append(d)
-        today_str = today_jst_str()
-        if today_str not in seen:
-            dates.insert(0, today_str)
-        return dates if dates else [today_str]
+        dates_set = set()
+        # 1. 確定・集計済みレコードがある日付
+        try:
+            res_settle = supabase.table("keiba_race_settlements").select("race_date").execute()
+            for row in (res_settle.data or []):
+                d = row.get("race_date")
+                if d and len(d) == 10 and d.startswith("20"):
+                    dates_set.add(d)
+        except Exception as e:
+            print(f"settlements dates error: {e}")
+
+        # 2. 予想キャッシュが存在する日付（未確定・進行中含む）
+        try:
+            res_pred = supabase.table("keiba_predictions_cache").select("race_date").execute()
+            for row in (res_pred.data or []):
+                d = row.get("race_date")
+                if d and len(d) == 10 and d.startswith("20"):
+                    dates_set.add(d)
+        except Exception as e:
+            print(f"predictions dates error: {e}")
+
+        # 3. レース開催日として登録された日付
+        try:
+            res_sched = supabase.table("keiba_scheduled_races").select("race_date").execute()
+            for row in (res_sched.data or []):
+                d = row.get("race_date")
+                if d and len(d) == 10 and d.startswith("20"):
+                    dates_set.add(d)
+        except Exception as e:
+            print(f"scheduled dates error: {e}")
+
+        dates_set.add(today_str)
+        sorted_dates = sorted(list(dates_set), reverse=True)
+        return sorted_dates if sorted_dates else [today_str]
     except Exception as e:
         print(f"日付一覧取得エラー: {e}")
-        return [today_jst_str()]
+        return [today_str]
 
 
 @app.get("/summary/today", response_model=DailySummary)
