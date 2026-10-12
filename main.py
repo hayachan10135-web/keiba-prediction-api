@@ -788,17 +788,33 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             is_tataki_2nd_val
         ]
 
+        # 末脚・上がり3F ＆ 展開・脚質特徴量 (4種)
+        prev1_last_3f_val = float(stat.get("last_3f", 36.0)) if stat and stat.get("last_3f") is not None else 36.0
+        prev1_corner_final_val = float(stat.get("last_corner_final", 8.0)) if stat and stat.get("last_corner_final") is not None else 8.0
+        prev1_is_front_val = 1.0 if prev1_corner_final_val <= 3.0 else 0.0
+        prev1_is_closer_val = 1.0 if prev1_corner_final_val >= 8.0 else 0.0
+
+        agari_feats = [
+            prev1_last_3f_val,
+            prev1_corner_final_val,
+            prev1_is_front_val,
+            prev1_is_closer_val
+        ]
+
         row25 = fd["base_feats"] + [float(j_ranks[idx]), float(t_ranks[idx]), float(p1_ranks[idx])]
         row32 = row25 + new_feats
+        row36 = row32 + agari_feats
 
-        if expected_num_features == 32:
+        if expected_num_features == 36:
+            feature_rows.append(row36)
+        elif expected_num_features == 32:
             feature_rows.append(row32)
         elif expected_num_features == 25:
             feature_rows.append(row25)
         elif expected_num_features == 19:
             feature_rows.append(row25[:19])
         else:
-            feature_rows.append(row32[:expected_num_features])
+            feature_rows.append(row36[:expected_num_features])
 
     if model:
         try:
