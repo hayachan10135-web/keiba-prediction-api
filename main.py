@@ -2777,7 +2777,7 @@ def fix_mislabeled_20261011_races():
 
 
 # --- DB構成・スキーマバージョン管理 ---
-CURRENT_DB_VERSION = "v4_flexible_multi_tickets"
+CURRENT_DB_VERSION = "v5_umaren_3point_strategy"
 
 def clear_all_database():
     """Supabaseの全テーブル（メタ、キャッシュ、台帳、スケジュール）を完全クリア・初期化"""
