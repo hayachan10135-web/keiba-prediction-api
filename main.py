@@ -58,6 +58,56 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("警告: SUPABASE_URL または SUPABASE_KEY が環境変数に設定されていません。")
 
+# --- Firebase Admin SDK 初期化 & プッシュ通知ヘルパー ---
+firebase_app = None
+FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", "firebase_service_account.json")
+FIREBASE_KEY_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", "")
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+
+    if FIREBASE_KEY_JSON:
+        try:
+            cred_dict = json.loads(FIREBASE_KEY_JSON)
+            cred = credentials.Certificate(cred_dict)
+            firebase_app = firebase_admin.initialize_app(cred)
+            print("[Firebase] 環境変数 FIREBASE_SERVICE_ACCOUNT_KEY から正常に初期化しました。")
+        except Exception as fe:
+            print(f"[Firebase] JSONパース失敗: {fe}")
+    elif os.path.exists(FIREBASE_KEY_PATH):
+        cred = credentials.Certificate(FIREBASE_KEY_PATH)
+        firebase_app = firebase_admin.initialize_app(cred)
+        print(f"[Firebase] ファイル {FIREBASE_KEY_PATH} から正常に初期化しました。")
+    else:
+        print("[Firebase] サービスアカウント情報未設定（設定完了後にプッシュ通知が有効化されます）。")
+except Exception as f_err:
+    print(f"[Firebase] 初期化待機: {f_err}")
+
+
+def send_fcm_notification(title: str, body: str, data: Optional[Dict[str, Any]] = None, topic: str = "keiba_real_bet") -> bool:
+    """Firebase Cloud Messaging で指定トピックへプッシュ通知を配信"""
+    if not firebase_app:
+        print(f"[FCM未設定・通知待機] {title} | {body} (Topic: {topic})")
+        return False
+    try:
+        from firebase_admin import messaging
+        str_data = {str(k): str(v) for k, v in (data or {}).items()}
+        msg = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body
+            ),
+            data=str_data,
+            topic=topic
+        )
+        resp = messaging.send(msg)
+        print(f"[FCM送信成功] {title} (ID: {resp})")
+        return True
+    except Exception as e:
+        print(f"[FCM送信失敗] {title}: {e}")
+        return False
+
 # --- LightGBM & 統計辞書のロード ---
 model = None
 if os.path.exists(MODEL_PATH):
@@ -2205,6 +2255,25 @@ def process_settlement_calculation(
         except Exception:
             pass
 
+    # 実戦推奨レースの結果確定プッシュ通知 (新規確定時のみ)
+    if not from_cache and hybrid_rec.get("is_real_bet_target"):
+        try:
+            if is_hit:
+                send_fcm_notification(
+                    title=f"🎯【実戦的中！】{race_name} 払戻: {total_payout:,}円",
+                    body=f"【{hit_type}】収支: {'+' if profit >= 0 else ''}{profit:,}円 (回収率: {recovery_rate}%)",
+                    data={"type": "SETTLEMENT_HIT", "race_id": race_id}
+                )
+            else:
+                o_str = f" (◎{target_u}番 {actual_order}着)" if actual_order else ""
+                send_fcm_notification(
+                    title=f"🏁【結果確定】{race_name} 不的中",
+                    body=f"投資: {total_bet:,}円 / 払戻: 0円{o_str} (収支: {profit:,}円)",
+                    data={"type": "SETTLEMENT_MISS", "race_id": race_id}
+                )
+        except Exception as ne:
+            print(f"[FCM通知エラー]: {ne}")
+
     return {
         "race_id": race_id,
         "race_name": race_name,
@@ -2732,6 +2801,32 @@ async def background_maintenance_loop():
                     await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "predict", False, False))
                     last_9h_predict_date = today_str
 
+                    # 朝の実戦推奨候補を走査してダイジェスト通知
+                    try:
+                        if supabase:
+                            p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", today_str).execute()
+                            real_races = []
+                            for row in (p_res.data or []):
+                                h_rec = row.get("data_json", {}).get("hybrid_recommendation") or {}
+                                if h_rec.get("is_real_bet_target"):
+                                    r_name = row.get("data_json", {}).get("race_name", row["race_id"])
+                                    b_txt = h_rec.get("real_bet_badge", "実戦推奨")
+                                    e_ratio = h_rec.get("edge_ratio", 0.0)
+                                    real_races.append(f"・{r_name} (エッジ{e_ratio}倍 {b_txt})")
+
+                            if real_races:
+                                summary_body = "\n".join(real_races[:5])
+                                if len(real_races) > 5:
+                                    summary_body += f"\n他{len(real_races)-5}レース"
+                                summary_body += "\n※各レース発走30分前に最新オッズで確定通知します。"
+                                send_fcm_notification(
+                                    title=f"🌅【本日実戦推奨候補】計{len(real_races)}レース該当！",
+                                    body=summary_body,
+                                    data={"type": "MORNING_SUMMARY", "race_date": today_str}
+                                )
+                    except Exception as fe:
+                        print(f"[Scheduler] 朝通知エラー: {fe}")
+
             if supabase:
                 # --- 2. 各レース【発走30分前】の直前再予想実行（直前オッズで本確定へ昇格） ---
                 try:
@@ -2754,12 +2849,37 @@ async def background_maintenance_loop():
                         if now_dt >= trigger_predict_time:
                             print(f"[Auto-Predict] 発走30分前検知: {r_id} ({r.get('race_name')}) の確定予想を実行します...")
                             try:
-                                predict_race(r_id, force_refresh=True)
+                                pred_res = predict_race(r_id, force_refresh=True)
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 2})\
                                     .eq("race_id", r_id)\
                                     .execute()
                                 print(f"[Auto-Predict] 確定予想完了: {r_id}")
+
+                                # 本確定の実戦推奨レースの場合、プッシュ通知を発火！
+                                h_rec = pred_res.get("hybrid_recommendation") or {}
+                                if h_rec.get("is_real_bet_target"):
+                                    badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
+                                    edge = h_rec.get("edge_ratio", 0.0)
+                                    target_u = pred_res.get("recommendation", {}).get("target_umaban")
+                                    h_name = pred_res.get("recommendation", {}).get("horse_name", "")
+                                    r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
+
+                                    u_bets = h_rec.get("umaren_bets", [])
+                                    bets_summary = ", ".join([f"{b.get('combination_str')}({b.get('amount')}円)" for b in u_bets[:3]])
+                                    tot_amt = h_rec.get("total_amount", 0)
+
+                                    body_text = f"◎{target_u}番 {h_name} (期待エッジ:{edge}倍)\n【推奨買い目】馬連: {bets_summary} 計{tot_amt:,}円"
+                                    send_fcm_notification(
+                                        title=f"{badge} {r_name}！",
+                                        body=body_text,
+                                        data={
+                                            "type": "REAL_BET_FINAL",
+                                            "race_id": r_id,
+                                            "edge_ratio": str(edge),
+                                            "badge": badge
+                                        }
+                                    )
                             except Exception as pe:
                                 print(f"[Auto-Predict] 予想実行失敗 ({r_id}): {pe}")
                 except Exception as e:
