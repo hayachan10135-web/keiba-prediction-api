@@ -5,6 +5,7 @@ import zoneinfo
 import re
 import json
 import asyncio
+import threading
 import requests
 import lightgbm as lgb
 from bs4 import BeautifulSoup
@@ -1871,7 +1872,7 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 # ★ 手動一括処理（アプリボタン用・確定検証と現時点の予想登録）
 # =========================================================================
 
-def run_batch_worker(target_date: Optional[str] = None):
+def run_batch_worker(target_date: Optional[str] = None, mode: str = "all", force_predict: bool = False):
     global batch_status
     batch_status["is_running"] = True
     batch_status["current"] = 0
@@ -1899,30 +1900,42 @@ def run_batch_worker(target_date: Optional[str] = None):
 
         for idx, r_id in enumerate(all_race_ids, 1):
             batch_status["current"] = idx
-            batch_status["message"] = f"処理中 ({idx}/{len(all_race_ids)}レース)"
+            batch_status["message"] = f"処理中 ({idx}/{len(all_race_ids)}R: 予想{batch_status['predicted']}件 / 確定{batch_status['settled']}件)"
 
-            # 確定済みなら結果検証して収支台帳へ記録
-            try:
-                settled = get_cached_settlement(r_id)
-                if not settled:
-                    verify_race_result(r_id)
-                    batch_status["settled"] += 1
-            except Exception:
-                pass
+            # 1. AI予想の実行 (未キャッシュまたはforce_predictの場合)
+            if mode in ("all", "predict"):
+                try:
+                    if force_predict:
+                        predict_race(r_id, force_refresh=True)
+                        batch_status["predicted"] += 1
+                    else:
+                        cached_p = get_cached_prediction(r_id)
+                        if not cached_p:
+                            predict_race(r_id)
+                            batch_status["predicted"] += 1
+                except Exception as pe:
+                    print(f"[Batch] 予想スキップ/エラー ({r_id}): {pe}")
 
-        batch_status["message"] = f"完了: 全{len(all_race_ids)}R中、確定検証{batch_status['settled']}件"
+            # 2. 確定済みなら結果検証して収支台帳へ記録
+            if mode in ("all", "settle"):
+                try:
+                    settled = get_cached_settlement(r_id)
+                    if not settled:
+                        verify_race_result(r_id)
+                        batch_status["settled"] += 1
+                except Exception:
+                    pass
+
+        batch_status["message"] = f"完了: 全{len(all_race_ids)}R (予想{batch_status['predicted']}件 / 確定検証{batch_status['settled']}件)"
 
     except Exception as e:
         batch_status["message"] = f"エラー終了: {e}"
+        print(f"[Batch] ワーカー全体エラー: {e}")
     finally:
         batch_status["is_running"] = False
 
 
-@app.post("/batch/today", response_model=BatchStartResponse)
-def run_today_batch(
-    background_tasks: BackgroundTasks,
-    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)")
-):
+def start_batch_thread(target_date: Optional[str] = None, mode: str = "all", force_predict: bool = False) -> BatchStartResponse:
     global batch_status
     if batch_status["is_running"]:
         return {
@@ -1930,12 +1943,35 @@ def run_today_batch(
             "message": f"現在処理中です ({batch_status['current']}/{batch_status['total']}レース進行中)"
         }
 
-    background_tasks.add_task(run_batch_worker, date)
+    # デーモンスレッドで完全に非同期切り離し実行（クライアントには即時200応答を返すためタイムアウトしない）
+    thread = threading.Thread(
+        target=run_batch_worker,
+        args=(target_date, mode, force_predict),
+        daemon=True
+    )
+    thread.start()
 
     return {
         "status": "started",
-        "message": "バックグラウンドで全レース一括照合を開始しました。"
+        "message": f"バックグラウンドで全レース一括処理を開始しました (モード: {mode})。"
     }
+
+
+@app.post("/batch/today", response_model=BatchStartResponse)
+def run_today_batch(
+    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)"),
+    mode: str = Query("all", description="処理モード: all (予想＆照合), predict (予想のみ), settle (照合のみ)"),
+    force: bool = Query(False, description="強制再予想フラグ")
+):
+    return start_batch_thread(date, mode=mode, force_predict=force)
+
+
+@app.post("/batch/predict", response_model=BatchStartResponse)
+def run_predict_batch(
+    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)"),
+    force: bool = Query(False, description="強制再予想フラグ")
+):
+    return start_batch_thread(date, mode="predict", force_predict=force)
 
 
 @app.get("/batch/status", response_model=BatchStatusResponse)
