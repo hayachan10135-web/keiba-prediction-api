@@ -179,16 +179,6 @@ class VerificationResult(BaseModel):
     umaren_payout: Optional[int] = 0
     trio_payout: Optional[int] = 0
 
-class ManualVerificationRequest(BaseModel):
-    target_order: Optional[int] = None       # ◎本命馬の着順 (1〜18等)
-    first_umaban: Optional[int] = None       # 1着馬番
-    second_umaban: Optional[int] = None      # 2着馬番
-    third_umaban: Optional[int] = None       # 3着馬番
-    umaren_payout: Optional[int] = None      # 馬連払戻金 (100円あたり, 任意)
-    trio_payout: Optional[int] = None        # 三連複払戻金 (100円あたり, 任意)
-    is_cancelled: Optional[bool] = False     # 取消・中止フラグ
-    note: Optional[str] = None               # メモ
-
 class DailySummary(BaseModel):
     target_date: str
     total_races: int
@@ -1515,10 +1505,7 @@ def process_settlement_calculation(
     race_name: str,
     pred_data: dict,
     race_res: dict,
-    from_cache: bool = False,
-    is_manual: bool = False,
-    is_cancelled: bool = False,
-    note: Optional[str] = None
+    from_cache: bool = False
 ) -> dict:
     rec = pred_data.get("recommendation", {})
     hybrid_rec = pred_data.get("hybrid_recommendation")
@@ -1529,64 +1516,6 @@ def process_settlement_calculation(
     orders = race_res.get("orders", {})
     actual_order = orders.get(target_u) if target_u else None
 
-    # 出走取消または競走中止
-    if is_cancelled:
-        msg = f"【出走取消/競走中止】全額返還・ノーカウント扱い (メモ: {note or '手動登録'})"
-        settlement = {
-            "race_id": race_id,
-            "race_date": race_date,
-            "race_name": race_name,
-            "strategy_type": "hybrid",
-            "target_umaban": target_u,
-            "horse_name": h_name,
-            "grade": grade,
-            "is_pass": True,
-            "umaren_bet": 0,
-            "trio_bet": 0,
-            "total_bet": 0,
-            "actual_order": None,
-            "umaren_payout": 0,
-            "trio_payout": 0,
-            "total_payout": 0,
-            "is_hit": False,
-            "hit_type": "取消/中止",
-            "hypothetical_bet": 0,
-            "hypothetical_payout": 0,
-            "pass_benefit": 0,
-            "bet_breakdown": {},
-            "payout_breakdown": {},
-            "bet_details": None,
-            "payout_details": None,
-            "tansho_bet": 0,
-            "fukusho_bet": 0,
-            "tansho_payout": 0,
-            "fukusho_payout": 0
-        }
-        save_settlement(settlement)
-        if supabase:
-            try:
-                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
-            except Exception:
-                pass
-        return {
-            "race_id": race_id,
-            "race_name": race_name,
-            "is_pass": True,
-            "grade": grade,
-            "target_umaban": target_u,
-            "horse_name": h_name,
-            "actual_order": None,
-            "is_hit": False,
-            "total_bet": 0,
-            "total_payout": 0,
-            "profit": 0,
-            "recovery_rate": 0.0,
-            "from_cache": from_cache,
-            "message": msg,
-            "strategy_type": "hybrid",
-            "hit_type": "取消/中止"
-        }
-
     # ハイブリッド推奨を最優先で照合（見送りレース）
     if not hybrid_rec or not hybrid_rec.get("is_participate", False):
         pass_info = calculate_hybrid_pass_benefit_info(hybrid_rec, race_res, target_u, actual_order)
@@ -1594,8 +1523,6 @@ def process_settlement_calculation(
         hypo_pay = pass_info["hypothetical_payout"]
         pass_benefit = pass_info["pass_benefit"]
         msg = pass_info["message"]
-        if is_manual:
-            msg = f"[手動登録] {msg}"
 
         settlement = {
             "race_id": race_id,
@@ -1723,13 +1650,12 @@ def process_settlement_calculation(
         hit_type = "不的中"
 
     all_hits = umaren_hits + trio_hits
-    manual_prefix = "[手動登録] " if is_manual else ""
     if is_hit:
         hit_texts = [f"{h['type']}{h['comb']}({h['payout']:,}円)" for h in all_hits]
-        msg = f"{manual_prefix}【{hit_type}】{' ＆ '.join(hit_texts)}！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery_rate}%)"
+        msg = f"【{hit_type}】{' ＆ '.join(hit_texts)}！ 払戻: {total_payout:,}円 (収支: {'+' if profit >= 0 else ''}{profit:,}円 / 回収率: {recovery_rate}%)"
     else:
         order_info = f" (◎{target_u}番: {actual_order}着)" if (actual_order and actual_order < 90) else ""
-        msg = f"{manual_prefix}不的中{order_info} (投資: {total_bet:,}円 / 払戻: 0円 / 収支: {profit:,}円 / 回収率: 0.0%)"
+        msg = f"不的中{order_info} (投資: {total_bet:,}円 / 払戻: 0円 / 収支: {profit:,}円 / 回収率: 0.0%)"
 
     bet_breakdown = {"馬連": u_bet_tot}
     payout_breakdown = {"馬連": umaren_payout}
@@ -1881,92 +1807,7 @@ def verify_race_result(
         race_name=race_name,
         pred_data=pred_data,
         race_res=race_res,
-        from_cache=from_cache,
-        is_manual=False
-    )
-
-
-@app.post("/result/{race_id}/manual", response_model=VerificationResult)
-def manual_verify_race_result(
-    race_id: str,
-    manual_data: ManualVerificationRequest
-):
-    if len(race_id) != 12 or not race_id.isdigit():
-        raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
-
-    pred_data = predict_race(race_id)
-    rec = pred_data.get("recommendation", {})
-    target_u = rec.get("target_umaban")
-    race_name = pred_data.get("race_name", f"Race {race_id}")
-
-    race_date = None
-    if supabase:
-        try:
-            s_res = supabase.table("keiba_scheduled_races").select("race_date").eq("race_id", race_id).execute()
-            if s_res.data and len(s_res.data) > 0:
-                race_date = s_res.data[0]["race_date"]
-        except Exception:
-            pass
-    if not race_date:
-        today_str = today_jst_str()
-        race_date = f"{race_id[:4]}-{today_str[5:7]}-{today_str[8:]}"
-
-    # 既存のキャッシュまたはネット競馬結果があればベースにする
-    race_res = get_cached_result(race_id) or fetch_netkeiba_race_result(race_id) or {
-        "race_name": race_name,
-        "orders": {},
-        "payouts": {
-            "tansho": {}, "fukusho": {}, "wakuren": {},
-            "umaren": {}, "wide": {}, "umatan": {}, "trio": {}, "tierce": {}
-        }
-    }
-
-    orders = race_res.setdefault("orders", {})
-    payouts = race_res.setdefault("payouts", {})
-
-    # 手動着順の反映
-    if manual_data.first_umaban is not None:
-        orders[manual_data.first_umaban] = 1
-    if manual_data.second_umaban is not None:
-        orders[manual_data.second_umaban] = 2
-    if manual_data.third_umaban is not None:
-        orders[manual_data.third_umaban] = 3
-
-    if target_u is not None:
-        if manual_data.target_order is not None:
-            orders[target_u] = manual_data.target_order
-        elif manual_data.first_umaban == target_u:
-            orders[target_u] = 1
-        elif manual_data.second_umaban == target_u:
-            orders[target_u] = 2
-        elif manual_data.third_umaban == target_u:
-            orders[target_u] = 3
-
-    # 手動払戻金の反映
-    if manual_data.first_umaban is not None and manual_data.second_umaban is not None:
-        u_key = f"{min(manual_data.first_umaban, manual_data.second_umaban)}-{max(manual_data.first_umaban, manual_data.second_umaban)}"
-        if manual_data.umaren_payout is not None:
-            payouts.setdefault("umaren", {})[u_key] = manual_data.umaren_payout
-
-    if manual_data.first_umaban is not None and manual_data.second_umaban is not None and manual_data.third_umaban is not None:
-        s_t = sorted([manual_data.first_umaban, manual_data.second_umaban, manual_data.third_umaban])
-        t_key = f"{s_t[0]}-{s_t[1]}-{s_t[2]}"
-        if manual_data.trio_payout is not None:
-            payouts.setdefault("trio", {})[t_key] = manual_data.trio_payout
-
-    # キャッシュを上書き保存
-    save_cached_result(race_id, race_name, race_date, race_res)
-
-    return process_settlement_calculation(
-        race_id=race_id,
-        race_date=race_date,
-        race_name=race_name,
-        pred_data=pred_data,
-        race_res=race_res,
-        from_cache=False,
-        is_manual=True,
-        is_cancelled=bool(manual_data.is_cancelled),
-        note=manual_data.note
+        from_cache=from_cache
     )
 
 
