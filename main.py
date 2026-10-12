@@ -1399,6 +1399,10 @@ def calculate_hybrid_pass_benefit_info(
                 {"combination": [u0, u1], "amount": 300},
                 {"combination": [u0, u2], "amount": 100}
             ]
+    if bets_to_check:
+        total_b = sum(ub.get("amount", 0) for ub in bets_to_check)
+        if total_b > 0:
+            hypo_bet = total_b
 
     hit_details = []
     for ub in bets_to_check:
