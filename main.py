@@ -1085,106 +1085,146 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         real_odds_data = fetch_real_odds(race_id)
         umaren_real_map = real_odds_data.get("umaren", {})
 
-        comb_01 = (min(u0, u1), max(u0, u1))
-        if comb_01 in umaren_real_map:
-            u01_odds = umaren_real_map[comb_01]
-            u01_is_real = True
-        else:
-            o_u0 = float(h_honmei.get("odds") or 0.0)
-            o_u1 = float(h_taiko.get("odds") or 0.0)
-            u01_odds = round(max(2.5, 0.65 * o_u0 * o_u1), 1) if (o_u0 > 0 and o_u1 > 0) else 0.0
-            u01_is_real = False
+        def get_umaren_odds_info(ua, ub):
+            comb = (min(ua, ub), max(ua, ub))
+            if comb in umaren_real_map:
+                return umaren_real_map[comb], True
+            else:
+                h_a = next((h for h in horses if int(h.get("umaban", 0)) == ua), {})
+                h_b = next((h for h in horses if int(h.get("umaban", 0)) == ub), {})
+                oa = float(h_a.get("odds") or 0.0)
+                ob = float(h_b.get("odds") or 0.0)
+                est_o = round(max(2.5, 0.65 * oa * ob), 1) if (oa > 0 and ob > 0) else 0.0
+                return est_o, False
 
-        # 仮想買い目 (見送り時の仮想損益検証用: 本命馬連800円)
-        exp_pay_hypo = int(round(800 * u01_odds)) if u01_odds > 0 else 0
-        hypothetical_umaren_bets = [{
-            "ticket_type": "馬連",
-            "combination": [u0, u1],
-            "combination_str": f"{u0}-{u1}",
-            "amount": 800,
-            "odds": u01_odds,
-            "expected_payout": exp_pay_hypo,
-            "is_real_odds": u01_is_real,
-            "memo": f"仮想本命馬連 (800円 / {'実オッズ' if u01_is_real else '想定'}{u01_odds}倍)"
-        }]
+        u01_odds, u01_is_real = get_umaren_odds_info(u0, u1) if (u0 and u1) else (0.0, False)
+        u02_odds, u02_is_real = get_umaren_odds_info(u0, u2) if (u0 and u2) else (0.0, False)
+        u03_odds, u03_is_real = get_umaren_odds_info(u0, u3) if (u0 and u3) else (0.0, False)
 
-        # ルール判定
-        is_target_gachi = (prob_gachi >= 0.28) and (o1 <= 2.8) and (surface_type != 2)
-        is_target_himo = (prob_himo >= 0.50) and (prob_gachi <= 0.25) and (o1 >= 2.0) and (surface_type != 2)
+        any_real_odds = u01_is_real or u02_is_real or u03_is_real
 
-        if is_target_gachi and len(horses) >= 5:
-            # 【ルール1】ガチガチ判定 → 本命ライン「◎-◯」の1点だけに厚張り（800円）！
-            exp_pay_01 = int(round(800 * u01_odds)) if u01_odds > 0 else 0
-            memo_01 = f"本命1点厚張り (800円 / {'Web実オッズ' if u01_is_real else '想定'}{u01_odds}倍 → 想定払戻{exp_pay_01:,}円)"
-            umaren_bets = [{
+        # 相手馬リスト（最大3頭: ◯, ▲, △）
+        opponents = []
+        if u1: opponents.append((u1, u01_odds, u01_is_real, "◯"))
+        if u2: opponents.append((u2, u02_odds, u02_is_real, "▲"))
+        if u3: opponents.append((u3, u03_odds, u03_is_real, "△"))
+
+        # ルール判定:
+        # 1. 堅実本命戦: ガチ度が高い、または1番人気が2.2倍以下の確固たる本命レース
+        is_target_gachi = (prob_gachi >= 0.22 or o1 <= 2.2) and (surface_type != 2) and (len(horses) >= 5)
+
+        # 2. 混戦妙味戦: 堅実判定ではなく、かつ極端な大荒れ・危険レースではないレース (1番人気が5.0倍未満)
+        is_target_himo = not is_target_gachi and (surface_type != 2) and (len(horses) >= 5) and (o1 < 5.0)
+
+        # 3. 大波乱・難解戦: 障害戦、少頭数(<5)、または1番人気が5.0倍以上の大混戦
+        is_target_skip = not (is_target_gachi or is_target_himo)
+
+        # 仮想買い目 (見送り時の検証用: 均等200円×3点 = 600円)
+        hypothetical_umaren_bets = []
+        for opp_u, opp_odds, opp_real, opp_mark in opponents:
+            hypo_amt = 200
+            exp_p = int(round(hypo_amt * opp_odds)) if opp_odds > 0 else 0
+            hypothetical_umaren_bets.append({
                 "ticket_type": "馬連",
-                "combination": [u0, u1],
-                "combination_str": f"{u0}-{u1}",
-                "amount": 800,
-                "odds": u01_odds,
-                "expected_payout": exp_pay_01,
-                "is_real_odds": u01_is_real,
-                "memo": memo_01
-            }]
+                "combination": [u0, opp_u],
+                "combination_str": f"{u0}-{opp_u}",
+                "amount": hypo_amt,
+                "odds": opp_odds,
+                "expected_payout": exp_p,
+                "is_real_odds": opp_real,
+                "memo": f"仮想馬連(◎-{opp_mark} {hypo_amt}円 / {'実オッズ' if opp_real else '想定'}{opp_odds}倍)"
+            })
+
+        if is_target_gachi and len(opponents) >= 1:
+            # 【ルール1】堅実本命戦 → 馬連傾斜配分 (◎-◯ 500円, ◎-▲ 200円, ◎-△ 100円 = 計800円)
+            umaren_bets = []
+            if len(opponents) >= 3:
+                amounts = [500, 200, 100]
+            elif len(opponents) == 2:
+                amounts = [600, 200]
+            else:
+                amounts = [800]
+
+            for (opp_u, opp_odds, opp_real, opp_mark), amt in zip(opponents, amounts):
+                exp_p = int(round(amt * opp_odds)) if opp_odds > 0 else 0
+                umaren_bets.append({
+                    "ticket_type": "馬連",
+                    "combination": [u0, opp_u],
+                    "combination_str": f"{u0}-{opp_u}",
+                    "amount": amt,
+                    "odds": opp_odds,
+                    "expected_payout": exp_p,
+                    "is_real_odds": opp_real,
+                    "memo": f"本命傾斜(◎-{opp_mark} {amt}円 / {'実オッズ' if opp_real else '想定'}{opp_odds}倍 → 想定払戻{exp_p:,}円)"
+                })
+            tot_amt = sum(b["amount"] for b in umaren_bets)
+            tot_exp = sum(b.get("expected_payout", 0) for b in umaren_bets if b.get("combination") == [u0, u1])
             hybrid_rec = {
                 "is_participate": True,
-                "strategy_name": "ガチガチ本命戦 (馬連1点厚張り)",
+                "strategy_name": "堅実本命戦 (馬連傾斜配分)",
                 "strategy_type": "gachi",
-                "total_amount": 800,
-                "summary": f"参戦推奨: 馬連1点厚張り(800円) [{u0}-{u1}] 想定払戻{exp_pay_01:,}円 (ガチ度{prob_gachi*100:.1f}%)",
+                "total_amount": tot_amt,
+                "summary": f"参戦推奨: 馬連傾斜配分({tot_amt}円) [本命線厚張り500円+抑え] (堅実度{prob_gachi*100:.1f}%)",
                 "umaren_bets": umaren_bets,
                 "sanrentan_bets": [],
                 "hypothetical_umaren_bets": umaren_bets,
                 "trio_bet": None,
-                "reason": f"ガチガチ判定クリア（1番人気{o1}倍・ガチ度基準合致 / 本命1点厚張り）",
-                "is_real_odds_applied": u01_is_real,
-                "total_expected_payout": exp_pay_01,
+                "reason": f"堅実判定クリア（1番人気{o1}倍・ガチ度基準合致 / 馬連傾斜配分）",
+                "is_real_odds_applied": any_real_odds,
+                "total_expected_payout": tot_exp,
                 "prob_gachi": prob_gachi,
                 "prob_himo": prob_himo
             }
-        elif is_target_himo and len(horses) >= 5:
-            # 【ルール2】中波乱・混戦判定 → 3連単フォーメーション（18点 各100円 = 1,800円）！
-            first_group = [u0, u1]
-            second_group = [u0, u1, u2, u3]
-            third_group = [u0, u1, u2, u3, u4]
-            sanrentan_bets = []
-            for f in first_group:
-                for s in second_group:
-                    for t in third_group:
-                        if f != s and f != t and s != t:
-                            sanrentan_bets.append({
-                                "ticket_type": "3連単",
-                                "combination": [f, s, t],
-                                "combination_str": f"{f}→{s}→{t}",
-                                "amount": 100,
-                                "memo": f"3連単F (1着:{f} / 2着:{s} / 3着:{t})"
-                            })
-            total_amt = len(sanrentan_bets) * 100
+        elif is_target_himo and len(opponents) >= 1:
+            # 【ルール2】混戦妙味戦 → 馬連均等配分 (◎-◯ 200円, ◎-▲ 200円, ◎-△ 200円 = 計600円)
+            umaren_bets = []
+            if len(opponents) >= 3:
+                amounts = [200, 200, 200]
+            elif len(opponents) == 2:
+                amounts = [300, 300]
+            else:
+                amounts = [600]
+
+            for (opp_u, opp_odds, opp_real, opp_mark), amt in zip(opponents, amounts):
+                exp_p = int(round(amt * opp_odds)) if opp_odds > 0 else 0
+                umaren_bets.append({
+                    "ticket_type": "馬連",
+                    "combination": [u0, opp_u],
+                    "combination_str": f"{u0}-{opp_u}",
+                    "amount": amt,
+                    "odds": opp_odds,
+                    "expected_payout": exp_p,
+                    "is_real_odds": opp_real,
+                    "memo": f"混戦均等(◎-{opp_mark} {amt}円 / {'実オッズ' if opp_real else '想定'}{opp_odds}倍 → 想定払戻{exp_p:,}円)"
+                })
+            tot_amt = sum(b["amount"] for b in umaren_bets)
             hybrid_rec = {
                 "is_participate": True,
-                "strategy_name": "中波乱・混戦 (3連単18点フォーメーション)",
+                "strategy_name": "混戦妙味戦 (馬連均等配分)",
                 "strategy_type": "himo",
-                "total_amount": total_amt,
-                "summary": f"参戦推奨: 3連単フォーメーション18点(1,800円) [1着:{u0},{u1} / 2着:4頭 / 3着:5頭] (混戦度{prob_himo*100:.1f}%)",
-                "umaren_bets": [],
-                "sanrentan_bets": sanrentan_bets,
-                "hypothetical_umaren_bets": hypothetical_umaren_bets,
+                "total_amount": tot_amt,
+                "summary": f"参戦推奨: 馬連均等配分({tot_amt}円) [◎から◯▲△ 3点流し各200円] (混戦度{prob_himo*100:.1f}%)",
+                "umaren_bets": umaren_bets,
+                "sanrentan_bets": [],
+                "hypothetical_umaren_bets": umaren_bets,
                 "trio_bet": None,
-                "reason": f"中波乱・混戦判定クリア（ヒモ荒れ期待値高 / 3連単フォーメーション）",
-                "is_real_odds_applied": False,
+                "reason": f"混戦判定クリア（中穴跳ね上がり狙い / 馬連3点均等配分）",
+                "is_real_odds_applied": any_real_odds,
                 "total_expected_payout": 0,
                 "prob_gachi": prob_gachi,
                 "prob_himo": prob_himo
             }
         else:
-            # 【ルール3】大波乱・難解判定 → 馬連は完全見送り（0円）で資金を守る！
+            # 【ルール3】大波乱・難解判定 → 完全見送り（0円）で資金を守る！
             reason_detail = []
             if surface_type == 2:
                 reason_detail.append("障害レース除外")
             elif len(horses) < 5:
                 reason_detail.append("少頭数レース除外")
+            elif o1 >= 5.0:
+                reason_detail.append(f"超混戦大荒れ懸念（1番人気:{o1}倍）")
             else:
-                reason_detail.append(f"波乱度基準外のため資金保全（1番人気:{o1}倍）")
+                reason_detail.append(f"リスク回避（1番人気:{o1}倍）")
             reason_str = " / ".join(reason_detail)
             hybrid_rec = {
                 "is_participate": False,
@@ -1197,7 +1237,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 "hypothetical_umaren_bets": hypothetical_umaren_bets,
                 "trio_bet": None,
                 "reason": reason_str,
-                "is_real_odds_applied": u01_is_real,
+                "is_real_odds_applied": any_real_odds,
                 "total_expected_payout": 0,
                 "prob_gachi": prob_gachi,
                 "prob_himo": prob_himo
@@ -1396,10 +1436,14 @@ def calculate_hybrid_pass_benefit_info(
 
         if h0 and h1 and h2:
             u0, u1, u2 = int(h0["umaban"]), int(h1["umaban"]), int(h2["umaban"])
+            h3 = next((h for h in horses if h.get("mark") == "△"), None)
+            u3 = int(h3["umaban"]) if h3 else None
             bets_to_check = [
-                {"combination": [u0, u1], "amount": 300},
-                {"combination": [u0, u2], "amount": 100}
+                {"combination": [u0, u1], "amount": 200},
+                {"combination": [u0, u2], "amount": 200}
             ]
+            if u3:
+                bets_to_check.append({"combination": [u0, u3], "amount": 200})
     if bets_to_check:
         total_b = sum(ub.get("amount", 0) for ub in bets_to_check)
         if total_b > 0:
