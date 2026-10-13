@@ -247,7 +247,7 @@ def calc_trio_odds(o1: float, o2: float, o3: float) -> float:
         p_sum += a * (b / denom1) * (c / denom2)
     if p_sum <= 0:
         return 10.0
-    return max(2.0, min(1000.0, 0.75 / p_sum))
+    return round(max(2.0, min(1000.0, 0.75 / p_sum)), 1)
 
 class TicketTypeSummary(BaseModel):
     ticket_type: str
@@ -1617,6 +1617,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         # Webリアルタイムオッズ取得
         real_odds_data = fetch_real_odds(race_id)
         umaren_real_map = real_odds_data.get("umaren", {})
+        trio_real_map = real_odds_data.get("trio", {})
 
         def get_umaren_odds_info(ua, ub):
             comb = (min(ua, ub), max(ua, ub))
@@ -1653,7 +1654,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             u0=u0,
             honmei_horse=honmei_horse,
             race_date_str=r_date_str,
-            force_final_odds=False
+            force_final_odds=False,
+            real_trio_odds=trio_real_map
         )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
@@ -1678,7 +1680,8 @@ def compute_hybrid_rec_from_inputs(
     u0: int,
     honmei_horse: Optional[dict],
     race_date_str: str,
-    force_final_odds: bool = False
+    force_final_odds: bool = False,
+    real_trio_odds: Optional[dict] = None
 ) -> dict:
     course_details_str = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
     if "障害" in race_name or "障" in course_details_str:
@@ -1822,17 +1825,25 @@ def compute_hybrid_rec_from_inputs(
             m3 = th["mark"] if th["mark"] != "-" else role_tag
             comb = sorted([t_u1, t_u2, u3])
             comb_str = f"{comb[0]}-{comb[1]}-{comb[2]}"
-            est_trio_odds = calc_trio_odds(t_o1, t_o2, o3)
-            exp_t_pay = int(round(100 * est_trio_odds))
+            comb_tup = tuple(comb)
+
+            is_real_trio = False
+            if real_trio_odds and comb_tup in real_trio_odds:
+                trio_odds_val = round(float(real_trio_odds[comb_tup]), 1)
+                is_real_trio = True
+            else:
+                trio_odds_val = round(calc_trio_odds(t_o1, t_o2, o3), 1)
+
+            exp_t_pay = int(round(100 * trio_odds_val))
             trio_bets_list.append({
                 "ticket_type": "三連複",
                 "combination": comb,
                 "combination_str": comb_str,
                 "amount": 100,
-                "odds": est_trio_odds,
+                "odds": trio_odds_val,
                 "expected_payout": exp_t_pay,
-                "is_real_odds": False,
-                "memo": f"2頭軸[{t_u1}({t_m1})={t_u2}({t_m2})]→{u3}番({m3}:単{o3}倍) 100円 / 想定{est_trio_odds}倍"
+                "is_real_odds": is_real_trio,
+                "memo": f"2頭軸[{t_u1}({t_m1})={t_u2}({t_m2})]→{u3}番({m3}:単{o3}倍) 100円 / {'実オッズ' if is_real_trio else '想定'}{trio_odds_val}倍"
             })
 
     is_trio_w_ok = is_real_sweet_spot and (t_s1 >= 0.50) and (4.5 <= t_o2 <= 18.0)
@@ -1884,11 +1895,7 @@ def compute_hybrid_rec_from_inputs(
             memo_prefix = "混戦均等"
             u_summary_str = f"{tier_prefix}馬連均等配分(600円) [◎から◯▲△ 各200円 / 合成{synth_odds}倍]"
 
-        u_reason_str = (
-            f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
-            if is_real_sweet_spot else
-            f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}：実戦推奨レンジ0.90〜1.80外）"
-        )
+        u_reason_str = f"馬連合成オッズ: {synth_odds}倍"
 
         for (opp_u, opp_odds, opp_real, opp_mark), amt in zip(opponents, amounts):
             exp_p = int(round(amt * opp_odds)) if opp_odds > 0 else 0
@@ -1904,6 +1911,7 @@ def compute_hybrid_rec_from_inputs(
             })
 
     active_trio_bets = trio_bets_list if is_trio_target else []
+    any_real_odds = any_real_odds or any(b.get("is_real_odds", False) for b in active_trio_bets)
     u_tot_amt = sum(b["amount"] for b in umaren_bets)
     t_tot_amt = sum(b["amount"] for b in active_trio_bets)
     tot_amt = u_tot_amt + t_tot_amt
@@ -1918,8 +1926,7 @@ def compute_hybrid_rec_from_inputs(
             f"({len(active_trio_bets)}点・{t_tot_amt}円) [計{tot_amt:,}円]"
         )
         reason_str = (
-            f"馬連＆三連複W好機合致（◎指数{honmei_score:.2f}・エッジ{edge_ratio} / "
-            f"三連複軸1:{t_u1}番[好走率{t_s1:.2f}]×妙味軸2:{t_u2}番[好走率{t_s2:.2f}・単{t_o2}倍]→本線保護＋EV流し）"
+            f"三連複軸: {t_u1}番({t_m1}・好走率{t_s1:.2f}) × {t_u2}番({t_m2}・好走率{t_s2:.2f}・単{t_o2}倍) / 馬連合成{synth_odds}倍"
         )
         tot_exp = (umaren_bets[0].get("expected_payout", 0) if umaren_bets else 0) + (active_trio_bets[0].get("expected_payout", 0) if active_trio_bets else 0)
         hybrid_rec = {
@@ -1968,10 +1975,8 @@ def compute_hybrid_rec_from_inputs(
             f"【実戦推奨】三連複2頭軸流し({t_tot_amt}円) "
             f"[軸{t_u1}番({t_m1})・{t_u2}番({t_m2}) → {third_nums_str}番 各100円]"
         )
-        trio_tier_label = "堅軸2強厳選" if is_trio_strong_duo else "厳選高期待値"
         reason_str = (
-            f"三連複{trio_tier_label}条件合致（軸1:{t_u1}番[好走率{t_s1:.2f}] × "
-            f"妙味軸2:{t_u2}番[好走率{t_s2:.2f}・単{t_o2}倍] → 本線2頭＋複勝EV上位3頭流し）"
+            f"三連複軸: {t_u1}番({t_m1}・好走率{t_s1:.2f}) × {t_u2}番({t_m2}・好走率{t_s2:.2f}・単{t_o2}倍)"
         )
         tot_exp = active_trio_bets[0].get("expected_payout", 0) if active_trio_bets else 0
         hybrid_rec = {
@@ -3726,6 +3731,15 @@ def recalculate_period_records():
                     o_real = False
                 opponents.append((ou, o_val, o_real, mark_sym))
 
+        # 既存の三連複実オッズを復元
+        old_t_bets = old_h.get("trio_bets") or ([old_h.get("trio_bet")] if old_h.get("trio_bet") else [])
+        real_trio_map = {}
+        for tb in old_t_bets:
+            if isinstance(tb, dict):
+                c = tb.get("combination") or []
+                if len(c) == 3 and tb.get("is_real_odds"):
+                    real_trio_map[tuple(sorted(c))] = float(tb.get("odds") or 0.0)
+
         new_h = compute_hybrid_rec_from_inputs(
             race_name=rname,
             race_details=rdetails,
@@ -3737,8 +3751,29 @@ def recalculate_period_records():
             u0=u0,
             honmei_horse=honmei,
             race_date_str=rdate,
-            force_final_odds=bool(old_h.get("is_final_odds", True))
+            force_final_odds=bool(old_h.get("is_final_odds", True)),
+            real_trio_odds=real_trio_map
         )
+
+        # 三連複対象レースで実オッズが未取得ならnetkeibaから取得して反映
+        if new_h.get("trio_bets") and not real_trio_map:
+            fetched_trio = fetch_real_odds(rid).get("trio", {})
+            if fetched_trio:
+                new_h = compute_hybrid_rec_from_inputs(
+                    race_name=rname,
+                    race_details=rdetails,
+                    horses=horses,
+                    surface_type=surf,
+                    prob_gachi=float(old_h.get("prob_gachi") or 0.0),
+                    prob_himo=float(old_h.get("prob_himo") or 0.0),
+                    opponents=opponents,
+                    u0=u0,
+                    honmei_horse=honmei,
+                    race_date_str=rdate,
+                    force_final_odds=bool(old_h.get("is_final_odds", True)),
+                    real_trio_odds=fetched_trio
+                )
+
         pred_data["hybrid_recommendation"] = new_h
 
         if ("新馬" in rname) or ("メイクデビュー" in rname) or surf == 2:
