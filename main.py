@@ -1715,30 +1715,27 @@ def compute_hybrid_rec_from_inputs(
     # ② ◎のAI勝率スコア >= 0.28 かつ 単勝オッズ 2.0〜10.0倍 (過剰人気・勝率0%の大穴バイアスを除外)
     # ③ ◎の期待値エッジ >= 0.80 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
     # 【第1段階：全参加レース基準 (is_participate = True)】
-    # ① 新馬・障害・少頭数(<5)・超混戦(1番人気>=5.0倍)を除外
-    # ② ◎のAI勝率スコア >= 0.22 かつ 単勝オッズ 1.8〜15.0倍
-    # ③ ◎の期待値エッジ >= 0.70 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
+    # ① 新馬・障害・少頭数(<5)・超混戦(1番人気>=4.5倍)を除外
+    # ② ◎のAI勝率スコア >= 0.28 かつ 単勝オッズ 2.0〜10.5倍
+    # ③ ◎の期待値エッジ >= 0.90 かつ 馬連3点の合成オッズ >= 2.2倍 (トリガミ完全回避)
     is_valid_target = (
         not is_shinba
         and (surface_type != 2)
         and (len(horses) >= 5)
-        and (o1 < 5.0)
-        and (honmei_score >= 0.22)
-        and (1.8 <= honmei_odds <= 15.0)
-        and (edge_ratio >= 0.70)
-        and (synth_odds >= 2.0)
+        and (o1 < 4.5)
+        and (honmei_score >= 0.28)
+        and (2.0 <= honmei_odds <= 10.5)
+        and (edge_ratio >= 0.90)
+        and (synth_odds >= 2.2)
         and (len(opponents) >= 1)
     )
 
     # 【第2段階：実戦推奨レース基準 (is_real_bet_target = True)】
-    # 全参加レースの中でも、特にAI確信度・オッズ帯・期待値エッジのスイートスポットに合致した厳選勝負レース
+    # 全参加レースの中でも、過去スコアと実勢オッズの乖離が適正なスイートスポット(エッジ0.90〜1.80)を厳選
+    # （エッジ>1.80の過剰乖離・長期休養明け等のトラップ馬は「標準参加」に留め実戦推奨から除外）
     is_real_sweet_spot = (
         is_valid_target
-        and (o1 < 4.5)
-        and (honmei_score >= 0.28)
-        and (2.0 <= honmei_odds <= 9.5)
         and (0.90 <= edge_ratio <= 1.80)
-        and (synth_odds >= 2.2)
     )
 
     if is_valid_target:
@@ -1762,7 +1759,7 @@ def compute_hybrid_rec_from_inputs(
             reason_str = (
                 f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
                 if is_real_sweet_spot else
-                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍 / 実戦推奨選外）"
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}＞1.80：オッズ乖離大のため実戦推奨は選外）"
             )
         else:
             if len(opponents) >= 3:
@@ -1778,7 +1775,7 @@ def compute_hybrid_rec_from_inputs(
             reason_str = (
                 f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
                 if is_real_sweet_spot else
-                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍 / 実戦推奨選外）"
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}＞1.80：オッズ乖離大のため実戦推奨は選外）"
             )
 
         umaren_bets = []
