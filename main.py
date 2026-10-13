@@ -2501,13 +2501,45 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
     return None
 
 
+def normalize_race_res(race_res: Optional[dict]) -> Optional[dict]:
+    if not race_res or not isinstance(race_res, dict):
+        return race_res
+    # orders を int キーに正規化 (JSONシリアライズ時の文字列キーを整数に復元)
+    raw_orders = race_res.get("orders") or {}
+    norm_orders = {}
+    for k, v in raw_orders.items():
+        try:
+            norm_orders[int(k)] = int(v)
+        except (ValueError, TypeError):
+            try:
+                norm_orders[k] = int(v)
+            except Exception:
+                pass
+    race_res["orders"] = norm_orders
+
+    # payouts の tansho / fukusho のキーも int に正規化
+    payouts = race_res.get("payouts") or {}
+    if isinstance(payouts, dict):
+        for p_type in ["tansho", "fukusho"]:
+            if p_type in payouts and isinstance(payouts[p_type], dict):
+                norm_p = {}
+                for k, v in payouts[p_type].items():
+                    try:
+                        norm_p[int(k)] = int(v)
+                    except (ValueError, TypeError):
+                        norm_p[k] = v
+                payouts[p_type] = norm_p
+        race_res["payouts"] = payouts
+    return race_res
+
+
 def get_cached_result(race_id: str) -> Optional[dict]:
     if not supabase:
         return None
     try:
         res = supabase.table("keiba_race_results_cache").select("result_json").eq("race_id", race_id).execute()
         if res.data and len(res.data) > 0:
-            return res.data[0]["result_json"]
+            return normalize_race_res(res.data[0]["result_json"])
     except Exception as e:
         print(f"Supabase結果キャッシュ取得エラー ({race_id}): {e}")
     return None
@@ -2770,11 +2802,11 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     if not is_confirmed:
         return None
 
-    return {
+    return normalize_race_res({
         "race_name": race_name,
         "orders": orders,
         "payouts": payouts
-    }
+    })
 
 
 def process_settlement_calculation(
@@ -2792,7 +2824,9 @@ def process_settlement_calculation(
     h_name = rec.get("horse_name")
     grade = rec.get("grade", "B")
     orders = race_res.get("orders", {})
-    actual_order = orders.get(target_u) if target_u else None
+    actual_order = orders.get(target_u) if target_u is not None else None
+    if actual_order is None and target_u is not None:
+        actual_order = orders.get(str(target_u))
 
     real_bet_meta = {
         "is_real_bet_target": bool((hybrid_rec or {}).get("is_real_bet_target", False)),
@@ -3156,18 +3190,22 @@ def verify_race_result(
     target_u = rec.get("target_umaban")
     orders = race_res.get("orders", {})
     payouts = race_res.get("payouts", {})
-    actual_order = orders.get(target_u) if target_u else None
+    actual_order = orders.get(target_u) if target_u is not None else None
+    if actual_order is None and target_u is not None:
+        actual_order = orders.get(str(target_u))
 
     # ★ 着順および払戻金が実数値で確認できるかの厳格チェック
     has_top3 = (1 in orders.values()) and (2 in orders.values()) and (3 in orders.values())
     has_payouts = (len(payouts.get("tansho", {})) > 0) or (len(payouts.get("umaren", {})) > 0) or (len(payouts.get("fukusho", {})) > 0)
     has_target_order = (actual_order is not None and isinstance(actual_order, int) and 1 <= actual_order <= 30)
 
-    is_fully_confirmed = has_top3 and has_payouts and (has_target_order or target_u is None)
+    # 1〜3着確定および払戻金確定があれば、JRA公式結果としてレース全体が確定している
+    # （◎馬が競走中止・除外・取消・大敗等の場合でも、レース照合は正常完了させる）
+    is_fully_confirmed = has_top3 and has_payouts
     if not is_19h_settle and not is_fully_confirmed:
         raise HTTPException(
             status_code=400,
-            detail=f"着順または払戻金が実数値で確定していません（入線直後・審議中等のため未確定）。確定後に再度照合してください。(確認状況: 1〜3着確定={has_top3}, 払戻金確定={has_payouts}, ◎着順確定={has_target_order})"
+            detail=f"着順または払戻金が実数値で確定していません（入線直後・審議中等のため未確定）。確定後に再度照合してください。(確認状況: 1〜3着確定={has_top3}, 払戻金確定={has_payouts})"
         )
 
     save_cached_result(race_id, race_name, race_date, race_res)
