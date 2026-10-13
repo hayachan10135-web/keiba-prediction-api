@@ -313,6 +313,17 @@ class DailySummary(BaseModel):
     real_bet_payout: Optional[int] = 0
     real_bet_profit: Optional[int] = 0
     real_bet_recovery_rate: Optional[float] = 0.0
+    cumulative_days: Optional[int] = 0
+    cumulative_total_races: Optional[int] = 0
+    cumulative_bet_races: Optional[int] = 0
+    cumulative_pass_races: Optional[int] = 0
+    cumulative_hit_races: Optional[int] = 0
+    cumulative_hit_rate: Optional[float] = 0.0
+    cumulative_bet_amount: Optional[int] = 0
+    cumulative_payout_amount: Optional[int] = 0
+    cumulative_profit: Optional[int] = 0
+    cumulative_recovery_rate: Optional[float] = 0.0
+    cumulative_pass_benefit: Optional[int] = 0
 
 class BatchStartResponse(BaseModel):
     status: str
@@ -2963,6 +2974,39 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     umaren_rec = round((umaren_payout_total / umaren_bet_total) * 100.0, 2) if umaren_bet_total > 0 else 0.0
     trio_rec = round((trio_payout_total / trio_bet_total) * 100.0, 2) if trio_bet_total > 0 else 0.0
 
+    # ★ 累計トータル収支・成績の集計（永続テーブル keiba_race_settlements の全期間集計）
+    cum_days = 0
+    cum_total_races = 0
+    cum_bet_races = 0
+    cum_pass_races = 0
+    cum_hit_races = 0
+    cum_hit_rate = 0.0
+    cum_bet_amount = 0
+    cum_payout_amount = 0
+    cum_profit = 0
+    cum_recovery_rate = 0.0
+    cum_pass_benefit = 0
+
+    if supabase:
+        try:
+            cum_res = supabase.table("keiba_race_settlements").select(
+                "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit"
+            ).execute()
+            cum_rows = cum_res.data or []
+            cum_days = len(set(cr.get("race_date") for cr in cum_rows if cr.get("race_date")))
+            cum_total_races = len(cum_rows)
+            cum_bet_races = sum(1 for cr in cum_rows if cr.get("is_pass") == 0)
+            cum_pass_races = sum(1 for cr in cum_rows if cr.get("is_pass") == 1)
+            cum_hit_races = sum(1 for cr in cum_rows if cr.get("is_hit") == 1 and cr.get("is_pass") == 0)
+            cum_bet_amount = sum((cr.get("total_bet") or 0) for cr in cum_rows)
+            cum_payout_amount = sum((cr.get("total_payout") or 0) for cr in cum_rows)
+            cum_profit = cum_payout_amount - cum_bet_amount
+            cum_recovery_rate = round((cum_payout_amount / cum_bet_amount) * 100.0, 2) if cum_bet_amount > 0 else 0.0
+            cum_hit_rate = round((cum_hit_races / cum_bet_races) * 100.0, 2) if cum_bet_races > 0 else 0.0
+            cum_pass_benefit = sum((cr.get("pass_benefit") or 0) for cr in cum_rows if cr.get("is_pass") == 1)
+        except Exception as e:
+            print(f"Supabase累計サマリー取得エラー: {e}")
+
     return {
         "target_date": target_date,
         "total_races": total_races,
@@ -2993,7 +3037,18 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "real_bet_amount": real_bet_amount,
         "real_bet_payout": real_bet_payout,
         "real_bet_profit": real_bet_profit,
-        "real_bet_recovery_rate": real_bet_recovery_rate
+        "real_bet_recovery_rate": real_bet_recovery_rate,
+        "cumulative_days": cum_days,
+        "cumulative_total_races": cum_total_races,
+        "cumulative_bet_races": cum_bet_races,
+        "cumulative_pass_races": cum_pass_races,
+        "cumulative_hit_races": cum_hit_races,
+        "cumulative_hit_rate": cum_hit_rate,
+        "cumulative_bet_amount": cum_bet_amount,
+        "cumulative_payout_amount": cum_payout_amount,
+        "cumulative_profit": cum_profit,
+        "cumulative_recovery_rate": cum_recovery_rate,
+        "cumulative_pass_benefit": cum_pass_benefit
     }
 
 
