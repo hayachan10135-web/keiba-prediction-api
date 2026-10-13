@@ -2995,17 +2995,7 @@ def get_summary_dates():
             except Exception as e:
                 print(f"settlements dates error: {e}")
 
-            # 2. 予想キャッシュが存在する日付
-            try:
-                res_pred = supabase.table("keiba_predictions_cache").select("race_date").execute()
-                for row in (res_pred.data or []):
-                    d = row.get("race_date")
-                    if d and len(d) == 10 and d.startswith("20"):
-                        dates_set.add(d)
-            except Exception as e:
-                print(f"predictions dates error: {e}")
-
-            # 3. レース開催日として登録された日付
+            # 2. レース開催日として登録された日付
             try:
                 res_sched = supabase.table("keiba_scheduled_races").select("race_date").execute()
                 for row in (res_sched.data or []):
@@ -3467,9 +3457,11 @@ def recalculate_period_records():
 
     preds_res = supabase.table("keiba_predictions_cache").select("race_id, race_date, data_json").execute()
     results_res = supabase.table("keiba_race_results_cache").select("race_id, race_date, result_json").execute()
+    sched_res = supabase.table("keiba_scheduled_races").select("race_id").execute()
 
     preds_list = preds_res.data or []
     res_map = {r["race_id"]: r.get("result_json") for r in (results_res.data or [])}
+    valid_rids = set(res_map.keys()) | {r["race_id"] for r in (sched_res.data or [])}
 
     updated_preds = 0
     updated_settlements = 0
@@ -3483,6 +3475,12 @@ def recalculate_period_records():
 
     for row in preds_list:
         rid = row["race_id"]
+        if valid_rids and rid not in valid_rids:
+            try:
+                supabase.table("keiba_predictions_cache").delete().eq("race_id", rid).execute()
+            except Exception:
+                pass
+            continue
         rdate = row.get("race_date") or today_jst_str()
         pred_data = row.get("data_json") or {}
         if not pred_data:
