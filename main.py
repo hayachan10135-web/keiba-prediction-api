@@ -1962,10 +1962,11 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                         break
                 if target_race_date:
                     break
+        known_schedule_date = target_race_date
         if not target_race_date:
             target_race_date = today_jst_str()
 
-        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id, race_date=target_race_date)
+        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id, race_date=known_schedule_date)
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
@@ -3457,11 +3458,10 @@ def recalculate_period_records():
 
     preds_res = supabase.table("keiba_predictions_cache").select("race_id, race_date, data_json").execute()
     results_res = supabase.table("keiba_race_results_cache").select("race_id, race_date, result_json").execute()
-    sched_res = supabase.table("keiba_scheduled_races").select("race_id").execute()
 
     preds_list = preds_res.data or []
     res_map = {r["race_id"]: r.get("result_json") for r in (results_res.data or [])}
-    valid_rids = set(res_map.keys()) | {r["race_id"] for r in (sched_res.data or [])}
+    valid_rids = set(res_map.keys())
 
     updated_preds = 0
     updated_settlements = 0
@@ -3478,6 +3478,7 @@ def recalculate_period_records():
         if valid_rids and rid not in valid_rids:
             try:
                 supabase.table("keiba_predictions_cache").delete().eq("race_id", rid).execute()
+                supabase.table("keiba_scheduled_races").delete().eq("race_id", rid).execute()
             except Exception:
                 pass
             continue
