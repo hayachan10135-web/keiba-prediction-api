@@ -3566,13 +3566,13 @@ def run_batch_worker(
 
         period_dates = discover_period_kaisai_dates(now_dt)
 
-        # mode == "all" (手動一括処理等) の場合は、今開催期間内の全中央競馬開催日を対象とする
-        if mode == "all" and not is_19h_settle:
-            target_dates = period_dates if period_dates else ([target_date] if target_date else [])
-        elif target_date:
+        # target_date が明示されている場合は指定日のみを対象とする
+        if target_date:
             clean_d = target_date.replace("-", "")
             fmt_d = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else target_date
             target_dates = [fmt_d]
+        elif mode == "all" and not is_19h_settle:
+            target_dates = period_dates if period_dates else []
         else:
             target_dates = period_dates
 
@@ -4353,6 +4353,19 @@ def normalize_mislabeled_dates():
                 except Exception:
                     pass
 
+        # keiba_scheduled_races の 2026-10-13 レコードも更新・整理
+        try:
+            res_sc = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", "2026-10-13").execute()
+            for row_sc in (res_sc.data or []):
+                sc_id = row_sc.get("race_id", "")
+                c_date = resolve_race_date_for_id(sc_id)
+                if c_date and c_date != "2026-10-13":
+                    supabase.table("keiba_scheduled_races").update({"race_date": c_date}).eq("race_id", sc_id).execute()
+                else:
+                    supabase.table("keiba_scheduled_races").delete().eq("race_id", sc_id).execute()
+        except Exception as e:
+            print(f"[NormalizeDates] scheduled_races cleanup error: {e}")
+
         msg = f"日付正規化完了: settlements={migrated_settlements}件, results={migrated_results}件, predictions={migrated_predictions}件"
         print(f"[NormalizeDates] {msg}")
         return {"status": "ok", "message": msg}
@@ -4362,9 +4375,103 @@ def normalize_mislabeled_dates():
         return {"status": "error", "message": str(e)}
 
 
+def sync_and_process_1003_1004():
+    """10/3 (土) および 10/4 (日) の全48レースを keiba_scheduled_races に登録し、全レース予想＆結果検証を実行"""
+    if not supabase:
+        print("[Process 10/3-10/4] Supabase未接続")
+        return {"status": "error", "message": "Supabase not connected"}
+
+    # 1. keiba_scheduled_races 内の誤った 2026-10-13 レコードを削除
+    try:
+        supabase.table("keiba_scheduled_races").delete().eq("race_date", "2026-10-13").execute()
+    except Exception as e:
+        print(f"[Fix] scheduled_races delete 2026-10-13 error: {e}")
+
+    # 2. 2026-10-03 と 2026-10-04 の各レーススケジュールを JRA netkeiba から取得して keiba_scheduled_races に登録
+    target_dates = ["2026-10-03", "2026-10-04"]
+    total_scheduled = 0
+    total_predicted = 0
+    total_settled = 0
+    all_races = []
+
+    for d_str in target_dates:
+        venues = fetch_venues_for_date_raw(d_str)
+        race_items = [r for v in venues for r in v.get("races", [])]
+        rows_to_upsert = []
+        for r in race_items:
+            r_id = r["race_id"]
+            r_info = r.get("race_info") or r.get("race_name") or ""
+            m = re.search(r"(\d{1,2}):(\d{2})", r_info)
+            hour, minute = (int(m.group(1)), int(m.group(2))) if m else (15, 0)
+            d_parts = [int(p) for p in d_str.split("-")]
+            post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
+            rows_to_upsert.append({
+                "race_id": r_id,
+                "race_date": d_str,
+                "race_name": r.get("race_name", r.get("race_no", "")),
+                "post_datetime": post_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "is_predicted": 0,
+                "is_settled": 0,
+                "retry_count": 0
+            })
+            all_races.append((d_str, r_id))
+        if rows_to_upsert:
+            try:
+                supabase.table("keiba_scheduled_races").upsert(rows_to_upsert, on_conflict="race_id").execute()
+                total_scheduled += len(rows_to_upsert)
+            except Exception as e:
+                print(f"[Schedule] upsert error for {d_str}: {e}")
+
+    # 3. 全レースの予想 ＆ 結果検証を一括実行
+    for d_str, r_id in all_races:
+        try:
+            predict_race_core(r_id, force_refresh=True)
+            total_predicted += 1
+            if supabase:
+                supabase.table("keiba_scheduled_races").update({"is_predicted": 2}).eq("race_id", r_id).execute()
+        except Exception as pe:
+            print(f"[Predict Error] {r_id}: {pe}")
+
+        try:
+            verify_race_result(r_id, bypass_cache=True)
+            total_settled += 1
+            if supabase:
+                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
+        except Exception as se:
+            print(f"[Settle Error] {r_id}: {se}")
+
+    msg = f"10/3・10/4 全レース処理完了: スケジュール登録={total_scheduled}R, 予想={total_predicted}R, 検証={total_settled}R"
+    print(f"[Batch 10/3-10/4] {msg}")
+    return {
+        "status": "ok",
+        "message": msg,
+        "scheduled_count": total_scheduled,
+        "predicted_count": total_predicted,
+        "settled_count": total_settled
+    }
+
+
+async def background_sync_1003_1004_task():
+    try:
+        await asyncio.sleep(5)
+        if supabase:
+            res_s = supabase.table("keiba_race_settlements").select("race_id").in_("race_date", ["2026-10-03", "2026-10-04"]).execute()
+            if len(res_s.data or []) < 40:
+                print("[Startup] 10/3, 10/4の未処理全レースの自動同期・予想・検証を開始します...")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, sync_and_process_1003_1004)
+    except Exception as e:
+        print(f"[Startup] 10/3, 10/4 バックグラウンド処理エラー: {e}")
+
+
 @app.post("/admin/normalize-dates")
 def endpoint_normalize_dates():
     return normalize_mislabeled_dates()
+
+
+@app.post("/admin/process-1003-1004")
+def endpoint_process_1003_1004():
+    return sync_and_process_1003_1004()
 
 
 @app.on_event("startup")
@@ -4372,4 +4479,5 @@ async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
     normalize_mislabeled_dates()
+    asyncio.create_task(background_sync_1003_1004_task())
     asyncio.create_task(background_maintenance_loop())
