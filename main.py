@@ -1716,23 +1716,23 @@ def compute_hybrid_rec_from_inputs(
     # ③ ◎の期待値エッジ >= 0.80 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
     # 【第1段階：全参加レース基準 (is_participate = True)】
     # ① 新馬・障害・少頭数(<5)・超混戦(1番人気>=4.5倍)を除外
-    # ② ◎のAI勝率スコア >= 0.28 かつ 単勝オッズ 2.0〜10.5倍
-    # ③ ◎の期待値エッジ >= 0.90 かつ 馬連3点の合成オッズ >= 2.2倍 (トリガミ完全回避)
+    # ② ◎のAI勝率スコア >= 0.28 かつ 単勝オッズ 2.0〜10.0倍 (過剰人気・勝率0%の大穴バイアスを除外)
+    # ③ ◎の期待値エッジ >= 0.80 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
     is_valid_target = (
         not is_shinba
         and (surface_type != 2)
         and (len(horses) >= 5)
         and (o1 < 4.5)
         and (honmei_score >= 0.28)
-        and (2.0 <= honmei_odds <= 10.5)
-        and (edge_ratio >= 0.90)
-        and (synth_odds >= 2.2)
+        and (2.0 <= honmei_odds <= 10.0)
+        and (edge_ratio >= 0.80)
+        and (synth_odds >= 2.0)
         and (len(opponents) >= 1)
     )
 
     # 【第2段階：実戦推奨レース基準 (is_real_bet_target = True)】
     # 全参加レースの中でも、過去スコアと実勢オッズの乖離が適正なスイートスポット(エッジ0.90〜1.80)を厳選
-    # （エッジ>1.80の過剰乖離・長期休養明け等のトラップ馬は「標準参加」に留め実戦推奨から除外）
+    # （エッジ0.80〜0.89の準推奨域や、エッジ>1.80の過剰乖離トラップ馬は「標準参加」に留め実戦推奨から除外）
     is_real_sweet_spot = (
         is_valid_target
         and (0.90 <= edge_ratio <= 1.80)
@@ -1759,7 +1759,7 @@ def compute_hybrid_rec_from_inputs(
             reason_str = (
                 f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
                 if is_real_sweet_spot else
-                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}＞1.80：オッズ乖離大のため実戦推奨は選外）"
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}：実戦推奨レンジ0.90〜1.80外）"
             )
         else:
             if len(opponents) >= 3:
@@ -1775,7 +1775,7 @@ def compute_hybrid_rec_from_inputs(
             reason_str = (
                 f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
                 if is_real_sweet_spot else
-                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}＞1.80：オッズ乖離大のため実戦推奨は選外）"
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}：実戦推奨レンジ0.90〜1.80外）"
             )
 
         umaren_bets = []
@@ -1817,18 +1817,18 @@ def compute_hybrid_rec_from_inputs(
             reason_detail.append("障害レース除外")
         elif len(horses) < 5:
             reason_detail.append("少頭数レース除外")
-        elif o1 >= 5.0:
+        elif o1 >= 4.5:
             reason_detail.append(f"超混戦大荒れ懸念（1番人気:{o1}倍）")
         elif synth_odds > 0 and synth_odds < 2.0:
             reason_detail.append(f"トリガミ回避（馬連合成オッズ:{synth_odds}倍 < 2.0倍）")
-        elif honmei_score < 0.22:
-            reason_detail.append(f"◎AI信頼度不足（指数:{honmei_score:.2f} < 0.22）")
-        elif honmei_odds < 1.8:
+        elif honmei_score < 0.28:
+            reason_detail.append(f"◎AI信頼度不足（指数:{honmei_score:.2f} < 0.28）")
+        elif honmei_odds < 2.0:
             reason_detail.append(f"◎過剰人気・妙味薄（単勝:{honmei_odds}倍）")
-        elif honmei_odds > 15.0:
-            reason_detail.append(f"◎人気薄リスク回避（単勝:{honmei_odds}倍 > 15.0倍）")
-        elif edge_ratio < 0.70:
-            reason_detail.append(f"◎期待値不足（エッジ:{edge_ratio} < 0.70）")
+        elif honmei_odds > 10.0:
+            reason_detail.append(f"◎人気薄リスク回避（単勝:{honmei_odds}倍 > 10.0倍）")
+        elif edge_ratio < 0.80:
+            reason_detail.append(f"◎期待値不足（エッジ:{edge_ratio} < 0.80）")
         else:
             reason_detail.append("期待値基準外")
         reason_str = " / ".join(reason_detail)
