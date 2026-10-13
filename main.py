@@ -3159,6 +3159,10 @@ def resolve_race_date_for_id(race_id: str) -> str:
             return "2026-10-11"
         elif day_code == "0405":
             return "2026-10-12"
+        elif day_code == "0408":
+            return "2026-09-26"
+        elif day_code == "0409":
+            return "2026-09-27"
 
     if supabase:
         for tbl in ("keiba_scheduled_races", "keiba_predictions_cache", "keiba_race_settlements"):
@@ -4376,20 +4380,12 @@ def normalize_mislabeled_dates():
         return {"status": "error", "message": str(e)}
 
 
-def sync_and_process_1003_1004():
-    """10/3 (土) および 10/4 (日) の全48レースを keiba_scheduled_races に登録し、全レース予想＆結果検証を実行"""
+def sync_and_process_target_dates(target_dates: List[str]):
+    """指定開催日（例: ['2026-09-26', '2026-09-27']）の全レースを keiba_scheduled_races に登録し、全レース予想＆結果検証を実行"""
     if not supabase:
-        print("[Process 10/3-10/4] Supabase未接続")
+        print("[Process Dates] Supabase未接続")
         return {"status": "error", "message": "Supabase not connected"}
 
-    # 1. keiba_scheduled_races 内の誤った 2026-10-13 レコードを削除
-    try:
-        supabase.table("keiba_scheduled_races").delete().eq("race_date", "2026-10-13").execute()
-    except Exception as e:
-        print(f"[Fix] scheduled_races delete 2026-10-13 error: {e}")
-
-    # 2. 2026-10-03 と 2026-10-04 の各レーススケジュールを JRA netkeiba から取得して keiba_scheduled_races に登録
-    target_dates = ["2026-10-03", "2026-10-04"]
     total_scheduled = 0
     total_predicted = 0
     total_settled = 0
@@ -4423,7 +4419,7 @@ def sync_and_process_1003_1004():
             except Exception as e:
                 print(f"[Schedule] upsert error for {d_str}: {e}")
 
-    # 3. 全レースの予想 ＆ 結果検証を一括実行
+    # 全レースの予想 ＆ 結果検証を一括実行
     for d_str, r_id in all_races:
         try:
             predict_race_core(r_id, force_refresh=True)
@@ -4441,8 +4437,8 @@ def sync_and_process_1003_1004():
         except Exception as se:
             print(f"[Settle Error] {r_id}: {se}")
 
-    msg = f"10/3・10/4 全レース処理完了: スケジュール登録={total_scheduled}R, 予想={total_predicted}R, 検証={total_settled}R"
-    print(f"[Batch 10/3-10/4] {msg}")
+    msg = f"{', '.join(target_dates)} 全レース処理完了: スケジュール登録={total_scheduled}R, 予想={total_predicted}R, 検証={total_settled}R"
+    print(f"[Batch Process] {msg}")
     return {
         "status": "ok",
         "message": msg,
@@ -4452,17 +4448,12 @@ def sync_and_process_1003_1004():
     }
 
 
-async def background_sync_1003_1004_task():
-    try:
-        await asyncio.sleep(5)
-        if supabase:
-            res_s = supabase.table("keiba_race_settlements").select("race_id").in_("race_date", ["2026-10-03", "2026-10-04"]).execute()
-            if len(res_s.data or []) < 40:
-                print("[Startup] 10/3, 10/4の未処理全レースの自動同期・予想・検証を開始します...")
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, sync_and_process_1003_1004)
-    except Exception as e:
-        print(f"[Startup] 10/3, 10/4 バックグラウンド処理エラー: {e}")
+def sync_and_process_1003_1004():
+    return sync_and_process_target_dates(["2026-10-03", "2026-10-04"])
+
+
+def sync_and_process_0926_0927():
+    return sync_and_process_target_dates(["2026-09-26", "2026-09-27"])
 
 
 @app.post("/admin/normalize-dates")
@@ -4473,6 +4464,11 @@ def endpoint_normalize_dates():
 @app.post("/admin/process-1003-1004")
 def endpoint_process_1003_1004():
     return sync_and_process_1003_1004()
+
+
+@app.post("/admin/process-0926-0927")
+def endpoint_process_0926_0927():
+    return sync_and_process_0926_0927()
 
 
 @app.on_event("startup")
