@@ -172,6 +172,9 @@ class HorsePrediction(BaseModel):
     mark: str
     is_blinker: Optional[bool] = False
     is_first_blinker: Optional[bool] = False
+    horse_weight: Optional[int] = None
+    weight_diff: Optional[int] = None
+    sex_age: Optional[str] = None
 
 class TicketBet(BaseModel):
     ticket_type: str
@@ -870,14 +873,22 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
 def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
-    try:
-        html = resp.content.decode("euc-jp")
-    except UnicodeDecodeError:
+    raw_head = resp.content[:300].lower()
+    if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head or b"utf-8" in raw_head:
         html = resp.content.decode("utf-8", errors="replace")
+    else:
+        try:
+            html = resp.content.decode("euc-jp")
+        except UnicodeDecodeError:
+            html = resp.content.decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
 
     race_num_int = int(race_id[10:12]) if len(race_id) == 12 and race_id[10:12].isdigit() else 1
     race_num = f"{race_num_int}R"
+    try:
+        venue_code = int(race_id[4:6])
+    except Exception:
+        venue_code = 5
 
     race_name = ""
     name_candidates = soup.select(".RaceName, .RaceName_Text, .Race_Title, h1.RaceName")
@@ -906,6 +917,8 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
 
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
     race_data_text = race_data_tag.get_text(separator=" ", strip=True) if race_data_tag else ""
+    race_data2_tag = soup.select_one(".RaceData02")
+    race_data2_text = race_data2_tag.get_text(separator=" ", strip=True) if race_data2_tag else ""
 
     post_time_m = re.search(r"(\d{1,2}:\d{2})\s*発走", race_data_text)
     post_time = f"{post_time_m.group(1)}発走" if post_time_m else ""
@@ -928,6 +941,42 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         surface_name = "ダート"
         surface_type = 1
 
+    # ★ コース回り (0:右回り, 1:左回り, 2:直線)
+    if "直線" in race_data_text or "直" in race_data_text or (venue_code == 4 and surface_type == 0 and int(distance) == 1000):
+        turn_type = 2
+        turn_label = "直線"
+    elif "左" in race_data_text or venue_code in (4, 5, 7):
+        turn_type = 1
+        turn_label = "左"
+    else:
+        turn_type = 0
+        turn_label = "右"
+
+    # ★ レースクラス・条件判定 (0:新馬, 1:未勝利, 2:1勝, 3:2勝, 4:3勝, 5:オープン/重賞)
+    combined_race_text = f"{race_name} {race_data2_text}"
+    race_class_code: Optional[int] = None
+    class_label = ""
+    if "新馬" in combined_race_text or "メイクデビュー" in combined_race_text:
+        race_class_code = 0
+        class_label = "新馬"
+    elif "未勝利" in combined_race_text:
+        race_class_code = 1
+        class_label = "未勝利"
+    elif "1勝" in combined_race_text or "１勝" in combined_race_text or "500万" in combined_race_text:
+        race_class_code = 2
+        class_label = "1勝クラス"
+    elif "2勝" in combined_race_text or "２勝" in combined_race_text or "1000万" in combined_race_text:
+        race_class_code = 3
+        class_label = "2勝クラス"
+    elif "3勝" in combined_race_text or "３勝" in combined_race_text or "1600万" in combined_race_text:
+        race_class_code = 4
+        class_label = "3勝クラス"
+    elif any(k in combined_race_text for k in ["オープン", "ＯＰ", "OP", "G1", "G2", "G3", "GI", "GII", "GIII", "重賞", "(L)", "リステッド"]):
+        race_class_code = 5
+        class_label = "オープン"
+
+    is_female_only_text = bool(re.search(r"牝(?:馬|\)|\]|限定|\s)", combined_race_text))
+
     condition_code = 0
     if "稍" in baba:
         condition_code = 1
@@ -937,7 +986,8 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         condition_code = 2
 
     weather_str = f" 天候:{weather}" if weather else ""
-    course_details = f"{surface_name}{int(distance)}m ({baba}){weather_str}"
+    class_str = f" [{class_label}]" if class_label else ""
+    course_details = f"{surface_name}{int(distance)}m・{turn_label} ({baba}){class_str}{weather_str}"
 
     race_details = {
         "race_num": race_num,
@@ -1006,12 +1056,40 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         trainer_tag = row.select_one(".Trainer a, td.Trainer")
         trainer = trainer_tag.get_text(strip=True) if trainer_tag else "未定"
 
+        # ★ 性齢 (td.Barei) と 斤量 (td.Barei の次の td または td.Kinryo)
+        sex_age = None
+        sex_code = 0
+        age = 4.0
+        barei_tag = row.select_one("td.Barei")
+        if barei_tag:
+            b_str = barei_tag.get_text(strip=True)
+            if b_str:
+                sex_age = b_str
+                if "牝" in b_str:
+                    sex_code = 1
+                elif "セ" in b_str or "騸" in b_str:
+                    sex_code = 2
+                m_age = re.search(r"(\d+)", b_str)
+                if m_age:
+                    age = float(m_age.group(1))
+
         kinryo = 55.0
-        kinryo_tag = row.select_one("td.Barei, td.Weight, td.Kinryo")
+        kinryo_tag = barei_tag.find_next_sibling("td") if barei_tag else row.select_one("td.Kinryo")
         if kinryo_tag:
             km = re.search(r"(\d{2}(?:\.\d)?)", kinryo_tag.get_text(strip=True))
             if km:
                 kinryo = float(km.group(1))
+
+        # ★ 馬体重・増減 (td.Weight: 例 "464(-2)" / "480(+6)")
+        horse_weight: Optional[int] = None
+        weight_diff: Optional[int] = None
+        weight_tag = row.select_one("td.Weight")
+        if weight_tag:
+            w_str = weight_tag.get_text(strip=True)
+            wm = re.search(r"(\d{3})\s*(?:\(([+-]?\d+)\))?", w_str)
+            if wm:
+                horse_weight = int(wm.group(1))
+                weight_diff = int(wm.group(2)) if wm.group(2) is not None else 0
 
         odds_item = odds_map.get(umaban, {})
         odds = odds_item.get("odds")
@@ -1043,13 +1121,22 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
             "odds": odds,
             "popularity": popularity,
             "is_blinker": is_blinker,
-            "is_first_blinker": is_first_blinker
+            "is_first_blinker": is_first_blinker,
+            "horse_weight": horse_weight,
+            "weight_diff": weight_diff,
+            "sex_age": sex_age,
+            "sex_code": sex_code,
+            "age": age
         })
 
     course_meta = {
         "distance": distance,
         "surface_type": surface_type,
-        "condition_code": condition_code
+        "condition_code": condition_code,
+        "turn_type": turn_type,
+        "race_num_int": race_num_int,
+        "race_class_code": race_class_code,
+        "is_female_only_text": is_female_only_text
     }
 
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
@@ -1114,12 +1201,17 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "recommendation": empty_recommendation
         }
 
-    expected_num_features = 25
-    if model:
+    expected_num_features = 48
+    if model_win:
+        try:
+            expected_num_features = model_win.num_feature()
+        except Exception:
+            expected_num_features = 48
+    elif model:
         try:
             expected_num_features = model.num_feature()
         except Exception:
-            expected_num_features = 25
+            expected_num_features = 48
 
     try:
         venue_code = int(race_id[4:6])
@@ -1129,6 +1221,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     distance = course_meta.get("distance", 1600.0)
     surface_type = course_meta.get("surface_type", 0)
     condition_code = course_meta.get("condition_code", 0)
+    turn_type = int(course_meta.get("turn_type", 2 if (venue_code == 4 and surface_type == 0 and int(distance) == 1000) else (1 if venue_code in (4, 5, 7) else 0)))
+    race_num_int = int(course_meta.get("race_num_int", int(race_id[10:12]) if len(race_id) == 12 and race_id[10:12].isdigit() else 6))
 
     course_key = f"{venue_code}_{surface_type}"
 
@@ -1141,6 +1235,15 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     head_count = len(horses)
     kinryo_list = [float(h.get("kinryo", 55.0)) for h in horses]
     mean_kinryo = sum(kinryo_list) / max(head_count, 1)
+    if head_count > 1:
+        kinryo_var = sum((x - mean_kinryo) ** 2 for x in kinryo_list) / (head_count - 1)
+        kinryo_std_in_race = math.sqrt(max(0.0, kinryo_var))
+    else:
+        kinryo_std_in_race = 0.0
+
+    # 牝馬限定戦フラグ (出走表テキスト または 全馬が牝馬)
+    all_female = head_count > 0 and all(int(h.get("sex_code", 0)) == 1 for h in horses)
+    is_female_only = 1 if (course_meta.get("is_female_only_text") or all_female) else 0
 
     today_date = now_jst().date()
 
@@ -1148,6 +1251,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     jc_rates = []
     tc_rates = []
     p1_orders = []
+    career_list = []
+    wins_list = []
 
     for h in horses:
         w = h["wakuban"]
@@ -1161,6 +1266,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         stat = h_stats.get(h_clean)
         if stat:
             career_races = float(stat.get("career_races", 0.0))
+            career_wins = float(stat.get("career_wins", round(career_races * float(stat.get("career_top3_rate", 0.25)) * 0.33)))
             career_top3_rate = float(stat.get("career_top3_rate", 0.25))
             prev1_order = float(stat.get("prev1_order", 99.0))
             prev1_pop = float(stat.get("prev1_pop", 10.0))
@@ -1182,6 +1288,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             # 過去3年出走データなし（新馬など）
             career_races = 0.0
+            career_wins = 0.0
             career_top3_rate = 0.25
             prev1_order = 99.0
             prev1_pop = 10.0
@@ -1189,6 +1296,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             prev2_order = 99.0
             days_since_prev = 999.0
             dist_diff = 0.0
+
+        career_list.append(career_races)
+        wins_list.append(career_wins)
 
         j_clean = re.sub(r"[▲△◇☆\s\u3000]", "", h.get("jockey", ""))
         t_clean = re.sub(r"\[.*?\]|[\s\u3000]", "", h.get("trainer", "") or "")
@@ -1215,6 +1325,26 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 float(head_count), float(rel_umaban), float(kinryo_diff)
             ]
         })
+
+    # レースクラスコードの決定（出走表テキスト優先、不明時はメンバーのキャリア・勝利数から推定）
+    race_class_code = course_meta.get("race_class_code")
+    if race_class_code is None:
+        max_c = max(career_list) if career_list else 0.0
+        max_w = max(wins_list) if wins_list else 0.0
+        sorted_w = sorted(wins_list)
+        q75_w = sorted_w[min(len(sorted_w) - 1, int(len(sorted_w) * 0.75))] if sorted_w else 0.0
+        if max_c == 0:
+            race_class_code = 0
+        elif max_w == 0 and race_num_int <= 6:
+            race_class_code = 1
+        elif q75_w <= 1.0:
+            race_class_code = 2
+        elif q75_w <= 2.0:
+            race_class_code = 3
+        elif q75_w <= 3.0 and not (race_num_int == 11 and max_w >= 4):
+            race_class_code = 4
+        else:
+            race_class_code = 5
 
     j_ranks = rank_min_desc(jc_rates)
     t_ranks = rank_min_desc(tc_rates)
@@ -1270,11 +1400,42 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             prev1_is_closer_val
         ]
 
+        # ★ 馬体重増減・コース回り・レースクラス条件・性齢 (12種)
+        raw_hw = h.get("horse_weight")
+        if raw_hw is not None and float(raw_hw) > 0:
+            hw_val = float(raw_hw)
+        elif stat and stat.get("last_weight") is not None and float(stat.get("last_weight") or 0) > 0:
+            hw_val = float(stat["last_weight"])
+        else:
+            hw_val = 470.0
+
+        raw_wd = h.get("weight_diff")
+        wd_val = float(raw_wd) if raw_wd is not None else 0.0
+        abs_wd_val = abs(wd_val)
+        k_val = float(h.get("kinryo", 55.0))
+        weight_ratio_val = k_val / max(hw_val, 350.0)
+
+        last_turn = int(stat.get("last_turn", turn_type)) if stat and stat.get("last_turn") is not None else turn_type
+        is_turn_change_val = float(1 if (h_career > 0 and turn_type != last_turn) else 0)
+
+        sex_code_val = float(h.get("sex_code", 0))
+        age_val = float(h.get("age", 4.0))
+
+        extra12_feats = [
+            hw_val, wd_val, abs_wd_val, weight_ratio_val,
+            float(turn_type), is_turn_change_val,
+            float(race_num_int), float(race_class_code), float(is_female_only), float(kinryo_std_in_race),
+            sex_code_val, age_val
+        ]
+
         row25 = fd["base_feats"] + [float(j_ranks[idx]), float(t_ranks[idx]), float(p1_ranks[idx])]
         row32 = row25 + new_feats
         row36 = row32 + agari_feats
+        row48 = row36 + extra12_feats
 
-        if expected_num_features == 36:
+        if expected_num_features == 48:
+            feature_rows.append(row48)
+        elif expected_num_features == 36:
             feature_rows.append(row36)
         elif expected_num_features == 32:
             feature_rows.append(row32)
@@ -1283,12 +1444,14 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         elif expected_num_features == 19:
             feature_rows.append(row25[:19])
         else:
-            feature_rows.append(row36[:expected_num_features])
+            feature_rows.append(row48[:expected_num_features])
 
     if model_win and model_top3:
         try:
-            w_scores = model_win.predict(feature_rows)
-            t_scores = model_top3.predict(feature_rows)
+            n_win = model_win.num_feature()
+            n_top3 = model_top3.num_feature()
+            w_scores = model_win.predict([r[:n_win] for r in feature_rows])
+            t_scores = model_top3.predict([r[:n_top3] for r in feature_rows])
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(w_scores[idx]), 4)
                 h["prob_top3"] = round(float(t_scores[idx]), 4)
@@ -1301,7 +1464,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 h["score"] = h["prob_win"]
     elif model:
         try:
-            scores = model.predict(feature_rows)
+            n_mod = model.num_feature()
+            scores = model.predict([r[:n_mod] for r in feature_rows])
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(scores[idx]), 4)
                 h["prob_top3"] = round(float(scores[idx]), 4)
@@ -1375,9 +1539,6 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         recommendation = empty_recommendation
 
     # -------------------------------------------------------------
-    # ★ 馬連・超高配当三連複ハイブリッド推奨ロジック (黒字最適化)
-    # -------------------------------------------------------------
-    # -------------------------------------------------------------
     # ★ 波乱度メタモデル × 動的資金配分・券種切り替え戦略
     # -------------------------------------------------------------
     hybrid_rec: Optional[dict] = None
@@ -1424,19 +1585,22 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             float(o1), float(o2), float(o3), float(o2 / max(o1, 0.5)),
             float(top3_share), float(entropy),
             float(ai_w1), float(ai_w2), float(ai_diff),
-            float(front_runners), float(front_ratio)
+            float(front_runners), float(front_ratio),
+            float(turn_type), float(race_class_code), float(is_female_only), float(kinryo_std_in_race)
         ]
 
         prob_gachi = 0.0
         prob_himo = 0.0
         if model_gachi:
             try:
-                prob_gachi = round(float(model_gachi.predict([race_feat_row])[0]), 4)
+                n_g = model_gachi.num_feature()
+                prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
             except Exception:
                 prob_gachi = 0.0
         if model_himo:
             try:
-                prob_himo = round(float(model_himo.predict([race_feat_row])[0]), 4)
+                n_h = model_himo.num_feature()
+                prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
             except Exception:
                 prob_himo = 0.0
 
