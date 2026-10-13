@@ -1723,7 +1723,7 @@ def compute_hybrid_rec_from_inputs(
         and (o1 < 4.5)
         and (honmei_score >= 0.28)
         and (2.0 <= honmei_odds <= 10.0)
-        and (edge_ratio >= 0.80)
+        and (0.80 <= edge_ratio <= 1.85)
         and (synth_odds >= 2.0)
         and (len(opponents) >= 1)
     )
@@ -1734,15 +1734,20 @@ def compute_hybrid_rec_from_inputs(
     )
 
     # ------------------------------------------------------------------
-    # ★ 2. 三連複 2頭軸・期待値上位流し（5点＝500円）の構築・参戦判定
+    # ★ 2. 三連複 2頭軸・本線保護＋期待値ハイブリッド流し（5点＝500円）の構築・参戦判定
     #    - 軸1頭目: 純粋な3着内好走確率 (prob_top3) 1位
     #    - 軸2頭目: 残りから バランス型複勝EV = (prob_top3^0.75) * (想定複勝オッズ^0.25) 1位
-    #    - 3頭目ヒモ: 残りから 複勝期待値 = prob_top3 * 想定複勝オッズ 上位6頭 (軸2を除き最大5点×100円)
-    #    - 参戦条件T2: 1番人気>=2.2倍 かつ 軸1好走確率>=0.50 かつ 軸2単勝オッズ 5.0〜20.0倍
+    #    - 3頭目ヒモ(5頭: fav_p2_post3):
+    #        [枠1〜2: 本線・1番人気保護枠] 1番人気馬(軸外時) ＋ 純粋好走率(prob_top3)上位で計2頭
+    #        [枠3〜5: 高期待値穴枠] 単勝90倍以下から複勝期待値(prob_top3*想定複勝オッズ)上位3頭
+    #    - 開催安定化・3段階参戦条件:
+    #        ① W勝負時(馬連実戦推奨合致): 軸1好走率>=0.50 & 軸2単勝 4.5〜18.0倍
+    #        ② 単独標準戦(1番人気>=2.2倍): 軸1好走率>=0.50 & 軸2好走率>=0.36 & 軸2単勝 5.8〜17.5倍
+    #        ③ 単独堅軸2強戦(1番人気1.4〜2.1倍): 軸1好走率>=0.60 & 軸2好走率>=0.58 & 軸2単勝 5.8〜12.0倍
     # ------------------------------------------------------------------
     trio_bets_list = []
     t_u1, t_u2 = 0, 0
-    t_s1, t_o1, t_o2 = 0.0, 0.0, 0.0
+    t_s1, t_s2, t_o1, t_o2 = 0.0, 0.0, 0.0, 0.0
     t_m1, t_m2 = "-", "-"
 
     if len(horses) >= 6:
@@ -1764,6 +1769,10 @@ def compute_hybrid_rec_from_inputs(
                 "score_balanced_ev": (max(p_t3, 0.0) ** 0.75) * (fuku_est ** 0.25)
             })
 
+        cand_by_u = {x["umaban"]: x for x in trio_cands}
+        fav1_cand = min(trio_cands, key=lambda x: x["odds"])
+        fav1_u = fav1_cand["umaban"]
+
         by_pure = sorted(trio_cands, key=lambda x: x["score_pure_top3"], reverse=True)
         ax1 = by_pure[0]
         t_u1 = ax1["umaban"]
@@ -1775,17 +1784,42 @@ def compute_hybrid_rec_from_inputs(
         by_bal = sorted(rem_cands, key=lambda x: x["score_balanced_ev"], reverse=True)
         ax2 = by_bal[0]
         t_u2 = ax2["umaban"]
+        t_s2 = ax2["score_pure_top3"]
         t_o2 = ax2["odds"]
         t_m2 = ax2["mark"] if ax2["mark"] != "-" else "軸2"
 
         by_post = sorted(rem_cands, key=lambda x: x["score_post_ev"], reverse=True)
-        top6_third = by_post[:6]
-        third_horses = [x for x in top6_third if x["umaban"] != t_u2][:5]
 
-        for th in third_horses:
+        # 3頭目ヒモ選定 (fav_p2_post3: 本線・1番人気保護2頭 ＋ 90倍以下EV上位3頭 ＝ 計5頭)
+        third_u_list = []
+        if fav1_u not in (t_u1, t_u2):
+            third_u_list.append(fav1_u)
+        for x in by_pure:
+            if len(third_u_list) >= 2:
+                break
+            xu = x["umaban"]
+            if xu not in (t_u1, t_u2) and xu not in third_u_list:
+                third_u_list.append(xu)
+        for x in by_post:
+            if len(third_u_list) >= 5:
+                break
+            xu = x["umaban"]
+            if xu not in (t_u1, t_u2) and xu not in third_u_list and x["odds"] <= 90.0:
+                third_u_list.append(xu)
+        for x in by_post:
+            if len(third_u_list) >= 5:
+                break
+            xu = x["umaban"]
+            if xu not in (t_u1, t_u2) and xu not in third_u_list:
+                third_u_list.append(xu)
+
+        third_horses = [cand_by_u[xu] for xu in third_u_list[:5] if xu in cand_by_u]
+
+        for idx_th, th in enumerate(third_horses):
             u3 = th["umaban"]
             o3 = th["odds"]
-            m3 = th["mark"] if th["mark"] != "-" else "穴"
+            role_tag = "本線" if idx_th < 2 else "妙味"
+            m3 = th["mark"] if th["mark"] != "-" else role_tag
             comb = sorted([t_u1, t_u2, u3])
             comb_str = f"{comb[0]}-{comb[1]}-{comb[2]}"
             est_trio_odds = calc_trio_odds(t_o1, t_o2, o3)
@@ -1801,14 +1835,16 @@ def compute_hybrid_rec_from_inputs(
                 "memo": f"2頭軸[{t_u1}({t_m1})={t_u2}({t_m2})]→{u3}番({m3}:単{o3}倍) 100円 / 想定{est_trio_odds}倍"
             })
 
+    is_trio_w_ok = is_real_sweet_spot and (t_s1 >= 0.50) and (4.5 <= t_o2 <= 18.0)
+    is_trio_std_alone = (not is_real_sweet_spot) and (o1 >= 2.2) and (t_s1 >= 0.50) and (t_s2 >= 0.36) and (5.8 <= t_o2 <= 17.5)
+    is_trio_strong_duo = (not is_real_sweet_spot) and (1.4 <= o1 < 2.2) and (t_s1 >= 0.60) and (t_s2 >= 0.58) and (5.8 <= t_o2 <= 12.0)
+
     is_trio_target = (
         not is_shinba
         and (surface_type != 2)
         and (len(horses) >= 6)
-        and (o1 >= 2.2)
-        and (t_s1 >= 0.50)
-        and (5.0 <= t_o2 <= 20.0)
         and (len(trio_bets_list) >= 1)
+        and (is_trio_w_ok or is_trio_std_alone or is_trio_strong_duo)
     )
 
     # ------------------------------------------------------------------
@@ -1883,7 +1919,7 @@ def compute_hybrid_rec_from_inputs(
         )
         reason_str = (
             f"馬連＆三連複W好機合致（◎指数{honmei_score:.2f}・エッジ{edge_ratio} / "
-            f"三連複軸1:{t_u1}番[好走率{t_s1:.2f}]×妙味軸2:{t_u2}番[単{t_o2}倍]）"
+            f"三連複軸1:{t_u1}番[好走率{t_s1:.2f}]×妙味軸2:{t_u2}番[好走率{t_s2:.2f}・単{t_o2}倍]→本線保護＋EV流し）"
         )
         tot_exp = (umaren_bets[0].get("expected_payout", 0) if umaren_bets else 0) + (active_trio_bets[0].get("expected_payout", 0) if active_trio_bets else 0)
         hybrid_rec = {
@@ -1927,14 +1963,15 @@ def compute_hybrid_rec_from_inputs(
         # パターンC: 【三連複単独】(500円)
         third_nums_str = ",".join(str(b["combination"][0] if b["combination"][0] not in (t_u1, t_u2) else (b["combination"][1] if b["combination"][1] not in (t_u1, t_u2) else b["combination"][2])) for b in active_trio_bets)
         s_type = "trio_only"
-        s_name = f"【実戦推奨】三連複2頭軸・EV上位流し ({t_tot_amt}円)"
+        s_name = f"【実戦推奨】三連複2頭軸・本線保護＋EV流し ({t_tot_amt}円)"
         summary_str = (
             f"【実戦推奨】三連複2頭軸流し({t_tot_amt}円) "
             f"[軸{t_u1}番({t_m1})・{t_u2}番({t_m2}) → {third_nums_str}番 各100円]"
         )
+        trio_tier_label = "堅軸2強厳選" if is_trio_strong_duo else "厳選高期待値"
         reason_str = (
-            f"三連複高期待値条件合致（軸1:{t_u1}番[好走確率{t_s1:.2f}] × "
-            f"妙味軸2:{t_u2}番[単{t_o2}倍] → 複勝EV上位{len(active_trio_bets)}頭流し）"
+            f"三連複{trio_tier_label}条件合致（軸1:{t_u1}番[好走率{t_s1:.2f}] × "
+            f"妙味軸2:{t_u2}番[好走率{t_s2:.2f}・単{t_o2}倍] → 本線2頭＋複勝EV上位3頭流し）"
         )
         tot_exp = active_trio_bets[0].get("expected_payout", 0) if active_trio_bets else 0
         hybrid_rec = {
@@ -1975,6 +2012,8 @@ def compute_hybrid_rec_from_inputs(
             reason_detail.append(f"◎人気薄リスク回避（単勝:{honmei_odds}倍 > 10.0倍）")
         elif edge_ratio < 0.80:
             reason_detail.append(f"◎期待値不足（エッジ:{edge_ratio} < 0.80）")
+        elif edge_ratio > 1.85:
+            reason_detail.append(f"◎穴振れ過大リスク回避（エッジ:{edge_ratio} > 1.85）")
         else:
             reason_detail.append("期待値基準外")
         reason_str = " / ".join(reason_detail)
