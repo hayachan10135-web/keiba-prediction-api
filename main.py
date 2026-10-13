@@ -327,6 +327,13 @@ class DailySummary(BaseModel):
     cumulative_profit: Optional[int] = 0
     cumulative_recovery_rate: Optional[float] = 0.0
     cumulative_pass_benefit: Optional[int] = 0
+    cumulative_real_bet_races: Optional[int] = 0
+    cumulative_real_bet_hits: Optional[int] = 0
+    cumulative_real_bet_hit_rate: Optional[float] = 0.0
+    cumulative_real_bet_amount: Optional[int] = 0
+    cumulative_real_bet_payout: Optional[int] = 0
+    cumulative_real_bet_profit: Optional[int] = 0
+    cumulative_real_bet_recovery_rate: Optional[float] = 0.0
 
 class BatchStartResponse(BaseModel):
     status: str
@@ -1707,22 +1714,38 @@ def compute_hybrid_rec_from_inputs(
     # ① 新馬・障害・少頭数(<5)・超混戦(1番人気>=5.0倍)を除外
     # ② ◎のAI勝率スコア >= 0.28 かつ 単勝オッズ 2.0〜10.0倍 (過剰人気・勝率0%の大穴バイアスを除外)
     # ③ ◎の期待値エッジ >= 0.80 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
+    # 【第1段階：全参加レース基準 (is_participate = True)】
+    # ① 新馬・障害・少頭数(<5)・超混戦(1番人気>=5.0倍)を除外
+    # ② ◎のAI勝率スコア >= 0.22 かつ 単勝オッズ 1.8〜15.0倍
+    # ③ ◎の期待値エッジ >= 0.70 かつ 馬連3点の合成オッズ >= 2.0倍 (トリガミ完全回避)
     is_valid_target = (
         not is_shinba
         and (surface_type != 2)
         and (len(horses) >= 5)
         and (o1 < 5.0)
-        and (honmei_score >= 0.28)
-        and (2.0 <= honmei_odds <= 10.0)
-        and (edge_ratio >= 0.80)
+        and (honmei_score >= 0.22)
+        and (1.8 <= honmei_odds <= 15.0)
+        and (edge_ratio >= 0.70)
         and (synth_odds >= 2.0)
         and (len(opponents) >= 1)
+    )
+
+    # 【第2段階：実戦推奨レース基準 (is_real_bet_target = True)】
+    # 全参加レースの中でも、特にAI確信度・オッズ帯・期待値エッジのスイートスポットに合致した厳選勝負レース
+    is_real_sweet_spot = (
+        is_valid_target
+        and (o1 < 4.5)
+        and (honmei_score >= 0.28)
+        and (2.0 <= honmei_odds <= 9.5)
+        and (0.90 <= edge_ratio <= 1.80)
+        and (synth_odds >= 2.2)
     )
 
     if is_valid_target:
         odds_arr = [opp_odds for _, opp_odds, _, _ in opponents]
         min_u = min((x for x in odds_arr if x > 0), default=0.0)
         max_u = max(odds_arr, default=0.0)
+        tier_prefix = "【実戦推奨】" if is_real_sweet_spot else "【標準参加】"
 
         # トリガミ防止 600円スマート配分:
         # 最小オッズが4.0倍未満 かつ 最大オッズが12.0倍以上の場合は、低オッズ順に 300円 / 200円 / 100円 を配分しトリガミを完全防止
@@ -1733,10 +1756,14 @@ def compute_hybrid_rec_from_inputs(
             amounts[sorted_idx[1]] = 200
             amounts[sorted_idx[2]] = 100
             s_type = "gachi"
-            s_name = "本命傾斜配分 (トリガミ防止600円)"
+            s_name = f"{tier_prefix}本命傾斜配分 (トリガミ防止600円)"
             memo_prefix = "本命傾斜"
-            summary_str = f"参戦推奨: 馬連傾斜配分(600円) [本命300円+中穴200円+穴100円 / 合成{synth_odds}倍]"
-            reason_str = f"厳選基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・合成{synth_odds}倍 / トリガミ防止配分）"
+            summary_str = f"{tier_prefix}馬連傾斜配分(600円) [本命300円+中穴200円+穴100円 / 合成{synth_odds}倍]"
+            reason_str = (
+                f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
+                if is_real_sweet_spot else
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍 / 実戦推奨選外）"
+            )
         else:
             if len(opponents) >= 3:
                 amounts = [200, 200, 200]
@@ -1745,10 +1772,14 @@ def compute_hybrid_rec_from_inputs(
             else:
                 amounts = [600]
             s_type = "himo"
-            s_name = "混戦妙味戦 (馬連均等配分)"
+            s_name = f"{tier_prefix}混戦妙味戦 (馬連均等配分)"
             memo_prefix = "混戦均等"
-            summary_str = f"参戦推奨: 馬連均等配分(600円) [◎から◯▲△ 各200円 / 合成{synth_odds}倍]"
-            reason_str = f"厳選基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・合成{synth_odds}倍 / 均等配分）"
+            summary_str = f"{tier_prefix}馬連均等配分(600円) [◎から◯▲△ 各200円 / 合成{synth_odds}倍]"
+            reason_str = (
+                f"実戦推奨スイートスポット合致（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍）"
+                if is_real_sweet_spot else
+                f"標準参加基準クリア（◎指数{honmei_score:.2f}・単{honmei_odds}倍・エッジ{edge_ratio}・合成{synth_odds}倍 / 実戦推奨選外）"
+            )
 
         umaren_bets = []
         for (opp_u, opp_odds, opp_real, opp_mark), amt in zip(opponents, amounts):
@@ -1793,14 +1824,14 @@ def compute_hybrid_rec_from_inputs(
             reason_detail.append(f"超混戦大荒れ懸念（1番人気:{o1}倍）")
         elif synth_odds > 0 and synth_odds < 2.0:
             reason_detail.append(f"トリガミ回避（馬連合成オッズ:{synth_odds}倍 < 2.0倍）")
-        elif honmei_score < 0.28:
-            reason_detail.append(f"◎AI信頼度不足（指数:{honmei_score:.2f} < 0.28）")
-        elif honmei_odds < 2.0:
+        elif honmei_score < 0.22:
+            reason_detail.append(f"◎AI信頼度不足（指数:{honmei_score:.2f} < 0.22）")
+        elif honmei_odds < 1.8:
             reason_detail.append(f"◎過剰人気・妙味薄（単勝:{honmei_odds}倍）")
-        elif honmei_odds > 10.0:
-            reason_detail.append(f"◎人気薄リスク回避（単勝:{honmei_odds}倍 > 10.0倍）")
-        elif edge_ratio < 0.80:
-            reason_detail.append(f"◎期待値不足（エッジ:{edge_ratio} < 0.80）")
+        elif honmei_odds > 15.0:
+            reason_detail.append(f"◎人気薄リスク回避（単勝:{honmei_odds}倍 > 15.0倍）")
+        elif edge_ratio < 0.70:
+            reason_detail.append(f"◎期待値不足（エッジ:{edge_ratio} < 0.70）")
         else:
             reason_detail.append("期待値基準外")
         reason_str = " / ".join(reason_detail)
@@ -1837,13 +1868,12 @@ def compute_hybrid_rec_from_inputs(
             except Exception:
                 pass
 
-    is_part = hybrid_rec.get("is_participate", False)
-    is_real_bet_target = bool(is_part)
+    is_real_bet_target = bool(is_real_sweet_spot)
     real_bet_badge = None
     real_bet_level = "none"
     if is_real_bet_target:
         suffix = " (確定)" if is_final_odds else " (暫定)"
-        if edge_ratio >= 1.30:
+        if edge_ratio >= 1.25:
             real_bet_badge = f"🚀 超勝負R{suffix}"
             real_bet_level = "high"
         else:
@@ -2867,7 +2897,8 @@ def process_settlement_calculation(
         "umaren_payout": umaren_payout,
         "trio_payout": trio_payout,
         "mark_orders": mark_orders,
-        "top3_orders": top3_orders
+        "top3_orders": top3_orders,
+        "is_real_bet_target": bool(hybrid_rec.get("is_real_bet_target", False))
     }
 
 
@@ -3150,11 +3181,18 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     cum_profit = 0
     cum_recovery_rate = 0.0
     cum_pass_benefit = 0
+    cum_rb_races = 0
+    cum_rb_hits = 0
+    cum_rb_hit_rate = 0.0
+    cum_rb_amount = 0
+    cum_rb_payout = 0
+    cum_rb_profit = 0
+    cum_rb_recovery_rate = 0.0
 
     if supabase:
         try:
             cum_res = supabase.table("keiba_race_settlements").select(
-                "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit"
+                "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
             ).execute()
             cum_rows = cum_res.data or []
             cum_days = len(set(cr.get("race_date") for cr in cum_rows if cr.get("race_date")))
@@ -3168,6 +3206,20 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             cum_recovery_rate = round((cum_payout_amount / cum_bet_amount) * 100.0, 2) if cum_bet_amount > 0 else 0.0
             cum_hit_rate = round((cum_hit_races / cum_bet_races) * 100.0, 2) if cum_bet_races > 0 else 0.0
             cum_pass_benefit = sum((cr.get("pass_benefit") or 0) for cr in cum_rows if cr.get("is_pass") == 1)
+
+            for cr in cum_rows:
+                if cr.get("is_pass") == 0:
+                    bd = cr.get("bet_details") if isinstance(cr.get("bet_details"), dict) else {}
+                    rbm = bd.get("real_bet_meta") or {}
+                    if rbm.get("is_real_bet_target"):
+                        cum_rb_races += 1
+                        if cr.get("is_hit") == 1:
+                            cum_rb_hits += 1
+                        cum_rb_amount += (cr.get("total_bet") or 0)
+                        cum_rb_payout += (cr.get("total_payout") or 0)
+            cum_rb_profit = cum_rb_payout - cum_rb_amount
+            cum_rb_recovery_rate = round((cum_rb_payout / cum_rb_amount) * 100.0, 2) if cum_rb_amount > 0 else 0.0
+            cum_rb_hit_rate = round((cum_rb_hits / cum_rb_races) * 100.0, 2) if cum_rb_races > 0 else 0.0
         except Exception as e:
             print(f"Supabase累計サマリー取得エラー: {e}")
 
@@ -3212,7 +3264,14 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "cumulative_payout_amount": cum_payout_amount,
         "cumulative_profit": cum_profit,
         "cumulative_recovery_rate": cum_recovery_rate,
-        "cumulative_pass_benefit": cum_pass_benefit
+        "cumulative_pass_benefit": cum_pass_benefit,
+        "cumulative_real_bet_races": cum_rb_races,
+        "cumulative_real_bet_hits": cum_rb_hits,
+        "cumulative_real_bet_hit_rate": cum_rb_hit_rate,
+        "cumulative_real_bet_amount": cum_rb_amount,
+        "cumulative_real_bet_payout": cum_rb_payout,
+        "cumulative_real_bet_profit": cum_rb_profit,
+        "cumulative_real_bet_recovery_rate": cum_rb_recovery_rate
     }
 
 
@@ -3421,6 +3480,9 @@ def recalculate_period_records():
     total_bet_sum = 0
     total_pay_sum = 0
     total_pass_benefit = 0
+    rb_count = 0
+    rb_bet_sum = 0
+    rb_pay_sum = 0
 
     for row in preds_list:
         rid = row["race_id"]
@@ -3512,11 +3574,16 @@ def recalculate_period_records():
                 participating_count += 1
                 total_bet_sum += st_res.get("total_bet", 0)
                 total_pay_sum += st_res.get("total_payout", 0)
+                if st_res.get("is_real_bet_target"):
+                    rb_count += 1
+                    rb_bet_sum += st_res.get("total_bet", 0)
+                    rb_pay_sum += st_res.get("total_payout", 0)
             else:
                 total_pass_benefit += (st_res.get("pass_benefit") or 0)
 
     _period_venues_cache.clear()
     roi = round((total_pay_sum / total_bet_sum) * 100.0, 2) if total_bet_sum > 0 else 0.0
+    rb_roi = round((rb_pay_sum / rb_bet_sum) * 100.0, 2) if rb_bet_sum > 0 else 0.0
     return {
         "status": "ok",
         "updated_predictions": updated_preds,
@@ -3526,6 +3593,11 @@ def recalculate_period_records():
         "total_payout": total_pay_sum,
         "profit": total_pay_sum - total_bet_sum,
         "recovery_rate": roi,
+        "real_bet_races": rb_count,
+        "real_bet_bet": rb_bet_sum,
+        "real_bet_payout": rb_pay_sum,
+        "real_bet_profit": rb_pay_sum - rb_bet_sum,
+        "real_bet_recovery_rate": rb_roi,
         "pass_benefit_total": total_pass_benefit
     }
 
