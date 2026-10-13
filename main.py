@@ -3083,8 +3083,9 @@ def process_settlement_calculation(
         except Exception:
             pass
 
-    # 実戦推奨レースの結果確定プッシュ通知 (新規確定時のみ)
-    if not from_cache and hybrid_rec.get("is_real_bet_target"):
+    # 実戦推奨レースの結果確定プッシュ通知 (当日開催の新規確定時のみ配信し、過去日の一括再検証時は通知を抑止)
+    is_today_race = (race_date == today_jst_str())
+    if not from_cache and is_today_race and hybrid_rec.get("is_real_bet_target"):
         try:
             if is_hit:
                 send_fcm_notification(
@@ -4479,5 +4480,4 @@ async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
     normalize_mislabeled_dates()
-    asyncio.create_task(background_sync_1003_1004_task())
     asyncio.create_task(background_maintenance_loop())
