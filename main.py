@@ -3139,19 +3139,51 @@ def process_settlement_calculation(
 
 
 def resolve_race_date_for_id(race_id: str) -> str:
-    """レースIDに対応する正確な開催日 (YYYY-MM-DD) をキャッシュ・DBから逆引き"""
+    """レースIDに対応する正確な開催日 (YYYY-MM-DD) をキャッシュ・DB・netkeibaから逆引き"""
     for d_cached, v_list in _period_venues_cache.items():
         for v in v_list:
             if any(r.get("race_id") == race_id for r in v.get("races", [])):
                 return d_cached
+
+    # 2026年4回東京(05)・京都(08)開催の確定日程マッピング
+    if len(race_id) == 12 and race_id.startswith("2026"):
+        day_code = race_id[6:10]
+        if day_code == "0401":
+            return "2026-10-03"
+        elif day_code == "0402":
+            return "2026-10-04"
+        elif day_code == "0403":
+            return "2026-10-10"
+        elif day_code == "0404":
+            return "2026-10-11"
+        elif day_code == "0405":
+            return "2026-10-12"
+
     if supabase:
         for tbl in ("keiba_scheduled_races", "keiba_predictions_cache", "keiba_race_settlements"):
             try:
                 res = supabase.table(tbl).select("race_date").eq("race_id", race_id).execute()
                 if res.data and len(res.data) > 0 and res.data[0].get("race_date"):
-                    return res.data[0]["race_date"]
+                    r_date = res.data[0]["race_date"]
+                    if r_date and r_date != today_jst_str():
+                        return r_date
             except Exception:
                 pass
+
+    # netkeibaのHTMLから正確な開催年月日を抽出
+    try:
+        url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+        resp = requests.get(url, headers=HEADERS_PC, timeout=5)
+        try:
+            html = resp.content.decode("euc-jp")
+        except UnicodeDecodeError:
+            html = resp.text
+        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", html)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    except Exception:
+        pass
+
     return today_jst_str()
 
 
@@ -4289,8 +4321,55 @@ def endpoint_fix_20261011():
     return fix_mislabeled_20261011_races()
 
 
+def normalize_mislabeled_dates():
+    """2026-10-13等のフォールバック日で誤保存された過去レースを正規の開催日 (2026-10-03, 2026-10-04) へ修正"""
+    if not supabase:
+        print("[NormalizeDates] Supabase未接続のためスキップします。")
+        return {"status": "skipped", "message": "Supabase not connected"}
+
+    migrated_settlements = 0
+    migrated_results = 0
+    migrated_predictions = 0
+
+    try:
+        res_s = supabase.table("keiba_race_settlements").select("race_id, race_date").eq("race_date", "2026-10-13").execute()
+        rows_s = res_s.data or []
+        for row in rows_s:
+            r_id = row.get("race_id", "")
+            correct_date = resolve_race_date_for_id(r_id)
+
+            if correct_date and correct_date != "2026-10-13":
+                supabase.table("keiba_race_settlements").update({"race_date": correct_date}).eq("race_id", r_id).execute()
+                migrated_settlements += 1
+
+                try:
+                    supabase.table("keiba_race_results_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
+                    migrated_results += 1
+                except Exception:
+                    pass
+                try:
+                    supabase.table("keiba_predictions_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
+                    migrated_predictions += 1
+                except Exception:
+                    pass
+
+        msg = f"日付正規化完了: settlements={migrated_settlements}件, results={migrated_results}件, predictions={migrated_predictions}件"
+        print(f"[NormalizeDates] {msg}")
+        return {"status": "ok", "message": msg}
+    except Exception as e:
+        err_msg = f"[NormalizeDates] 修正処理エラー: {e}"
+        print(err_msg)
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/normalize-dates")
+def endpoint_normalize_dates():
+    return normalize_mislabeled_dates()
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
+    normalize_mislabeled_dates()
     asyncio.create_task(background_maintenance_loop())
