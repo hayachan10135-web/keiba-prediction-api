@@ -4471,6 +4471,11 @@ def endpoint_process_0926_0927():
     return sync_and_process_0926_0927()
 
 
+@app.post("/admin/process-date")
+def endpoint_process_date(date: str = Query(..., description="対象日付 (YYYY-MM-DD)")):
+    return sync_and_process_target_dates([date])
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
