@@ -306,6 +306,7 @@ class VerificationResult(BaseModel):
     trio_payout: Optional[int] = 0
     mark_orders: Optional[List[dict]] = None
     top3_orders: Optional[List[dict]] = None
+    target_popularity: Optional[int] = None
 
 class DailySummary(BaseModel):
     target_date: str
@@ -2318,7 +2319,8 @@ def extract_mark_orders(pred_data: Optional[dict], orders: Optional[dict]) -> Li
                 "umaban": u,
                 "horse_name": name,
                 "order": ord_num if (ord_num and ord_num < 90) else None,
-                "order_text": ord_text
+                "order_text": ord_text,
+                "popularity": h.get("popularity")
             })
     return found
 
@@ -3409,6 +3411,22 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             c_res = res_cache_map.get(r["race_id"], {})
             if not r.get("mark_orders"):
                 r["mark_orders"] = extract_mark_orders(p_data, c_res.get("orders", {})) if (p_data and c_res) else rb_meta.get("mark_orders")
+
+        # 本命馬の人気 (popularity) および mark_orders の人気情報を補完
+        h_horses = p_data.get("horses", []) if p_data else []
+        h_pop_map = {int(h["umaban"]): h.get("popularity") for h in h_horses if "umaban" in h and h.get("popularity") is not None}
+        target_u = r.get("target_umaban")
+        if target_u and int(target_u) in h_pop_map:
+            r["target_popularity"] = h_pop_map[int(target_u)]
+        else:
+            h0 = next((h for h in h_horses if h.get("mark") == "◎"), None)
+            if h0 and h0.get("popularity") is not None:
+                r["target_popularity"] = h0.get("popularity")
+
+        if r.get("mark_orders") and h_pop_map:
+            for mo in r["mark_orders"]:
+                if mo.get("popularity") is None and mo.get("umaban") in h_pop_map:
+                    mo["popularity"] = h_pop_map[mo["umaban"]]
         # Android (Gson) は bet_breakdown / payout_breakdown に Map<String, Int> を要求するため、
         # 文字列等の不正形式の場合は必ず dict に正規化してクラッシュを防ぐ
         if not isinstance(r.get("bet_breakdown"), dict):
