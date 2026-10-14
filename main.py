@@ -3417,6 +3417,31 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             if not r.get("mark_orders"):
                 r["mark_orders"] = extract_mark_orders(p_data, c_res.get("orders", {})) if (p_data and c_res) else rb_meta.get("mark_orders")
 
+        # mark_orders を Android (Gson) の期待する List[dict] に正規化
+        if isinstance(r.get("mark_orders"), dict):
+            converted = []
+            h_mark_map = {h.get("mark"): h for h in (p_data.get("horses", []) if p_data else [])}
+            for m_key, o_val in r["mark_orders"].items():
+                matched_h = h_mark_map.get(m_key, {})
+                ord_int = int(o_val) if (o_val is not None and str(o_val).isdigit()) else None
+                converted.append({
+                    "mark": str(m_key),
+                    "umaban": matched_h.get("umaban"),
+                    "horse_name": matched_h.get("horse_name", f"馬{matched_h.get('umaban', '')}"),
+                    "order": ord_int,
+                    "order_text": f"{ord_int}着" if ord_int is not None else "着外",
+                    "popularity": matched_h.get("popularity")
+                })
+            r["mark_orders"] = converted
+        elif not isinstance(r.get("mark_orders"), list):
+            r["mark_orders"] = []
+
+        # top3_orders も List[Top3OrderInfo] (List[dict]) に正規化
+        if isinstance(r.get("top3_orders"), list) and r["top3_orders"] and not isinstance(r["top3_orders"][0], dict):
+            r["top3_orders"] = []
+        elif not isinstance(r.get("top3_orders"), list):
+            r["top3_orders"] = []
+
         # 本命馬の人気 (popularity) および mark_orders の人気情報を補完
         h_horses = p_data.get("horses", []) if p_data else []
         h_pop_map = {int(h["umaban"]): h.get("popularity") for h in h_horses if "umaban" in h and h.get("popularity") is not None}
