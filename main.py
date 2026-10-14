@@ -2732,6 +2732,10 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         "tierce": {}
     }
     race_name = f"Race {race_id}"
+    sp_html_text = ""
+    pc_html_text = ""
+    sp_title = ""
+    pc_title = ""
 
     # SP版スクレイピング試行
     sp_url = f"https://race.sp.netkeiba.com/race/result.html?race_id={race_id}"
@@ -2741,7 +2745,9 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
             html = resp.content.decode("euc-jp")
         except UnicodeDecodeError:
             html = resp.content.decode("utf-8", errors="replace")
+        sp_html_text = html
         soup = BeautifulSoup(html, "html.parser")
+        sp_title = soup.title.get_text(strip=True) if soup.title else ""
 
         r_title = soup.select_one(".RaceName, h1, .Race_Title")
         if r_title:
@@ -2809,7 +2815,9 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
                 html = resp.content.decode("euc-jp")
             except UnicodeDecodeError:
                 html = resp.content.decode("utf-8", errors="replace")
+            pc_html_text = html
             soup = BeautifulSoup(html, "html.parser")
+            pc_title = soup.title.get_text(strip=True) if soup.title else ""
 
             r_title = soup.select_one(".RaceName, h1")
             if r_title and not race_name:
@@ -2921,13 +2929,32 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         for winner_u in payouts["tansho"].keys():
             orders[winner_u] = 1
 
+    # レース中止・取りやめ判定 (荒天・積雪・不成立等)
+    all_html = sp_html_text + " " + pc_html_text
+    is_cancelled = False
+    if not is_confirmed:
+        cancel_kws = ["開催中止", "競走取りやめ", "レース取りやめ", "開催取りやめ", "不成立", "天候調査"]
+        has_cancel_kw = any(kw in all_html for kw in cancel_kws)
+        empty_title = (sp_title.startswith("|") or pc_title.startswith("|") or (not sp_title and not pc_title))
+        if has_cancel_kw or (empty_title and len(orders) == 0):
+            is_cancelled = True
+
+    if is_cancelled:
+        return {
+            "race_name": race_name,
+            "orders": {},
+            "payouts": payouts,
+            "is_cancelled": True
+        }
+
     if not is_confirmed:
         return None
 
     return normalize_race_res({
         "race_name": race_name,
         "orders": orders,
-        "payouts": payouts
+        "payouts": payouts,
+        "is_cancelled": False
     })
 
 
@@ -2939,6 +2966,87 @@ def process_settlement_calculation(
     race_res: dict,
     from_cache: bool = False
 ) -> dict:
+    # 開催中止・取りやめレースの全額返還処理 (投資0円・払戻0円・見送り扱い)
+    if race_res.get("is_cancelled"):
+        settlement = {
+            "race_id": race_id,
+            "race_date": race_date,
+            "race_name": race_name,
+            "strategy_type": "cancelled",
+            "target_umaban": None,
+            "horse_name": None,
+            "grade": "C",
+            "is_pass": True,
+            "umaren_bet": 0,
+            "trio_bet": 0,
+            "total_bet": 0,
+            "actual_order": None,
+            "umaren_payout": 0,
+            "trio_payout": 0,
+            "total_payout": 0,
+            "is_hit": False,
+            "hit_type": "開催中止",
+            "hypothetical_bet": 0,
+            "hypothetical_payout": 0,
+            "pass_benefit": 0,
+            "bet_breakdown": {},
+            "payout_breakdown": {},
+            "bet_details": {
+                "real_bet_meta": {
+                    "is_real_bet_target": False,
+                    "real_bet_badge": "⛔【開催中止】全額返還",
+                    "real_bet_level": "none",
+                    "mark_orders": [],
+                    "top3_orders": []
+                }
+            },
+            "payout_details": None,
+            "tansho_bet": 0,
+            "fukusho_bet": 0,
+            "tansho_payout": 0,
+            "fukusho_payout": 0,
+            "mark_orders": [],
+            "top3_orders": []
+        }
+        save_settlement(settlement)
+        if supabase:
+            try:
+                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+            except Exception:
+                pass
+
+        return {
+            "race_id": race_id,
+            "race_name": race_name,
+            "is_pass": True,
+            "grade": "C",
+            "target_umaban": None,
+            "horse_name": None,
+            "actual_order": None,
+            "is_hit": False,
+            "total_bet": 0,
+            "total_payout": 0,
+            "profit": 0,
+            "recovery_rate": 0.0,
+            "from_cache": from_cache,
+            "message": "【開催中止】積雪・荒天等のためレース取りやめ（馬券全額返還 / 投資0円・払戻0円）。",
+            "hypothetical_bet": 0,
+            "hypothetical_payout": 0,
+            "pass_benefit": 0,
+            "strategy_type": "cancelled",
+            "hit_type": "開催中止",
+            "bet_breakdown": {},
+            "payout_breakdown": {},
+            "bet_details": None,
+            "payout_details": None,
+            "umaren_bet": 0,
+            "trio_bet": 0,
+            "umaren_payout": 0,
+            "trio_payout": 0,
+            "mark_orders": [],
+            "top3_orders": []
+        }
+
     rec = pred_data.get("recommendation", {})
     hybrid_rec = pred_data.get("hybrid_recommendation")
 
@@ -4621,6 +4729,82 @@ def endpoint_fix_20261011():
     return fix_mislabeled_20261011_races()
 
 
+def fix_cancelled_races_2026():
+    """2026年の中止レース（2/7 東京8-12R、2/8 小倉4R等）を正規の開催中止（返還・投資0/払戻0/不参戦）に是正"""
+    if not supabase:
+        print("[FixCancelled] Supabase未接続")
+        return {"status": "skipped", "message": "Supabase not connected"}
+
+    target_race_ids = [
+        "202605010308",  # 2026-02-07 東京8R (積雪中止)
+        "202605010309",  # 2026-02-07 東京9R (積雪中止)
+        "202605010310",  # 2026-02-07 東京10R (積雪中止)
+        "202605010311",  # 2026-02-07 東京11R (積雪中止)
+        "202605010312",  # 2026-02-07 東京12R (積雪中止)
+        "202610010604",  # 2026-02-08 小倉4R (中止)
+    ]
+
+    updated_count = 0
+    try:
+        for r_id in target_race_ids:
+            row_data = {
+                "strategy_type": "cancelled",
+                "target_umaban": None,
+                "horse_name": None,
+                "grade": "C",
+                "is_pass": 1,
+                "umaren_bet": 0,
+                "trio_bet": 0,
+                "total_bet": 0,
+                "actual_order": None,
+                "umaren_payout": 0,
+                "trio_payout": 0,
+                "total_payout": 0,
+                "is_hit": 0,
+                "hit_type": "開催中止",
+                "hypothetical_bet": 0,
+                "hypothetical_payout": 0,
+                "pass_benefit": 0,
+                "bet_breakdown": {},
+                "payout_breakdown": {},
+                "bet_details": {
+                    "real_bet_meta": {
+                        "is_real_bet_target": False,
+                        "real_bet_badge": "⛔【開催中止】全額返還",
+                        "real_bet_level": "none",
+                        "mark_orders": [],
+                        "top3_orders": []
+                    }
+                },
+                "payout_details": None,
+                "tansho_bet": 0,
+                "fukusho_bet": 0,
+                "tansho_payout": 0,
+                "fukusho_payout": 0,
+                "mark_orders": [],
+                "top3_orders": []
+            }
+            supabase.table("keiba_race_settlements").update(row_data).eq("race_id", r_id).execute()
+            updated_count += 1
+            print(f"[FixCancelled] {r_id} を開催中止（全額返還）に更新しました。")
+
+        # サマリー集計キャッシュを無効化・再計算
+        invalidate_summary_caches()
+        msg = f"中止レース是正完了: {updated_count}件を全額返還（投資0/払戻0）に修正し、集計キャッシュを無効化しました。"
+        print(f"[FixCancelled] {msg}")
+        return {"status": "ok", "message": msg, "updated_count": updated_count}
+    except Exception as e:
+        err_msg = f"[FixCancelled Error] {e}"
+        print(err_msg)
+        return {"status": "error", "message": err_msg}
+
+
+@app.get("/admin/fix-cancelled-races")
+@app.post("/admin/fix-cancelled-races")
+def endpoint_fix_cancelled_races():
+    return fix_cancelled_races_2026()
+
+
 def normalize_mislabeled_dates():
     """2026-10-13等のフォールバック日で誤保存された過去レースを正規の開催日 (2026-10-03, 2026-10-04) へ修正"""
     if not supabase:
@@ -4812,4 +4996,5 @@ async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
     normalize_mislabeled_dates()
+    fix_cancelled_races_2026()
     asyncio.create_task(background_maintenance_loop())
