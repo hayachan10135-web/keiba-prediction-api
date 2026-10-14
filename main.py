@@ -1,6 +1,8 @@
 from typing import List, Optional, Dict, Any
+from collections import defaultdict
 import os
 import math
+import time
 import datetime
 import zoneinfo
 import re
@@ -363,6 +365,33 @@ class DailySummary(BaseModel):
     cumulative_real_bet_profit: Optional[int] = 0
     cumulative_real_bet_recovery_rate: Optional[float] = 0.0
 
+class PeriodStatItem(BaseModel):
+    title: str
+    period_key: str
+    days: int = 0
+    total_races: int = 0
+    bet_races: int = 0
+    pass_races: int = 0
+    hit_races: int = 0
+    hit_rate: float = 0.0
+    total_bet: int = 0
+    total_payout: int = 0
+    total_profit: int = 0
+    recovery_rate: float = 0.0
+    real_bet_races: int = 0
+    real_bet_hits: int = 0
+    real_bet_hit_rate: float = 0.0
+    real_bet_amount: int = 0
+    real_bet_payout: int = 0
+    real_bet_profit: int = 0
+    real_bet_recovery_rate: float = 0.0
+    pass_benefit: int = 0
+
+class AggregateSummaryResponse(BaseModel):
+    lifetime: PeriodStatItem
+    yearly: List[PeriodStatItem] = []
+    monthly: List[PeriodStatItem] = []
+
 class BatchStartResponse(BaseModel):
     status: str
     message: str
@@ -531,6 +560,26 @@ def clear_kaisai_period_caches():
         print("[Cleanup] 金曜20:00 開催期間の一時キャッシュ（予想・結果HTML・スケジュール）を破棄しました（成績台帳は保持）。")
     except Exception as e:
         print(f"[Cleanup] キャッシュ破棄エラー: {e}")
+    invalidate_summary_caches()
+
+
+# --- サマリー・総合収支のインメモリキャッシュ (高速化用) ---
+_summary_dates_cache: Dict[str, Any] = {
+    "dates": [],
+    "updated_at": 0.0
+}
+_aggregate_summary_cache: Dict[str, Any] = {
+    "data": None,
+    "updated_at": 0.0
+}
+CACHE_TTL_SUMMARY_DATES = 600.0  # 10分
+CACHE_TTL_AGGREGATE = 600.0      # 10分
+
+def invalidate_summary_caches():
+    """新レース確定や一括同期時にサマリーキャッシュを破棄"""
+    global _summary_dates_cache, _aggregate_summary_cache
+    _summary_dates_cache["updated_at"] = 0.0
+    _aggregate_summary_cache["updated_at"] = 0.0
 
 
 # --- スケジュール登録ヘルパー ---
@@ -2665,6 +2714,7 @@ def save_settlement(data: dict):
             "tansho_payout": data.get("tansho_payout", 0),
             "fukusho_payout": data.get("fukusho_payout", 0)
         }).execute()
+        invalidate_summary_caches()
     except Exception as e:
         print(f"Supabase収支台帳保存エラー: {e}")
 
@@ -3331,8 +3381,13 @@ def verify_race_result(
 
 @app.get("/summary/dates", response_model=List[str])
 @app.get("/daily-summary/dates", response_model=List[str])
-def get_summary_dates():
-    """過去の予想・集計可能日付一覧を取得 (降順)"""
+def get_summary_dates(force_refresh: bool = False):
+    """過去の予想・集計可能日付一覧を取得 (降順・キャッシュ付き)"""
+    global _summary_dates_cache
+    now = time.time()
+    if not force_refresh and _summary_dates_cache["dates"] and (now - _summary_dates_cache["updated_at"] < CACHE_TTL_SUMMARY_DATES):
+        return _summary_dates_cache["dates"]
+
     today_str = today_jst_str()
     try:
         dates_set = set(discover_period_kaisai_dates())
@@ -3370,7 +3425,10 @@ def get_summary_dates():
                 print(f"scheduled dates error: {e}")
 
         sorted_dates = sorted(list(dates_set), reverse=True)
-        return sorted_dates if sorted_dates else [today_str]
+        res = sorted_dates if sorted_dates else [today_str]
+        _summary_dates_cache["dates"] = res
+        _summary_dates_cache["updated_at"] = now
+        return res
     except Exception as e:
         print(f"日付一覧取得エラー: {e}")
         return [today_str]
@@ -3591,7 +3649,8 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     umaren_rec = round((umaren_payout_total / umaren_bet_total) * 100.0, 2) if umaren_bet_total > 0 else 0.0
     trio_rec = round((trio_payout_total / trio_bet_total) * 100.0, 2) if trio_bet_total > 0 else 0.0
 
-    # ★ 累計トータル収支・成績の集計（永続テーブル keiba_race_settlements の全期間集計）
+    # 累計（生涯・年間・月間）データは別エンドポイント /summary/aggregates でキャッシュ集計するため、
+    # 日別サマリーでは当日データのみを最速(約0.2秒)で返却し、後方互換フィールドは0とする
     cum_days = 0
     cum_total_races = 0
     cum_bet_races = 0
@@ -3610,49 +3669,6 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     cum_rb_payout = 0
     cum_rb_profit = 0
     cum_rb_recovery_rate = 0.0
-
-    if supabase:
-        try:
-            cum_rows = []
-            page = 0
-            page_size = 1000
-            while True:
-                cum_res = supabase.table("keiba_race_settlements").select(
-                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
-                ).range(page * page_size, (page + 1) * page_size - 1).execute()
-                batch = cum_res.data or []
-                cum_rows.extend(batch)
-                if len(batch) < page_size:
-                    break
-                page += 1
-
-            cum_days = len(set(cr.get("race_date") for cr in cum_rows if cr.get("race_date")))
-            cum_total_races = len(cum_rows)
-            cum_bet_races = sum(1 for cr in cum_rows if cr.get("is_pass") == 0)
-            cum_pass_races = sum(1 for cr in cum_rows if cr.get("is_pass") == 1)
-            cum_hit_races = sum(1 for cr in cum_rows if cr.get("is_hit") == 1 and cr.get("is_pass") == 0)
-            cum_bet_amount = sum((cr.get("total_bet") or 0) for cr in cum_rows)
-            cum_payout_amount = sum((cr.get("total_payout") or 0) for cr in cum_rows)
-            cum_profit = cum_payout_amount - cum_bet_amount
-            cum_recovery_rate = round((cum_payout_amount / cum_bet_amount) * 100.0, 2) if cum_bet_amount > 0 else 0.0
-            cum_hit_rate = round((cum_hit_races / cum_bet_races) * 100.0, 2) if cum_bet_races > 0 else 0.0
-            cum_pass_benefit = sum((cr.get("pass_benefit") or 0) for cr in cum_rows if cr.get("is_pass") == 1)
-
-            for cr in cum_rows:
-                if cr.get("is_pass") == 0:
-                    bd = cr.get("bet_details") if isinstance(cr.get("bet_details"), dict) else {}
-                    rbm = bd.get("real_bet_meta") or {}
-                    if rbm.get("is_real_bet_target"):
-                        cum_rb_races += 1
-                        if cr.get("is_hit") == 1:
-                            cum_rb_hits += 1
-                        cum_rb_amount += (cr.get("total_bet") or 0)
-                        cum_rb_payout += (cr.get("total_payout") or 0)
-            cum_rb_profit = cum_rb_payout - cum_rb_amount
-            cum_rb_recovery_rate = round((cum_rb_payout / cum_rb_amount) * 100.0, 2) if cum_rb_amount > 0 else 0.0
-            cum_rb_hit_rate = round((cum_rb_hits / cum_rb_races) * 100.0, 2) if cum_rb_races > 0 else 0.0
-        except Exception as e:
-            print(f"Supabase累計サマリー取得エラー: {e}")
 
     return {
         "target_date": target_date,
@@ -3704,6 +3720,120 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "cumulative_real_bet_profit": cum_rb_profit,
         "cumulative_real_bet_recovery_rate": cum_rb_recovery_rate
     }
+
+
+def calc_period_stat(title: str, key: str, rows: list) -> dict:
+    """期間ごとの収支・回収率・実戦推奨成績を集計"""
+    days = len(set(r.get("race_date") for r in rows if r.get("race_date")))
+    total_races = len(rows)
+    bet_races = sum(1 for r in rows if r.get("is_pass") == 0)
+    pass_races = sum(1 for r in rows if r.get("is_pass") == 1)
+    hit_races = sum(1 for r in rows if r.get("is_hit") == 1 and r.get("is_pass") == 0)
+    hit_rate = round((hit_races / bet_races) * 100.0, 2) if bet_races > 0 else 0.0
+    total_bet = sum((r.get("total_bet") or 0) for r in rows)
+    total_payout = sum((r.get("total_payout") or 0) for r in rows)
+    total_profit = total_payout - total_bet
+    recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
+    pass_benefit = sum((r.get("pass_benefit") or 0) for r in rows if r.get("is_pass") == 1)
+
+    rb_races = 0
+    rb_hits = 0
+    rb_amount = 0
+    rb_payout = 0
+    for r in rows:
+        if r.get("is_pass") == 0:
+            bd = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+            rbm = bd.get("real_bet_meta") or {}
+            if rbm.get("is_real_bet_target"):
+                rb_races += 1
+                if r.get("is_hit") == 1:
+                    rb_hits += 1
+                rb_amount += (r.get("total_bet") or 0)
+                rb_payout += (r.get("total_payout") or 0)
+    rb_profit = rb_payout - rb_amount
+    rb_recovery = round((rb_payout / rb_amount) * 100.0, 2) if rb_amount > 0 else 0.0
+    rb_hit_rate = round((rb_hits / rb_races) * 100.0, 2) if rb_races > 0 else 0.0
+
+    return {
+        "title": title,
+        "period_key": key,
+        "days": days,
+        "total_races": total_races,
+        "bet_races": bet_races,
+        "pass_races": pass_races,
+        "hit_races": hit_races,
+        "hit_rate": hit_rate,
+        "total_bet": total_bet,
+        "total_payout": total_payout,
+        "total_profit": total_profit,
+        "recovery_rate": recovery_rate,
+        "real_bet_races": rb_races,
+        "real_bet_hits": rb_hits,
+        "real_bet_hit_rate": rb_hit_rate,
+        "real_bet_amount": rb_amount,
+        "real_bet_payout": rb_payout,
+        "real_bet_profit": rb_profit,
+        "real_bet_recovery_rate": rb_recovery,
+        "pass_benefit": pass_benefit
+    }
+
+
+@app.get("/summary/aggregates", response_model=AggregateSummaryResponse)
+def get_aggregate_summary(force_refresh: bool = False):
+    """生涯・年間・月間の総合収支サマリーを取得（キャッシュ付き）"""
+    global _aggregate_summary_cache
+    now = time.time()
+    if not force_refresh and _aggregate_summary_cache["data"] and (now - _aggregate_summary_cache["updated_at"] < CACHE_TTL_AGGREGATE):
+        return _aggregate_summary_cache["data"]
+
+    cum_rows = []
+    if supabase:
+        try:
+            page = 0
+            page_size = 1000
+            while True:
+                cum_res = supabase.table("keiba_race_settlements").select(
+                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
+                ).range(page * page_size, (page + 1) * page_size - 1).execute()
+                batch = cum_res.data or []
+                cum_rows.extend(batch)
+                if len(batch) < page_size:
+                    break
+                page += 1
+        except Exception as e:
+            print(f"Supabase総合集計データ取得エラー: {e}")
+
+    # 1. 生涯（全期間）
+    lifetime = calc_period_stat("生涯（全期間）", "lifetime", cum_rows)
+
+    # 2. 年別 & 月別グループ分け
+    year_map = defaultdict(list)
+    month_map = defaultdict(list)
+    for r in cum_rows:
+        rd = r.get("race_date") or ""
+        if len(rd) >= 4:
+            year_map[rd[:4]].append(r)
+        if len(rd) >= 7:
+            month_map[rd[:7]].append(r)
+
+    yearly = []
+    for y in sorted(year_map.keys(), reverse=True):
+        yearly.append(calc_period_stat(f"{y}年", y, year_map[y]))
+
+    monthly = []
+    for ym in sorted(month_map.keys(), reverse=True):
+        y_part = ym[:4]
+        m_part = int(ym[5:7]) if ym[5:7].isdigit() else ym[5:7]
+        monthly.append(calc_period_stat(f"{y_part}年{m_part}月", ym, month_map[ym]))
+
+    result = {
+        "lifetime": lifetime,
+        "yearly": yearly,
+        "monthly": monthly
+    }
+    _aggregate_summary_cache["data"] = result
+    _aggregate_summary_cache["updated_at"] = now
+    return result
 
 
 # =========================================================================
@@ -3848,6 +3978,7 @@ def run_batch_worker(
         print(f"[Batch] ワーカー全体エラー: {e}")
     finally:
         batch_status["is_running"] = False
+        invalidate_summary_caches()
 
 
 def start_batch_thread(target_date: Optional[str] = None, mode: str = "all", force_predict: bool = False) -> BatchStartResponse:
@@ -4664,6 +4795,7 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
         if payload.scheduled:
             supabase.table("keiba_scheduled_races").upsert(payload.scheduled, on_conflict="race_id").execute()
             sched_count = len(payload.scheduled)
+        invalidate_summary_caches()
         return {
             "status": "ok",
             "predictions_count": pred_count,
