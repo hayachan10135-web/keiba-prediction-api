@@ -813,10 +813,11 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
 
 
 def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) -> List[dict]:
-    """レース一覧の各レースにSupabase上の予想・実戦推奨バッジ情報を付与"""
+    """レース一覧の各レースにSupabase上の予想・実戦推奨バッジ情報および確定・的中結果を付与"""
     if not venues:
         return []
     cached_preds_map = {}
+    settled_map = {}
     if supabase:
         try:
             p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
@@ -833,12 +834,28 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
         except Exception as e:
             print(f"レース一覧キャッシュ付与エラー: {e}")
 
+        try:
+            s_res = supabase.table("keiba_race_settlements").select("race_id, is_hit, is_pass, total_payout").eq("race_date", formatted_date).execute()
+            for s_row in (s_res.data or []):
+                is_hit_val = 1 if (s_row.get("is_hit") == 1 and s_row.get("is_pass") == 0) else 0
+                settled_map[s_row["race_id"]] = {
+                    "is_settled": 1,
+                    "is_hit": is_hit_val,
+                    "is_pass": s_row.get("is_pass", 0),
+                    "total_payout": s_row.get("total_payout", 0)
+                }
+        except Exception as se:
+            print(f"レース一覧確定情報付与エラー: {se}")
+
     for venue in venues:
         for race in venue.get("races", []):
             info = cached_preds_map.get(race["race_id"])
             if info:
                 race["is_real_bet_target"] = info["is_real_bet_target"]
-                race["real_bet_badge"] = info["real_bet_badge"]
+                badge_str = info["real_bet_badge"]
+                if badge_str and isinstance(badge_str, str):
+                    badge_str = badge_str.replace("🎯", "⭐")
+                race["real_bet_badge"] = badge_str
                 race["real_bet_level"] = info.get("real_bet_level", "none")
                 race["edge_ratio"] = info["edge_ratio"]
                 race["is_final_odds"] = info["is_final_odds"]
@@ -848,6 +865,16 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["real_bet_level"] = "none"
                 race["edge_ratio"] = None
                 race["is_final_odds"] = False
+
+            s_info = settled_map.get(race["race_id"])
+            if s_info:
+                race["is_settled"] = s_info.get("is_settled", 0)
+                race["is_hit"] = s_info.get("is_hit", 0)
+                race["is_pass"] = s_info.get("is_pass", 0)
+            else:
+                race["is_settled"] = 0
+                race["is_hit"] = 0
+                race["is_pass"] = 0
     return venues
 
 
