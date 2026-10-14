@@ -3385,7 +3385,12 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 
         # 実戦推奨情報を付与（キャッシュ破棄後も bet_details.real_bet_meta から復元）
         r["is_real_bet_target"] = h_rec.get("is_real_bet_target", rb_meta.get("is_real_bet_target", False))
-        r["real_bet_badge"] = h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge")
+        badge_val = h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge")
+        if badge_val and isinstance(badge_val, str):
+            badge_val = badge_val.replace("🎯", "⭐")
+        r["real_bet_badge"] = badge_val
+        if r.get("strategy_name") and isinstance(r["strategy_name"], str):
+            r["strategy_name"] = r["strategy_name"].replace("🎯", "⭐")
         r["real_bet_level"] = h_rec.get("real_bet_level") or rb_meta.get("real_bet_level", "none")
         r["edge_ratio"] = h_rec.get("edge_ratio") if h_rec.get("edge_ratio") is not None else rb_meta.get("edge_ratio")
         r["is_final_odds"] = h_rec.get("is_final_odds", rb_meta.get("is_final_odds", False))
