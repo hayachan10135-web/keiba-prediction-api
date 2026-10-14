@@ -801,6 +801,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                     cached_preds_map[row["race_id"]] = {
                         "is_real_bet_target": h_rec.get("is_real_bet_target", False),
                         "real_bet_badge": h_rec.get("real_bet_badge"),
+                        "real_bet_level": h_rec.get("real_bet_level", "none"),
                         "edge_ratio": h_rec.get("edge_ratio"),
                         "is_final_odds": h_rec.get("is_final_odds", False)
                     }
@@ -813,11 +814,13 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
             if info:
                 race["is_real_bet_target"] = info["is_real_bet_target"]
                 race["real_bet_badge"] = info["real_bet_badge"]
+                race["real_bet_level"] = info.get("real_bet_level", "none")
                 race["edge_ratio"] = info["edge_ratio"]
                 race["is_final_odds"] = info["is_final_odds"]
             else:
                 race["is_real_bet_target"] = False
                 race["real_bet_badge"] = None
+                race["real_bet_level"] = "none"
                 race["edge_ratio"] = None
                 race["is_final_odds"] = False
     return venues
