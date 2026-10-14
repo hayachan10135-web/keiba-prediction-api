@@ -1906,7 +1906,14 @@ def compute_hybrid_rec_from_inputs(
         for opp in umaren_opponents:
             comb = sorted([w0_u, opp])
             h_opp = next((h for h in horses if int(h.get("umaban", 0)) == opp), {})
-            opp_odds = float(h_opp.get("odds") or 0.0)
+            opp_h_odds = float(h_opp.get("odds") or 10.0)
+            matched_opp = next((item for item in opponents if item[0] == opp), None)
+            if matched_opp and matched_opp[1] > 0:
+                opp_odds = matched_opp[1]
+                is_u_real = matched_opp[2]
+            else:
+                opp_odds = round(max(2.5, 0.65 * w0_odds * opp_h_odds), 1)
+                is_u_real = False
             exp_p = int(round(umaren_unit * opp_odds)) if opp_odds > 0 else 0
             umaren_bets.append({
                 "ticket_type": "馬連",
@@ -1915,8 +1922,8 @@ def compute_hybrid_rec_from_inputs(
                 "amount": umaren_unit,
                 "odds": opp_odds,
                 "expected_payout": exp_p,
-                "is_real_odds": True,
-                "memo": f"馬連(軸{w0_u}→{opp}番 {umaren_unit}円 / {opp_odds}倍)"
+                "is_real_odds": is_u_real,
+                "memo": f"馬連(軸{w0_u}→{opp}番 {umaren_unit}円 / {'実' if is_u_real else '想定:'}{opp_odds}倍)"
             })
 
         # 三連複買い目
@@ -1927,8 +1934,10 @@ def compute_hybrid_rec_from_inputs(
             opp_odds = float(h_opp.get("odds") or 50.0)
             if real_trio_odds and comb_tup in real_trio_odds:
                 trio_odds_val = round(float(real_trio_odds[comb_tup]), 1)
+                is_t_real = True
             else:
                 trio_odds_val = round(calc_trio_odds(t0_odds, t1_odds, opp_odds), 1)
+                is_t_real = False
             exp_tp = int(round(trio_unit * trio_odds_val))
             trio_bets.append({
                 "ticket_type": "三連複",
@@ -1937,8 +1946,8 @@ def compute_hybrid_rec_from_inputs(
                 "amount": trio_unit,
                 "odds": trio_odds_val,
                 "expected_payout": exp_tp,
-                "is_real_odds": bool(real_trio_odds and comb_tup in real_trio_odds),
-                "memo": f"2頭軸[{t0_u}={t1_u}]→{opp}番 {trio_unit}円 / {trio_odds_val}倍"
+                "is_real_odds": is_t_real,
+                "memo": f"2頭軸[{t0_u}={t1_u}]→{opp}番 {trio_unit}円 / {'実' if is_t_real else '想定:'}{trio_odds_val}倍"
             })
 
         total_amount = sum(b["amount"] for b in umaren_bets) + sum(b["amount"] for b in trio_bets)
