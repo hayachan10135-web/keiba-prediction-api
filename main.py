@@ -205,6 +205,7 @@ class HybridRecommendation(BaseModel):
     prob_gachi: Optional[float] = None
     prob_himo: Optional[float] = None
     edge_ratio: Optional[float] = None
+    confidence_score: Optional[float] = None
     is_real_bet_target: Optional[bool] = False
     real_bet_badge: Optional[str] = None
     real_bet_level: Optional[str] = None
