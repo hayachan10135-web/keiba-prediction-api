@@ -1625,27 +1625,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             feature_rows.append(row50[:expected_num_features] if len(row50) >= expected_num_features else row48[:expected_num_features])
 
-    is_maiden_race = (race_class_code == 1) or ("未勝利" in race_name)
-    predicted_by_maiden = False
-
-    if is_maiden_race and model_maiden_win and model_maiden_top3:
-        try:
-            n_m_win = model_maiden_win.num_feature()
-            n_m_top3 = model_maiden_top3.num_feature()
-            w_scores = model_maiden_win.predict([r[:n_m_win] for r in maiden_feature_rows])
-            t_scores = model_maiden_top3.predict([r[:n_m_top3] for r in maiden_feature_rows])
-            for idx, h in enumerate(horses):
-                h["prob_win"] = round(float(w_scores[idx]), 4)
-                h["prob_top3"] = round(float(t_scores[idx]), 4)
-                h["score"] = h["prob_win"]
-            predicted_by_maiden = True
-            print(f"[{race_name}] 未勝利戦専用モデル (m_maiden_win/top3) で高精度推論を実行しました。")
-        except Exception as me:
-            print(f"未勝利専用モデル推論エラー（汎用モデルへフォールバック）: {me}")
-            predicted_by_maiden = False
-
-    if not predicted_by_maiden:
-        if model_win and model_top3:
+    # ★ Model B (Value Hunter: 1番人気抑制＋中穴過小評価馬強化) による全レース統一推論
+    if model_win and model_top3:
             try:
                 n_win = model_win.num_feature()
                 n_top3 = model_top3.num_feature()
