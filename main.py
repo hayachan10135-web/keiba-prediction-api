@@ -3442,12 +3442,12 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             r["payout_breakdown"] = p_dict
 
     total_races = len(rows)
-    bet_races = sum(1 for r in rows if r["is_pass"] == 0)
-    pass_races = sum(1 for r in rows if r["is_pass"] == 1)
-    hit_races = sum(1 for r in rows if r["is_hit"] == 1 and r["is_pass"] == 0)
+    bet_races = sum(1 for r in rows if r.get("is_pass") == 0)
+    pass_races = sum(1 for r in rows if r.get("is_pass") == 1)
+    hit_races = sum(1 for r in rows if r.get("is_hit") == 1 and r.get("is_pass") == 0)
 
-    total_bet = sum(r["total_bet"] for r in rows)
-    total_payout = sum(r["total_payout"] for r in rows)
+    total_bet = sum((r.get("total_bet") or 0) for r in rows)
+    total_payout = sum((r.get("total_payout") or 0) for r in rows)
     total_profit = total_payout - total_bet
 
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
@@ -3458,8 +3458,8 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     real_bet_races = len(real_bet_rows)
     real_bet_hits = sum(1 for r in real_bet_rows if r.get("is_hit") == 1)
     real_bet_hit_rate = round((real_bet_hits / real_bet_races) * 100.0, 2) if real_bet_races > 0 else 0.0
-    real_bet_amount = sum(r.get("total_bet", 0) for r in real_bet_rows)
-    real_bet_payout = sum(r.get("total_payout", 0) for r in real_bet_rows)
+    real_bet_amount = sum((r.get("total_bet") or 0) for r in real_bet_rows)
+    real_bet_payout = sum((r.get("total_payout") or 0) for r in real_bet_rows)
     real_bet_profit = real_bet_payout - real_bet_amount
     real_bet_recovery_rate = round((real_bet_payout / real_bet_amount) * 100.0, 2) if real_bet_amount > 0 else 0.0
 
@@ -3508,10 +3508,10 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
     # ハイブリッド内訳集計 (後方互換用)
     umaren_hit_races = sum(1 for r in rows if (r.get("umaren_payout") or 0) > 0 and r.get("is_pass") == 0)
     trio_hit_races = sum(1 for r in rows if (r.get("trio_payout") or 0) > 0 and r.get("is_pass") == 0)
-    umaren_bet_total = sum(r.get("umaren_bet", 0) for r in rows if r.get("is_pass") == 0)
-    trio_bet_total = sum(r.get("trio_bet", 0) for r in rows if r.get("is_pass") == 0)
-    umaren_payout_total = sum(r.get("umaren_payout", 0) for r in rows if r.get("is_pass") == 0)
-    trio_payout_total = sum(r.get("trio_payout", 0) for r in rows if r.get("is_pass") == 0)
+    umaren_bet_total = sum((r.get("umaren_bet") or 0) for r in rows if r.get("is_pass") == 0)
+    trio_bet_total = sum((r.get("trio_bet") or 0) for r in rows if r.get("is_pass") == 0)
+    umaren_payout_total = sum((r.get("umaren_payout") or 0) for r in rows if r.get("is_pass") == 0)
+    trio_payout_total = sum((r.get("trio_payout") or 0) for r in rows if r.get("is_pass") == 0)
     umaren_rec = round((umaren_payout_total / umaren_bet_total) * 100.0, 2) if umaren_bet_total > 0 else 0.0
     trio_rec = round((trio_payout_total / trio_bet_total) * 100.0, 2) if trio_bet_total > 0 else 0.0
 
