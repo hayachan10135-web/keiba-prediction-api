@@ -1907,10 +1907,10 @@ def compute_hybrid_rec_from_inputs(
 
     # ------------------------------------------------------------------
     # ★ 3段階階層化 × 動的パーセンタイル戦略 (DynamicPercentile_Top5Leverage)
-    #    Tier 1: 勝負馬券 (上位2%, Score >= 0.999) - W勝負 (三連複1,000円, 馬連1,200円 = 2,200円)
-    #    Tier 2: 実馬券   (上位5%, 0.821 <= Score < 0.999) - W勝負 (三連複500円, 馬連600円 = 1,100円)
-    #    Tier 3: 仮想馬券 (上位12%, 0.665 <= Score < 0.821) - アプリ内集計 (三連複500円, 馬連600円 = 1,100円)
-    #    見送り: Score < 0.665 または 頭数不足/新馬/障害 (0円)
+    #    Tier 1: 勝負馬券 (上位2%, Score >= 0.774) - W勝負 (三連複1,000円, 馬連1,200円 = 2,200円)
+    #    Tier 2: 実馬券   (上位5%, 0.725 <= Score < 0.774) - W勝負 (三連複500円, 馬連600円 = 1,100円)
+    #    Tier 3: 仮想馬券 (上位12%, 0.671 <= Score < 0.725) - アプリ内集計 (三連複500円, 馬連600円 = 1,100円)
+    #    見送り: Score < 0.671 または 頭数不足/新馬/障害 (0円)
     # ------------------------------------------------------------------
     has_enough_horses = len(horses) >= 6
     is_valid_race_type = (surface_type != 2)
@@ -1972,9 +1972,9 @@ def compute_hybrid_rec_from_inputs(
     is_maiden = ("未勝利" in race_name)
     is_condition = not is_shinba and not is_maiden
 
-    is_tier1 = has_enough_horses and is_valid_race_type and (confidence_score >= 0.999)
-    is_tier2 = has_enough_horses and is_valid_race_type and (0.821 <= confidence_score < 0.999)
-    is_tier3 = has_enough_horses and is_valid_race_type and (0.665 <= confidence_score < 0.821)
+    is_tier1 = has_enough_horses and is_valid_race_type and (confidence_score >= 0.774)
+    is_tier2 = has_enough_horses and is_valid_race_type and (0.725 <= confidence_score < 0.774)
+    is_tier3 = has_enough_horses and is_valid_race_type and (0.671 <= confidence_score < 0.725)
 
     # クラス別フィルター
     skip_reason_custom = None
@@ -2173,7 +2173,7 @@ def compute_hybrid_rec_from_inputs(
         elif surface_type == 2:
             skip_reason = "障害戦除外 (不確実性高のため見送り)"
         else:
-            skip_reason = f"動的確信度スコア不足 ({confidence_score:.3f} < 0.665: 資金保全のため見送り)"
+            skip_reason = f"動的確信度スコア不足 ({confidence_score:.3f} < 0.671: 資金保全のため見送り)"
 
         hybrid_rec = {
             "is_participate": False,
