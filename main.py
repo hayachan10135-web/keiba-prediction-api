@@ -1887,12 +1887,29 @@ def compute_hybrid_rec_from_inputs(
     suffix = " (確定)" if is_final_odds else " (暫定)"
 
     # 3段階判定
+    is_maiden = ("未勝利" in race_name)
+    is_condition = not is_shinba and not is_maiden
+
     is_tier1 = has_enough_horses and is_valid_race_type and (confidence_score >= 0.999)
     is_tier2 = has_enough_horses and is_valid_race_type and (0.821 <= confidence_score < 0.999)
     is_tier3 = has_enough_horses and is_valid_race_type and (0.665 <= confidence_score < 0.821)
 
-    is_participate = is_tier1 or is_tier2 or is_tier3
-    is_real_bet_target = is_tier1 or is_tier2
+    # クラス別フィルター
+    skip_reason_custom = None
+    if is_maiden and (w0_odds < 2.4):
+        # 未勝利戦: 本命オッズ2.4倍未満は配当妙味不足・トリガミ回避のため見送り
+        is_tier1 = False
+        is_tier2 = False
+        is_tier3 = False
+        skip_reason_custom = f"未勝利戦オッズ不足 (本命オッズ{w0_odds}倍 < 2.4倍: トリガミ回避・見送り推奨)"
+
+    is_participate = (is_tier1 or is_tier2 or is_tier3)
+    is_real_bet_target = (is_tier1 or is_tier2)
+
+    # 勝負馬券 (Tier 1) のトリガミ防止ガード (オッズ2.5倍未満は1倍配分に抑える)
+    if is_tier1 and (w0_odds < 2.5):
+        is_tier1 = False
+        is_tier2 = True
 
     # 軸馬と相手馬の選定
     w0_u = int(w0.get("umaban", 0))
@@ -1910,13 +1927,18 @@ def compute_hybrid_rec_from_inputs(
     for h in s_top3:
         hu = int(h.get("umaban", 0))
         if hu not in (t0_u, t1_u) and hu not in trio_opponents:
+            # 未勝利戦: キャリア8戦以上の頭打ち馬は相手から除外
+            if is_maiden:
+                h_c = float(h.get("career_races", 0) or 0)
+                if h_c >= 8:
+                    continue
             trio_opponents.append(hu)
         if len(trio_opponents) >= 5:
             break
 
-    # 馬連相手3頭 (軸: w0) - 新馬戦は除外(0点)
+    # 馬連相手3頭 (軸: w0) - 新馬戦および未勝利戦は三連複特化のため馬連除外
     umaren_opponents = []
-    if not is_shinba:
+    if is_condition:
         umaren_opponents.append(w1_u)
         for h in s_top3:
             hu = int(h.get("umaban", 0))
@@ -1931,40 +1953,50 @@ def compute_hybrid_rec_from_inputs(
     if is_participate:
         # 配分設定
         if is_tier1:
-            if w0_odds <= 4.5:
+            real_bet_level = "high"
+            real_bet_badge = f"🔥【超勝負R】厚め推奨{suffix}"
+            strategy_name = "🔥 勝負馬券 (上位2%超厳選・本命厚め配分)"
+            if is_shinba:
+                strategy_type = "trio_only"
+                strategy_name += " [新馬特化: 三連複5点]"
+                trio_unit = 400
+                umaren_unit = 0
+            elif is_maiden:
+                strategy_type = "trio_only"
+                strategy_name += " [未勝利特化: 三連複5点]"
+                trio_unit = 400
+                umaren_unit = 0
+            else:
+                strategy_type = "w_bet"
                 trio_unit = 200
                 umaren_unit = 400
-                real_bet_level = "high"
-                real_bet_badge = f"🔥【超勝負R】厚め推奨{suffix}"
-                strategy_name = "🔥 勝負馬券 (上位2%超厳選・本命厚め配分)"
-                strategy_type = "w_bet"
-            else:
-                trio_unit = 200
-                umaren_unit = 200
-                real_bet_level = "standard"
-                real_bet_badge = f"🎯【実戦推奨】オッズ配慮推奨{suffix}"
-                strategy_name = "🎯 実馬券 (上位2%・中穴軸オッズ管理)"
-                strategy_type = "w_bet"
         elif is_tier2:
-            trio_unit = 100
-            umaren_unit = 200
             real_bet_level = "standard"
             real_bet_badge = f"🎯【実戦推奨】標準推奨{suffix}"
             strategy_name = "🎯 実馬券 (上位5%厳選・標準購入推奨)"
-            strategy_type = "w_bet"
+            if is_shinba:
+                strategy_type = "trio_only"
+                strategy_name += " [新馬特化: 三連複5点]"
+                trio_unit = 200
+                umaren_unit = 0
+            elif is_maiden:
+                strategy_type = "trio_only"
+                strategy_name += " [未勝利特化: 三連複5点]"
+                trio_unit = 200
+                umaren_unit = 0
+            else:
+                strategy_type = "w_bet"
+                trio_unit = 100
+                umaren_unit = 200
         else:
-            trio_unit = 100
-            umaren_unit = 200
             real_bet_level = "virtual"
             real_bet_badge = f"📊【仮想集計R】アプリ内モニタリング{suffix}"
             strategy_name = "📊 仮想馬券 (上位12%・アプリ集計モニタリング)"
             strategy_type = "virtual"
+            trio_unit = 100
+            umaren_unit = 0 if (is_shinba or is_maiden) else 200
 
-        if is_shinba:
-            strategy_type = "trio_only"
-            strategy_name += " [新馬特化: 三連複5点限定]"
-
-        # 馬連買い目
+        # 馬連買い目 (条件戦・重賞: オッズ3.5倍以上のみ厳選)
         for opp in umaren_opponents:
             comb = sorted([w0_u, opp])
             h_opp = next((h for h in horses if int(h.get("umaban", 0)) == opp), {})
@@ -1976,6 +2008,9 @@ def compute_hybrid_rec_from_inputs(
             else:
                 opp_odds = round(max(2.5, 0.65 * w0_odds * opp_h_odds), 1)
                 is_u_real = False
+            # トリガミ防止: オッズ3.5倍未満は購入除外
+            if opp_odds < 3.5:
+                continue
             exp_p = int(round(umaren_unit * opp_odds)) if opp_odds > 0 else 0
             umaren_bets.append({
                 "ticket_type": "馬連",
@@ -2015,7 +2050,7 @@ def compute_hybrid_rec_from_inputs(
         total_amount = sum(b["amount"] for b in umaren_bets) + sum(b["amount"] for b in trio_bets)
         t_opps_str = ",".join(str(o) for o in trio_opponents)
         u_opps_str = ",".join(str(o) for o in umaren_opponents)
-        if is_shinba:
+        if len(umaren_bets) == 0:
             summary_str = f"{strategy_name} [三連複{len(trio_bets)}点(軸[{t0_u}={t1_u}]→{t_opps_str}) / 計{total_amount:,}円]"
         else:
             summary_str = f"{strategy_name} [馬連{len(umaren_bets)}点(軸{w0_u}→{u_opps_str}) ＋ 三連複{len(trio_bets)}点(軸[{t0_u}={t1_u}]→{t_opps_str}) / 計{total_amount:,}円]"
@@ -2029,7 +2064,7 @@ def compute_hybrid_rec_from_inputs(
             "summary": summary_str,
             "umaren_bets": umaren_bets,
             "sanrentan_bets": [],
-            "hypothetical_umaren_bets": umaren_bets,
+            "hypothetical_umaren_bets": umaren_bets if umaren_bets else hypothetical_umaren_bets,
             "trio_bets": trio_bets,
             "trio_bet": trio_bets[0] if trio_bets else None,
             "reason": reason_str,
@@ -2049,10 +2084,10 @@ def compute_hybrid_rec_from_inputs(
         # 見送り
         real_bet_level = "none"
         real_bet_badge = None
-        if not has_enough_horses:
+        if skip_reason_custom:
+            skip_reason = skip_reason_custom
+        elif not has_enough_horses:
             skip_reason = "出走頭数不足 (6頭未満のため見送り)"
-        elif is_shinba:
-            skip_reason = "新馬戦除外 (過去走実績なしのため見送り)"
         elif surface_type == 2:
             skip_reason = "障害戦除外 (不確実性高のため見送り)"
         else:
