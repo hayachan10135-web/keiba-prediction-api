@@ -3346,16 +3346,15 @@ def get_summary_dates():
 
 @app.get("/summary/today", response_model=DailySummary)
 def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
-    try:
-        target_date = date if date else today_jst_str()
+    target_date = date if date else today_jst_str()
 
-        rows = []
-        if supabase:
-            try:
-                res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
-                rows = res.data or []
-            except Exception as e:
-                print(f"Supabaseサマリー取得エラー: {e}")
+    rows = []
+    if supabase:
+        try:
+            res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
+            rows = res.data or []
+        except Exception as e:
+            print(f"Supabaseサマリー取得エラー: {e}")
 
     # 結果キャッシュと予想キャッシュを一括取得（金曜20:00破棄後は空でも keiba_race_settlements から完全復元）
     res_cache_map = {}
@@ -3643,11 +3642,6 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "cumulative_real_bet_profit": cum_rb_profit,
         "cumulative_real_bet_recovery_rate": cum_rb_recovery_rate
     }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"[get_daily_summary exception] {e}")
-        raise HTTPException(status_code=500, detail=f"Summary error: {type(e).__name__}: {str(e)}")
 
 
 # =========================================================================
