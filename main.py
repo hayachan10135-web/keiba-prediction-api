@@ -3588,7 +3588,16 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         r["edge_ratio"] = h_rec.get("edge_ratio") if h_rec.get("edge_ratio") is not None else rb_meta.get("edge_ratio")
         r["is_final_odds"] = h_rec.get("is_final_odds", rb_meta.get("is_final_odds", False))
 
-        if r.get("is_pass") == 1:
+        if r.get("strategy_type") == "cancelled" or r.get("hit_type") == "開催中止":
+            r["is_real_bet_target"] = False
+            r["real_bet_badge"] = "⛔【開催中止】全額返還"
+            r["real_bet_level"] = "none"
+            r["hypothetical_bet"] = 0
+            r["hypothetical_payout"] = 0
+            r["pass_benefit"] = 0
+            r["mark_orders"] = []
+            r["top3_orders"] = []
+        elif r.get("is_pass") == 1:
             c_res = res_cache_map.get(r["race_id"], {})
             if p_data and c_res:
                 pass_info = calculate_hybrid_pass_benefit_info(h_rec, c_res, r.get("target_umaban"), r.get("actual_order"), pred_data=p_data)
