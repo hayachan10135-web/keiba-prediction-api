@@ -3305,21 +3305,33 @@ def get_summary_dates():
         if supabase:
             # 1. 確定・集計済みレコードがある日付（永続保存されている全過去日）
             try:
-                res_settle = supabase.table("keiba_race_settlements").select("race_date").execute()
-                for row in (res_settle.data or []):
-                    d = row.get("race_date")
-                    if d and len(d) == 10 and d.startswith("20"):
-                        dates_set.add(d)
+                page = 0
+                while True:
+                    res_settle = supabase.table("keiba_race_settlements").select("race_date").range(page * 1000, (page + 1) * 1000 - 1).execute()
+                    batch = res_settle.data or []
+                    for row in batch:
+                        d = row.get("race_date")
+                        if d and len(d) == 10 and d.startswith("20"):
+                            dates_set.add(d)
+                    if len(batch) < 1000:
+                        break
+                    page += 1
             except Exception as e:
                 print(f"settlements dates error: {e}")
 
             # 2. レース開催日として登録された日付
             try:
-                res_sched = supabase.table("keiba_scheduled_races").select("race_date").execute()
-                for row in (res_sched.data or []):
-                    d = row.get("race_date")
-                    if d and len(d) == 10 and d.startswith("20"):
-                        dates_set.add(d)
+                page = 0
+                while True:
+                    res_sched = supabase.table("keiba_scheduled_races").select("race_date").range(page * 1000, (page + 1) * 1000 - 1).execute()
+                    batch = res_sched.data or []
+                    for row in batch:
+                        d = row.get("race_date")
+                        if d and len(d) == 10 and d.startswith("20"):
+                            dates_set.add(d)
+                    if len(batch) < 1000:
+                        break
+                    page += 1
             except Exception as e:
                 print(f"scheduled dates error: {e}")
 
@@ -3496,10 +3508,19 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
 
     if supabase:
         try:
-            cum_res = supabase.table("keiba_race_settlements").select(
-                "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
-            ).execute()
-            cum_rows = cum_res.data or []
+            cum_rows = []
+            page = 0
+            page_size = 1000
+            while True:
+                cum_res = supabase.table("keiba_race_settlements").select(
+                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
+                ).range(page * page_size, (page + 1) * page_size - 1).execute()
+                batch = cum_res.data or []
+                cum_rows.extend(batch)
+                if len(batch) < page_size:
+                    break
+                page += 1
+
             cum_days = len(set(cr.get("race_date") for cr in cum_rows if cr.get("race_date")))
             cum_total_races = len(cum_rows)
             cum_bet_races = sum(1 for cr in cum_rows if cr.get("is_pass") == 0)
