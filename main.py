@@ -1978,8 +1978,8 @@ def compute_hybrid_rec_from_inputs(
                 umaren_unit = 400
         elif is_tier2:
             real_bet_level = "standard"
-            real_bet_badge = f"🎯【実戦推奨】標準推奨{suffix}"
-            strategy_name = "🎯 実馬券 (上位5%厳選・標準購入推奨)"
+            real_bet_badge = f"⭐【実戦推奨】標準推奨{suffix}"
+            strategy_name = "⭐ 実馬券 (上位5%厳選・標準購入推奨)"
             if is_shinba:
                 strategy_type = "trio_only"
                 strategy_name += " [新馬特化: 三連複5点]"
