@@ -4780,9 +4780,7 @@ def fix_cancelled_races_2026():
                 "tansho_bet": 0,
                 "fukusho_bet": 0,
                 "tansho_payout": 0,
-                "fukusho_payout": 0,
-                "mark_orders": [],
-                "top3_orders": []
+                "fukusho_payout": 0
             }
             supabase.table("keiba_race_settlements").update(row_data).eq("race_id", r_id).execute()
             updated_count += 1
