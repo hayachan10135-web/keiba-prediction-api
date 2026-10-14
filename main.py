@@ -3346,15 +3346,16 @@ def get_summary_dates():
 
 @app.get("/summary/today", response_model=DailySummary)
 def get_daily_summary(date: Optional[str] = Query(None, description="集計対象日付 (YYYY-MM-DD)")):
-    target_date = date if date else today_jst_str()
+    try:
+        target_date = date if date else today_jst_str()
 
-    rows = []
-    if supabase:
-        try:
-            res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
-            rows = res.data or []
-        except Exception as e:
-            print(f"Supabaseサマリー取得エラー: {e}")
+        rows = []
+        if supabase:
+            try:
+                res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
+                rows = res.data or []
+            except Exception as e:
+                print(f"Supabaseサマリー取得エラー: {e}")
 
     # 結果キャッシュと予想キャッシュを一括取得（金曜20:00破棄後は空でも keiba_race_settlements から完全復元）
     res_cache_map = {}
@@ -3440,6 +3441,20 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             if (r.get("umaren_payout") or 0) > 0: p_dict["馬連"] = r["umaren_payout"]
             if (r.get("trio_payout") or 0) > 0: p_dict["三連複"] = r["trio_payout"]
             r["payout_breakdown"] = p_dict
+
+        r_id_str = str(r.get("race_id", ""))
+        if len(r_id_str) >= 12 and not r.get("venue_name"):
+            try:
+                v_code = int(r_id_str[4:6])
+                r["venue_name"] = VENUE_MAP.get(v_code, "JRA")
+            except Exception:
+                pass
+        if len(r_id_str) >= 12 and not r.get("race_num"):
+            try:
+                r_num_int = int(r_id_str[10:12])
+                r["race_num"] = f"{r_num_int}R"
+            except Exception:
+                pass
 
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r.get("is_pass") == 0)
@@ -3628,6 +3643,11 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "cumulative_real_bet_profit": cum_rb_profit,
         "cumulative_real_bet_recovery_rate": cum_rb_recovery_rate
     }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[get_daily_summary exception] {e}")
+        raise HTTPException(status_code=500, detail=f"Summary error: {type(e).__name__}: {str(e)}")
 
 
 # =========================================================================
