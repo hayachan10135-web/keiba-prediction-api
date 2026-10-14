@@ -3424,9 +3424,9 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             if h0 and h0.get("popularity") is not None:
                 r["target_popularity"] = h0.get("popularity")
 
-        if r.get("mark_orders") and h_pop_map:
+        if r.get("mark_orders") and h_pop_map and isinstance(r["mark_orders"], list):
             for mo in r["mark_orders"]:
-                if mo.get("popularity") is None and mo.get("umaban") in h_pop_map:
+                if isinstance(mo, dict) and mo.get("popularity") is None and mo.get("umaban") in h_pop_map:
                     mo["popularity"] = h_pop_map[mo["umaban"]]
         # Android (Gson) は bet_breakdown / payout_breakdown に Map<String, Int> を要求するため、
         # 文字列等の不正形式の場合は必ず dict に正規化してクラッシュを防ぐ
