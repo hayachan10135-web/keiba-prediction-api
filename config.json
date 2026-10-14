@@ -1,0 +1,28 @@
+{
+  "model_name": "DynamicPercentile_Top5Leverage",
+  "version": "1.0.0",
+  "philosophy": "完全ゼロリーク前日確定主義 × 動的確信度上位5%厳選 × 三連複5点高期待値レバレッジ",
+  "confidence_percentile": 0.95,
+  "confidence_threshold": 0.821,
+  "confidence_formula": "win_margin * 2.0 + top3_margin_0_1 + top3_margin_1_2 + clip(win_edge - 1.0, -0.5, 0.5)",
+  "tickets": {
+    "trio": {
+      "points": 5,
+      "unit_amount": 100,
+      "total_amount": 500,
+      "axis1": "pure_top3_1st",
+      "axis2": "pure_top3_2nd",
+      "opponents": 5
+    },
+    "umaren": {
+      "points": 3,
+      "unit_amount": 200,
+      "total_amount": 600,
+      "axis": "win_1st",
+      "opponents": 3
+    },
+    "w_bet": {
+      "total_amount": 1100
+    }
+  }
+}
