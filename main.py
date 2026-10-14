@@ -3409,8 +3409,19 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             c_res = res_cache_map.get(r["race_id"], {})
             if not r.get("mark_orders"):
                 r["mark_orders"] = extract_mark_orders(p_data, c_res.get("orders", {})) if (p_data and c_res) else rb_meta.get("mark_orders")
-            if not r.get("top3_orders"):
-                r["top3_orders"] = extract_top3_orders(p_data, c_res.get("orders", {})) if (p_data and c_res) else rb_meta.get("top3_orders")
+        # Android (Gson) は bet_breakdown / payout_breakdown に Map<String, Int> を要求するため、
+        # 文字列等の不正形式の場合は必ず dict に正規化してクラッシュを防ぐ
+        if not isinstance(r.get("bet_breakdown"), dict):
+            b_dict = {}
+            if (r.get("umaren_bet") or 0) > 0: b_dict["馬連"] = r["umaren_bet"]
+            if (r.get("trio_bet") or 0) > 0: b_dict["三連複"] = r["trio_bet"]
+            r["bet_breakdown"] = b_dict
+
+        if not isinstance(r.get("payout_breakdown"), dict):
+            p_dict = {}
+            if (r.get("umaren_payout") or 0) > 0: p_dict["馬連"] = r["umaren_payout"]
+            if (r.get("trio_payout") or 0) > 0: p_dict["三連複"] = r["trio_payout"]
+            r["payout_breakdown"] = p_dict
 
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r["is_pass"] == 0)
