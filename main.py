@@ -40,6 +40,8 @@ HEADERS_PC = {
 MODEL_PATH = "lgb_model.txt"
 WIN_MODEL_PATH = "lgb_win_model.txt"
 TOP3_MODEL_PATH = "lgb_top3_model.txt"
+MAIDEN_WIN_MODEL_PATH = "lgb_maiden_win_model.txt"
+MAIDEN_TOP3_MODEL_PATH = "lgb_maiden_top3_model.txt"
 GACHI_MODEL_PATH = "lgb_gachi_model.txt"
 HIMO_MODEL_PATH = "lgb_himo_model.txt"
 DICT_PATH = "stats_dict.json"
@@ -132,6 +134,22 @@ if os.path.exists(TOP3_MODEL_PATH):
         print("3着内特化モデル (m_top3) を正常にロードしました。")
     except Exception as e:
         print(f"3着内特化モデルロード失敗: {e}")
+
+model_maiden_win = None
+if os.path.exists(MAIDEN_WIN_MODEL_PATH):
+    try:
+        model_maiden_win = lgb.Booster(model_file=MAIDEN_WIN_MODEL_PATH)
+        print("未勝利戦Winモデル (m_maiden_win) を正常にロードしました。")
+    except Exception as e:
+        print(f"未勝利戦Winモデルロード失敗: {e}")
+
+model_maiden_top3 = None
+if os.path.exists(MAIDEN_TOP3_MODEL_PATH):
+    try:
+        model_maiden_top3 = lgb.Booster(model_file=MAIDEN_TOP3_MODEL_PATH)
+        print("未勝利戦Top3モデル (m_maiden_top3) を正常にロードしました。")
+    except Exception as e:
+        print(f"未勝利戦Top3モデルロード失敗: {e}")
 
 model_gachi = None
 if os.path.exists(GACHI_MODEL_PATH):
@@ -1370,6 +1388,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     p1_ranks = rank_min_asc(p1_orders)
 
     feature_rows = []
+    maiden_feature_rows = []
     for idx, fd in enumerate(horse_feature_data):
         h = horses[idx]
         h_clean = re.sub(r"[\s\u3000]", "", h.get("horse_name", ""))
@@ -1501,6 +1520,14 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             float(horse_surf_val), float(prev_time_diff_min_val), float(jockey_surf_val), float(p1_class_diff_val)
         ]
 
+        # 未勝利戦専用特徴量 (54特徴量)
+        is_prev_near_miss_val = float(1 if (p1_time_diff_val <= 0.3 or p1_order_val <= 3.0) else 0)
+        is_career_prime_val = float(1 if c_races in [1.0, 2.0] else 0)
+        is_career_stale_val = float(1 if c_races >= 8.0 else 0)
+        is_prev_fastest_3f_val = float(1 if p1_l3f_rank_val <= 3.0 else 0)
+        row_maiden = row50[:49] + [float(jockey_surf_val), is_prev_near_miss_val, is_career_prime_val, is_career_stale_val, is_prev_fastest_3f_val]
+        maiden_feature_rows.append(row_maiden)
+
         if expected_num_features == 50:
             feature_rows.append(row50)
         elif expected_num_features == 48:
@@ -1516,22 +1543,42 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             feature_rows.append(row50[:expected_num_features] if len(row50) >= expected_num_features else row48[:expected_num_features])
 
-    if model_win and model_top3:
+    is_maiden_race = (race_class_code == 1) or ("未勝利" in race_name)
+    predicted_by_maiden = False
+
+    if is_maiden_race and model_maiden_win and model_maiden_top3:
         try:
-            n_win = model_win.num_feature()
-            n_top3 = model_top3.num_feature()
-            w_scores = model_win.predict([r[:n_win] for r in feature_rows])
-            t_scores = model_top3.predict([r[:n_top3] for r in feature_rows])
+            n_m_win = model_maiden_win.num_feature()
+            n_m_top3 = model_maiden_top3.num_feature()
+            w_scores = model_maiden_win.predict([r[:n_m_win] for r in maiden_feature_rows])
+            t_scores = model_maiden_top3.predict([r[:n_m_top3] for r in maiden_feature_rows])
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(w_scores[idx]), 4)
                 h["prob_top3"] = round(float(t_scores[idx]), 4)
                 h["score"] = h["prob_win"]
-        except Exception:
-            for idx, h in enumerate(horses):
-                odds = h["odds"] if h["odds"] else 50.0
-                h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                h["score"] = h["prob_win"]
+            predicted_by_maiden = True
+            print(f"[{race_name}] 未勝利戦専用モデル (m_maiden_win/top3) で高精度推論を実行しました。")
+        except Exception as me:
+            print(f"未勝利専用モデル推論エラー（汎用モデルへフォールバック）: {me}")
+            predicted_by_maiden = False
+
+    if not predicted_by_maiden:
+        if model_win and model_top3:
+            try:
+                n_win = model_win.num_feature()
+                n_top3 = model_top3.num_feature()
+                w_scores = model_win.predict([r[:n_win] for r in feature_rows])
+                t_scores = model_top3.predict([r[:n_top3] for r in feature_rows])
+                for idx, h in enumerate(horses):
+                    h["prob_win"] = round(float(w_scores[idx]), 4)
+                    h["prob_top3"] = round(float(t_scores[idx]), 4)
+                    h["score"] = h["prob_win"]
+            except Exception:
+                for idx, h in enumerate(horses):
+                    odds = h["odds"] if h["odds"] else 50.0
+                    h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                    h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
+                    h["score"] = h["prob_win"]
     elif model:
         try:
             n_mod = model.num_feature()
@@ -1784,7 +1831,7 @@ def compute_hybrid_rec_from_inputs(
     #    見送り: Score < 0.665 または 頭数不足/新馬/障害 (0円)
     # ------------------------------------------------------------------
     has_enough_horses = len(horses) >= 6
-    is_valid_race_type = (not is_shinba) and (surface_type != 2)
+    is_valid_race_type = (surface_type != 2)
 
     # AI勝率順
     s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
@@ -1867,41 +1914,55 @@ def compute_hybrid_rec_from_inputs(
         if len(trio_opponents) >= 5:
             break
 
-    # 馬連相手3頭 (軸: w0)
-    umaren_opponents = [w1_u]
-    for h in s_top3:
-        hu = int(h.get("umaban", 0))
-        if hu != w0_u and hu not in umaren_opponents:
-            umaren_opponents.append(hu)
-        if len(umaren_opponents) >= 3:
-            break
+    # 馬連相手3頭 (軸: w0) - 新馬戦は除外(0点)
+    umaren_opponents = []
+    if not is_shinba:
+        umaren_opponents.append(w1_u)
+        for h in s_top3:
+            hu = int(h.get("umaban", 0))
+            if hu != w0_u and hu not in umaren_opponents:
+                umaren_opponents.append(hu)
+            if len(umaren_opponents) >= 3:
+                break
 
     umaren_bets = []
     trio_bets = []
 
     if is_participate:
         # 配分設定
-        if is_tier1:  # 勝負馬券 (2x配分: 三連複200円×5点=1,000円 / 馬連400円×3点=1,200円)
-            trio_unit = 200
-            umaren_unit = 400
-            real_bet_level = "high"
-            real_bet_badge = f"🔥【超勝負R】厚め推奨{suffix}"
-            strategy_name = "🔥 勝負馬券 (上位2%超厳選・資金傾斜配分)"
-            strategy_type = "w_bet"
-        elif is_tier2:  # 実馬券 (1x配分: 三連複100円×5点=500円 / 馬連200円×3点=600円)
+        if is_tier1:
+            if w0_odds <= 4.5:
+                trio_unit = 200
+                umaren_unit = 400
+                real_bet_level = "high"
+                real_bet_badge = f"🔥【超勝負R】厚め推奨{suffix}"
+                strategy_name = "🔥 勝負馬券 (上位2%超厳選・本命厚め配分)"
+                strategy_type = "w_bet"
+            else:
+                trio_unit = 200
+                umaren_unit = 200
+                real_bet_level = "standard"
+                real_bet_badge = f"🎯【実戦推奨】オッズ配慮推奨{suffix}"
+                strategy_name = "🎯 実馬券 (上位2%・中穴軸オッズ管理)"
+                strategy_type = "w_bet"
+        elif is_tier2:
             trio_unit = 100
             umaren_unit = 200
             real_bet_level = "standard"
             real_bet_badge = f"🎯【実戦推奨】標準推奨{suffix}"
             strategy_name = "🎯 実馬券 (上位5%厳選・標準購入推奨)"
             strategy_type = "w_bet"
-        else:  # 仮想馬券 (1x配分: 三連複100円×5点=500円 / 馬連200円×3点=600円 / アプリ内集計のみ)
+        else:
             trio_unit = 100
             umaren_unit = 200
             real_bet_level = "virtual"
             real_bet_badge = f"📊【仮想集計R】アプリ内モニタリング{suffix}"
             strategy_name = "📊 仮想馬券 (上位12%・アプリ集計モニタリング)"
             strategy_type = "virtual"
+
+        if is_shinba:
+            strategy_type = "trio_only"
+            strategy_name += " [新馬特化: 三連複5点限定]"
 
         # 馬連買い目
         for opp in umaren_opponents:
@@ -1954,7 +2015,10 @@ def compute_hybrid_rec_from_inputs(
         total_amount = sum(b["amount"] for b in umaren_bets) + sum(b["amount"] for b in trio_bets)
         t_opps_str = ",".join(str(o) for o in trio_opponents)
         u_opps_str = ",".join(str(o) for o in umaren_opponents)
-        summary_str = f"{strategy_name} [馬連{len(umaren_bets)}点(軸{w0_u}→{u_opps_str}) ＋ 三連複{len(trio_bets)}点(軸[{t0_u}={t1_u}]→{t_opps_str}) / 計{total_amount:,}円]"
+        if is_shinba:
+            summary_str = f"{strategy_name} [三連複{len(trio_bets)}点(軸[{t0_u}={t1_u}]→{t_opps_str}) / 計{total_amount:,}円]"
+        else:
+            summary_str = f"{strategy_name} [馬連{len(umaren_bets)}点(軸{w0_u}→{u_opps_str}) ＋ 三連複{len(trio_bets)}点(軸[{t0_u}={t1_u}]→{t_opps_str}) / 計{total_amount:,}円]"
         reason_str = f"動的確信度スコア: {confidence_score:.3f} (閾値判定合致)"
 
         hybrid_rec = {
