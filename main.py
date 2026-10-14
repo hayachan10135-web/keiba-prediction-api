@@ -37,6 +37,11 @@ HEADERS_PC = {
     "Referer": "https://race.netkeiba.com/"
 }
 
+GLOBAL_VENUE_MAP = {
+    1: "札幌", 2: "函館", 3: "福島", 4: "新潟", 5: "東京",
+    6: "中山", 7: "中京", 8: "京都", 9: "阪神", 10: "小倉"
+}
+
 MODEL_PATH = "lgb_model.txt"
 WIN_MODEL_PATH = "lgb_win_model.txt"
 TOP3_MODEL_PATH = "lgb_top3_model.txt"
@@ -3445,7 +3450,7 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         if len(r_id_str) >= 12 and not r.get("venue_name"):
             try:
                 v_code = int(r_id_str[4:6])
-                r["venue_name"] = VENUE_MAP.get(v_code, "JRA")
+                r["venue_name"] = GLOBAL_VENUE_MAP.get(v_code, "JRA")
             except Exception:
                 pass
         if len(r_id_str) >= 12 and not r.get("race_num"):
