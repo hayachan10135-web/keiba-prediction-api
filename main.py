@@ -996,6 +996,8 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
 def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS_PC, timeout=10)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"netkeiba出馬表の取得に失敗しました (Status: {resp.status_code})。ダミー値生成は行いません。")
     raw_head = resp.content[:300].lower()
     if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head or b"utf-8" in raw_head:
         html = resp.content.decode("utf-8", errors="replace")
@@ -1171,7 +1173,9 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
                 wakuban = int(wm.group())
 
         name_tag = row.select_one(".HorseName a, .Horse_Info a")
-        horse_name = name_tag.get_text(strip=True) if name_tag else f"馬{umaban}"
+        if not name_tag or not name_tag.get_text(strip=True):
+            raise HTTPException(status_code=502, detail=f"出馬表から馬番 {umaban} の正式な馬名を取得できませんでした (ダミー値補完禁止)")
+        horse_name = name_tag.get_text(strip=True)
 
         jockey_tag = row.select_one(".Jockey a")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
@@ -1262,6 +1266,9 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         "is_female_only_text": is_female_only_text
     }
 
+    if not horses or len(horses) == 0:
+        raise HTTPException(status_code=502, detail=f"レース {race_id} の出走馬データが0頭です。不完全なデータは処理できません。")
+
     return race_name, race_details, sorted(horses, key=lambda x: x["umaban"]), course_meta
 
 
@@ -1316,13 +1323,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         "summary": "推奨馬なし (見送り)"
     }
 
-    if not horses:
-        return {
-            "race_name": race_name,
-            "race_details": race_details,
-            "horses": [],
-            "recommendation": empty_recommendation
-        }
+    if not horses or len(horses) == 0:
+        raise ValueError(f"レース {race_id} の出走馬データが空のため予想を生成できません。ダミー値による補完は禁止されています。")
 
     expected_num_features = 48
     if model_win:
@@ -1645,12 +1647,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                     h["prob_win"] = round(float(w_scores[idx]), 4)
                     h["prob_top3"] = round(float(t_scores[idx]), 4)
                     h["score"] = h["prob_win"]
-            except Exception:
-                for idx, h in enumerate(horses):
-                    odds = h["odds"] if h["odds"] else 50.0
-                    h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                    h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                    h["score"] = h["prob_win"]
+            except Exception as e:
+                raise RuntimeError(f"AIモデル(Win/Top3)推論エラー ({race_id}): {e}")
     elif model:
         try:
             n_mod = model.num_feature()
@@ -1659,19 +1657,10 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
                 h["prob_win"] = round(float(scores[idx]), 4)
                 h["prob_top3"] = round(float(scores[idx]), 4)
                 h["score"] = round(float(scores[idx]), 4)
-        except Exception:
-            for idx, h in enumerate(horses):
-                odds = h["odds"] if h["odds"] else 50.0
-                h["prob_win"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                h["prob_top3"] = round(float(1.0 / (1.0 + (odds ** 0.5))), 4)
-                h["score"] = h["prob_win"]
+        except Exception as e:
+            raise RuntimeError(f"AIモデル推論エラー ({race_id}): {e}")
     else:
-        for idx, h in enumerate(horses):
-            odds = h["odds"] if h["odds"] else 50.0
-            base_score = 1.0 / (1.0 + (odds ** 0.5))
-            h["prob_win"] = round(float(base_score), 4)
-            h["prob_top3"] = round(float(base_score), 4)
-            h["score"] = round(float(base_score), 4)
+        raise RuntimeError(f"AIモデルがロードされていないため、レース {race_id} の推論を実行できません。")
 
     # 1着特化モデルのスコア順で◎, ◯を決定
     sorted_by_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
@@ -1725,14 +1714,16 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "summary": summary_text
         }
     else:
-        recommendation = empty_recommendation
+        raise ValueError(f"レース {race_id} の本命馬(◎)を特定できませんでした。ダミー買い目の生成は禁止されています。")
 
     # -------------------------------------------------------------
     # ★ 波乱度メタモデル × 動的資金配分・券種切り替え戦略
     # -------------------------------------------------------------
     hybrid_rec: Optional[dict] = None
-    if len(horses) >= 3:
-        # 馬番・印の取得
+    if len(horses) < 3:
+        raise ValueError(f"レース {race_id} の出走頭数が少なすぎます ({len(horses)}頭)。ダミー予想の生成は禁止されています。")
+
+    # 馬番・印の取得
         h_honmei = next((h for h in horses if h["mark"] == "◎"), sorted_horses[0])
         h_taiko = next((h for h in horses if h["mark"] == "◯"), (sorted_horses[1] if len(sorted_horses) > 1 else sorted_horses[0]))
         h_kuro = next((h for h in horses if h["mark"] == "▲"), (sorted_horses[2] if len(sorted_horses) > 2 else sorted_horses[0]))
@@ -1778,20 +1769,21 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             float(turn_type), float(race_class_code), float(is_female_only), float(kinryo_std_in_race)
         ]
 
-        prob_gachi = 0.0
-        prob_himo = 0.0
-        if model_gachi:
-            try:
-                n_g = model_gachi.num_feature()
-                prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
-            except Exception:
-                prob_gachi = 0.0
-        if model_himo:
-            try:
-                n_h = model_himo.num_feature()
-                prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
-            except Exception:
-                prob_himo = 0.0
+        if not model_gachi:
+            raise RuntimeError(f"model_gachi がロードされていないため、レース {race_id} のガチ度を推論できません。")
+        try:
+            n_g = model_gachi.num_feature()
+            prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
+        except Exception as e:
+            raise RuntimeError(f"model_gachi 推論エラー ({race_id}): {e}")
+
+        if not model_himo:
+            raise RuntimeError(f"model_himo がロードされていないため、レース {race_id} の混戦度を推論できません。")
+        try:
+            n_h = model_himo.num_feature()
+            prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
+        except Exception as e:
+            raise RuntimeError(f"model_himo 推論エラー ({race_id}): {e}")
 
         # Webリアルタイムオッズ取得
         real_odds_data = fetch_real_odds(race_id)
@@ -2211,6 +2203,15 @@ def get_cached_prediction(race_id: str) -> Optional[dict]:
 def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
     if not supabase:
         return
+    horses = (data_dict or {}).get("horses", [])
+    if not horses or len(horses) == 0:
+        print(f"[SaveCache Warning] レース {race_id} の出走馬が0頭のためキャッシュ保存を拒絶しました。")
+        return
+    for h in horses:
+        h_name = h.get("horse_name", "")
+        if not h_name or re.match(r"^馬\d+$", h_name):
+            print(f"[SaveCache Warning] レース {race_id} にダミー馬名 '{h_name}' が含まれるためキャッシュ保存を拒絶しました。")
+            return
     try:
         supabase.table("keiba_predictions_cache").upsert({
             "race_id": race_id,
@@ -4991,6 +4992,28 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
     """検証済みの予想・収支結果・スケジュールデータをSupabaseに一括アップサート"""
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase未接続")
+
+    # バリデーション: 不完全データ、ダミー馬名、出走馬0頭のアップサートを厳格に遮断
+    if payload.predictions:
+        for p in payload.predictions:
+            r_id = p.get("race_id", "")
+            d_json = p.get("data_json", {})
+            horses = d_json.get("horses", [])
+            if not horses or len(horses) == 0:
+                raise HTTPException(status_code=400, detail=f"不正データ拒絶: レース {r_id} の出走馬データが0頭です。")
+            for h in horses:
+                h_name = h.get("horse_name", "")
+                if not h_name or re.match(r"^馬\d+$", h_name):
+                    raise HTTPException(status_code=400, detail=f"不正データ拒絶: レース {r_id} にダミー馬名 '{h_name}' (馬番 {h.get('umaban')}) が含まれています。")
+
+    if payload.settlements:
+        for s in payload.settlements:
+            r_id = s.get("race_id", "")
+            h_name = s.get("horse_name", "")
+            if not s.get("is_cancelled") and s.get("strategy_type") != "cancelled":
+                if not h_name or re.match(r"^馬\d+$", h_name):
+                    raise HTTPException(status_code=400, detail=f"不正データ拒絶: レース {r_id} の本命馬名がダミー '{h_name}' です。")
+
     pred_count = 0
     settle_count = 0
     sched_count = 0
