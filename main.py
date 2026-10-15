@@ -287,6 +287,13 @@ class HybridRecommendation(BaseModel):
     real_bet_badge: Optional[str] = None
     real_bet_level: Optional[str] = None
     is_final_odds: Optional[bool] = False
+    # 仮想馬券フィールド
+    is_virtual_bet_target: Optional[bool] = False
+    virtual_bet_slot: Optional[int] = None
+    virtual_strategy_name: Optional[str] = None
+    virtual_badge: Optional[str] = None
+    virtual_bets: Optional[List[TicketBet]] = []
+    virtual_total_amount: Optional[int] = 0
 
 class TanFukuRecommendation(BaseModel):
     target_umaban: Optional[int]
@@ -929,14 +936,21 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
         try:
             p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
             for row in (p_res.data or []):
-                h_rec = (row.get("data_json") or {}).get("hybrid_recommendation")
+                d_json = row.get("data_json") or {}
+                h_rec = d_json.get("hybrid_recommendation")
+                r_name = d_json.get("race_name", "")
                 if h_rec:
                     cached_preds_map[row["race_id"]] = {
                         "is_real_bet_target": h_rec.get("is_real_bet_target", False),
                         "real_bet_badge": h_rec.get("real_bet_badge"),
                         "real_bet_level": h_rec.get("real_bet_level", "none"),
                         "edge_ratio": h_rec.get("edge_ratio"),
-                        "is_final_odds": h_rec.get("is_final_odds", False)
+                        "is_final_odds": h_rec.get("is_final_odds", False),
+                        "confidence_score": float(h_rec.get("confidence_score") or 0.0),
+                        "is_virtual_bet_target": h_rec.get("is_virtual_bet_target", False),
+                        "virtual_bet_slot": h_rec.get("virtual_bet_slot"),
+                        "virtual_badge": h_rec.get("virtual_badge"),
+                        "race_name": r_name
                     }
         except Exception as e:
             print(f"レース一覧キャッシュ付与エラー: {e}")
@@ -955,7 +969,8 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
             print(f"レース一覧確定情報付与エラー: {se}")
 
     for venue in venues:
-        for race in venue.get("races", []):
+        races_in_venue = venue.get("races", [])
+        for race in races_in_venue:
             info = cached_preds_map.get(race["race_id"])
             if info:
                 race["is_real_bet_target"] = info["is_real_bet_target"]
@@ -966,12 +981,18 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["real_bet_level"] = info.get("real_bet_level", "none")
                 race["edge_ratio"] = info["edge_ratio"]
                 race["is_final_odds"] = info["is_final_odds"]
+                race["confidence_score"] = info.get("confidence_score", 0.0)
+                race["is_virtual_bet_target"] = info.get("is_virtual_bet_target", False)
+                race["virtual_bet_slot"] = info.get("virtual_bet_slot")
             else:
                 race["is_real_bet_target"] = False
                 race["real_bet_badge"] = None
                 race["real_bet_level"] = "none"
                 race["edge_ratio"] = None
                 race["is_final_odds"] = False
+                race["confidence_score"] = 0.0
+                race["is_virtual_bet_target"] = False
+                race["virtual_bet_slot"] = None
 
             s_info = settled_map.get(race["race_id"])
             if s_info:
@@ -982,6 +1003,29 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_settled"] = 0
                 race["is_hit"] = 0
                 race["is_pass"] = 0
+
+        # 各会場ごとに確信度上位3レースを「仮想馬券枠 (各場3R)」として保証
+        # （平地・新馬戦・障害戦除くレースの中で確信度が高い順）
+        eligible_for_virtual = []
+        for r in races_in_venue:
+            r_nm = r.get("race_name", "")
+            r_info = r.get("race_info", "")
+            is_shinba = ("新馬" in r_nm) or ("メイクデビュー" in r_nm)
+            is_obstacle = ("障害" in r_nm) or ("障" in r_info)
+            if not is_shinba and not is_obstacle:
+                eligible_for_virtual.append(r)
+
+        # 確信度順にソートして上位3レースを選出
+        eligible_for_virtual.sort(key=lambda x: x.get("confidence_score", 0.0), reverse=True)
+        top3_virtual = eligible_for_virtual[:3]
+        for slot_idx, v_race in enumerate(top3_virtual, start=1):
+            v_race["is_virtual_bet_target"] = True
+            v_race["virtual_bet_slot"] = slot_idx
+            # リアル勝負枠でない場合は「仮想観戦」バッジとレベルを付与
+            if not v_race.get("is_real_bet_target"):
+                v_race["real_bet_level"] = "virtual"
+                v_race["real_bet_badge"] = f"🎮【仮想観戦】第{slot_idx}推奨"
+
     return venues
 
 
@@ -2129,6 +2173,41 @@ def compute_hybrid_rec_from_inputs(
                 "memo": f"複勝(防衛) {w0_u}番 ({w0_name}) 300円"
             })
 
+        # -------------------------------------------------------------
+        # 優先度 4: 戦略A-2 (芝波乱妙味拾い上げ: 単500円＋複500円)
+        # 条件: 芝 かつ confidence_score >= 0.70 かつ w0_odds >= 6.0 かつ prob_gachi <= 0.10
+        # -------------------------------------------------------------
+        elif surface_type == 0 and confidence_score >= 0.70 and w0_odds >= 6.0 and prob_gachi <= 0.10:
+            assigned_tier = "A_hole"
+            strategy_type = "strategy_a_hole"
+            strategy_name = "⚡ 戦略A-2: 芝波乱妙味 (単500円＋複500円)"
+            real_bet_badge = f"⚡【芝波乱妙味】単複好配当狙い{suffix}"
+            real_bet_level = "standard"
+            is_participate = True
+            is_real_bet_target = True
+
+            tansho_bets.append({
+                "ticket_type": "単勝",
+                "combination": [w0_u],
+                "combination_str": f"{w0_u}",
+                "amount": 500,
+                "odds": w0_odds,
+                "expected_payout": int(round(500 * w0_odds)),
+                "is_real_odds": True,
+                "memo": f"単勝(妙味狙い) {w0_u}番 ({w0_name}) 500円"
+            })
+            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
+            fukusho_bets.append({
+                "ticket_type": "複勝",
+                "combination": [w0_u],
+                "combination_str": f"{w0_u}",
+                "amount": 500,
+                "odds": est_fuku_odds,
+                "expected_payout": int(round(500 * est_fuku_odds)),
+                "is_real_odds": False,
+                "memo": f"複勝(妙味狙い) {w0_u}番 ({w0_name}) 500円"
+            })
+
         else:
             # カスケード全条件不一致 -> 見送り
             is_participate = False
@@ -2163,7 +2242,7 @@ def compute_hybrid_rec_from_inputs(
     if is_participate:
         if assigned_tier == "B":
             summary_str = f"{strategy_name} [単勝{w0_u}番 500円 ＋ 馬単{len(umatan_bets)}点 各200円 / 計{total_amount:,}円]"
-        elif assigned_tier == "A":
+        elif assigned_tier in ("A", "A_hole"):
             summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u}番 {w0_name}) / 計{total_amount:,}円]"
         elif assigned_tier == "C":
             summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u}番 {w0_name}) / 計{total_amount:,}円]"
@@ -2171,6 +2250,45 @@ def compute_hybrid_rec_from_inputs(
     else:
         summary_str = f"見送り推奨 ({skip_reason})"
         reason_str = skip_reason
+
+    # 仮想馬券 (Tier 2 観戦枠 / 単100円 + 複100円)
+    virtual_bets = []
+    virtual_total_amount = 0
+    virtual_strategy_name = None
+    virtual_badge = None
+
+    if is_real_bet_target:
+        virtual_bets = tansho_bets + fukusho_bets + umatan_bets
+        virtual_total_amount = total_amount
+        virtual_strategy_name = strategy_name
+        virtual_badge = real_bet_badge
+    elif is_valid_race_type and w0_u > 0:
+        est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
+        virtual_strategy_name = "🎮 仮想観戦枠: 安定単複 (単100円＋複100円)"
+        virtual_badge = "🎮【仮想観戦】単複ミニマム"
+        virtual_bets = [
+            {
+                "ticket_type": "単勝",
+                "combination": [w0_u],
+                "combination_str": f"{w0_u}",
+                "amount": 100,
+                "odds": w0_odds,
+                "expected_payout": int(round(100 * w0_odds)),
+                "is_real_odds": True,
+                "memo": f"単勝 {w0_u}番 ({w0_name}) 100円"
+            },
+            {
+                "ticket_type": "複勝",
+                "combination": [w0_u],
+                "combination_str": f"{w0_u}",
+                "amount": 100,
+                "odds": est_fuku_odds,
+                "expected_payout": int(round(100 * est_fuku_odds)),
+                "is_real_odds": False,
+                "memo": f"複勝 {w0_u}番 ({w0_name}) 100円"
+            }
+        ]
+        virtual_total_amount = 200
 
     hybrid_rec = {
         "is_participate": is_participate,
@@ -2200,7 +2318,14 @@ def compute_hybrid_rec_from_inputs(
         "is_real_bet_target": is_real_bet_target,
         "real_bet_badge": real_bet_badge,
         "real_bet_level": real_bet_level,
-        "is_final_odds": is_final_odds
+        "is_final_odds": is_final_odds,
+        # 仮想馬券フィールド
+        "is_virtual_bet_target": is_real_bet_target, # リアル対象は仮想枠にも自動認定
+        "virtual_bet_slot": None,
+        "virtual_strategy_name": virtual_strategy_name,
+        "virtual_badge": virtual_badge,
+        "virtual_bets": virtual_bets,
+        "virtual_total_amount": virtual_total_amount
     }
 
     return hybrid_rec
