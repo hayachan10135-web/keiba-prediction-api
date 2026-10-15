@@ -5582,6 +5582,48 @@ def endpoint_refresh_stats_dict(rebuild_from_cached_results: bool = False):
     }
 
 
+@app.get("/admin/test-umaca-connection")
+def endpoint_test_umaca_connection():
+    """Renderコンテナ上からJRA（UMACAスマートおよび照会サービス）へのネットワーク疎通テスト"""
+    urls = {
+        "voting_site": "https://www.ipat.jra.go.jp/sp/umaca/",
+        "inquiry_site": "https://www.nvinq.jra.go.jp/jrasp/SMP000400",
+        "jra_top": "https://www.jra.go.jp/"
+    }
+    results = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    }
+
+    for name, url in urls.items():
+        try:
+            start_t = time.time()
+            resp = requests.get(url, headers=headers, timeout=10)
+            elapsed = round(time.time() - start_t, 2)
+            html_snippet = resp.text[:300].replace("\n", " ").strip()
+            is_blocked = resp.status_code in (403, 401, 503) or "アクセスが制限されています" in resp.text
+            results[name] = {
+                "status_code": resp.status_code,
+                "elapsed_sec": elapsed,
+                "is_blocked": is_blocked,
+                "content_bytes": len(resp.content),
+                "snippet": html_snippet[:120]
+            }
+        except Exception as e:
+            results[name] = {
+                "status_code": None,
+                "error": str(e)
+            }
+
+    can_reach_all = all(r.get("status_code") == 200 for r in results.values())
+    return {
+        "status": "ok",
+        "can_reach_all": can_reach_all,
+        "render_ip_check": results,
+        "summary": "【接続成功】RenderからJRAへの通信はブロックされていません。クラウド化が可能です。" if can_reach_all else "【接続制限あり】一部の通信がブロックされています。"
+    }
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
