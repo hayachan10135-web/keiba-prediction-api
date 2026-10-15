@@ -44,6 +44,15 @@ GLOBAL_VENUE_MAP = {
     6: "中山", 7: "中京", 8: "京都", 9: "阪神", 10: "小倉"
 }
 
+CANCELLED_RACE_NAMES = {
+    "202605010308": "東京8R (積雪中止)",
+    "202605010309": "東京9R (積雪中止)",
+    "202605010310": "東京10R (積雪中止)",
+    "202605010311": "東京11R 早春S (積雪中止)",
+    "202605010312": "東京12R (積雪中止)",
+    "202610010604": "小倉4R (中止)",
+}
+
 MODEL_PATH = "lgb_model.txt"
 WIN_MODEL_PATH = "lgb_win_model.txt"
 TOP3_MODEL_PATH = "lgb_top3_model.txt"
@@ -3682,6 +3691,24 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
                 r["race_num"] = f"{r_num_int}R"
             except Exception:
                 pass
+
+        # 中止レース正式名称の補完
+        if r_id_str in CANCELLED_RACE_NAMES:
+            r["race_name"] = CANCELLED_RACE_NAMES[r_id_str]
+
+        # 収支・回収率の算術整合性を厳密保証
+        r_bet = r.get("total_bet") or 0
+        r_payout = r.get("total_payout") or 0
+        if r.get("strategy_type") == "cancelled" or r.get("hit_type") == "開催中止":
+            r["total_bet"] = 0
+            r["total_payout"] = 0
+            r["profit"] = 0
+            r["recovery_rate"] = 0.0
+            r["is_pass"] = 1
+            r["is_hit"] = 0
+        else:
+            r["profit"] = r_payout - r_bet
+            r["recovery_rate"] = round((r_payout / r_bet) * 100.0, 1) if r_bet > 0 else 0.0
 
     total_races = len(rows)
     bet_races = sum(1 for r in rows if r.get("is_pass") == 0)
