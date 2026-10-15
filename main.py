@@ -576,8 +576,9 @@ def fetch_real_odds(race_id: str) -> dict:
 
 
 # --- 開催期間（土曜日 〜 次週金曜日 20:00）管理ヘルパー ---
-_period_venues_cache: Dict[str, List[dict]] = {}
+_period_venues_cache: Dict[str, Any] = {}
 _period_checked_empty_dates: set = set()
+_latest_post_times: Dict[str, str] = {}  # {race_id: "09:50発走"} (スクレイピングした実際の最新出走時刻)
 
 
 def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dict[str, Any]:
@@ -613,9 +614,10 @@ def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dic
 
 def clear_kaisai_period_caches():
     """金曜20:00の開催期間キャッシュ破棄（成績 keiba_race_settlements は永続保持）"""
-    global _period_venues_cache, _period_checked_empty_dates
+    global _period_venues_cache, _period_checked_empty_dates, _latest_post_times
     _period_venues_cache.clear()
     _period_checked_empty_dates.clear()
+    _latest_post_times.clear()
     if not supabase:
         return
     try:
@@ -683,55 +685,43 @@ def register_race_schedule(race_id: str, race_date: str, race_name: str, post_ti
 
 
 def ensure_schedules_registered_for_venues(formatted_date: str, venues: List[dict]):
-    """レース一覧取得時に未登録のレーススケジュールを一括で keiba_scheduled_races に同期"""
-    if not supabase or not venues:
+    """レース一覧取得時に実際の最新発走時刻を keiba_scheduled_races および _latest_post_times に同期（発走時刻変更対応）"""
+    if not venues:
         return
     try:
-        existing_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", formatted_date).execute()
-        existing_ids = {r["race_id"] for r in (existing_res.data or [])}
-
-        all_race_items = []
+        d_parts = [int(p) for p in formatted_date.split("-")]
+        updates_for_schedule = []
         for v in venues:
             for r in v.get("races", []):
-                if r.get("race_id") and r["race_id"] not in existing_ids:
-                    all_race_items.append(r)
+                r_id = r.get("race_id")
+                if not r_id:
+                    continue
+                r_info = r.get("race_info") or r.get("race_name") or ""
+                m = re.search(r"(\d{1,2}):(\d{2})", r_info)
+                if m:
+                    hour, minute = int(m.group(1)), int(m.group(2))
+                    post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
+                    post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    post_time_str = f"{hour:02d}:{minute:02d}発走"
+                    _latest_post_times[r_id] = post_time_str
+                    updates_for_schedule.append({
+                        "race_id": r_id,
+                        "race_date": formatted_date,
+                        "race_name": r.get("race_name", r.get("race_no", "")),
+                        "post_datetime": post_dt_str,
+                        "post_time_str": post_time_str
+                    })
 
-        if not all_race_items:
-            return
-
-        # 既に予想や確定成績が存在する場合はフラグを引き継ぐ
-        pred_ids = set()
-        settled_ids = set()
-        try:
-            p_res = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", formatted_date).execute()
-            pred_ids = {r["race_id"] for r in (p_res.data or [])}
-        except Exception:
-            pass
-        try:
-            s_res = supabase.table("keiba_race_settlements").select("race_id").eq("race_date", formatted_date).execute()
-            settled_ids = {r["race_id"] for r in (s_res.data or [])}
-        except Exception:
-            pass
-
-        d_parts = [int(p) for p in formatted_date.split("-")]
-        rows_to_upsert = []
-        for r in all_race_items:
-            r_id = r["race_id"]
-            r_info = r.get("race_info") or r.get("race_name") or ""
-            m = re.search(r"(\d{1,2}):(\d{2})", r_info)
-            hour, minute = (int(m.group(1)), int(m.group(2))) if m else (15, 0)
-            post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
-            rows_to_upsert.append({
-                "race_id": r_id,
-                "race_date": formatted_date,
-                "race_name": r.get("race_name", r.get("race_no", "")),
-                "post_datetime": post_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "is_predicted": 2 if r_id in pred_ids else 0,
-                "is_settled": 1 if r_id in settled_ids else 0
-            })
-
-        if rows_to_upsert:
-            supabase.table("keiba_scheduled_races").upsert(rows_to_upsert, on_conflict="race_id").execute()
+        if supabase and updates_for_schedule:
+            # 1. keiba_scheduled_races の post_datetime を最新時刻で更新
+            for row in updates_for_schedule:
+                try:
+                    supabase.table("keiba_scheduled_races").update({
+                        "post_datetime": row["post_datetime"],
+                        "race_name": row["race_name"]
+                    }).eq("race_id", row["race_id"]).execute()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"スケジュール一括同期エラー ({formatted_date}): {e}")
 
@@ -782,8 +772,10 @@ def parse_netkeiba_race_list_html(html_text: str):
         raw_text = a.get_text(separator=" ", strip=True)
         clean_text = " ".join(raw_text.split())
 
-        post_m = re.search(r"(\d{1,2}:\d{2})", clean_text)
-        post_time_est = f"{post_m.group(1)}発走" if post_m else ""
+        all_post_m = re.findall(r"(\d{1,2}:\d{2})", clean_text)
+        post_time_est = f"{all_post_m[-1]}発走" if all_post_m else ""
+        if post_time_est:
+            _latest_post_times[race_id] = post_time_est
 
         if venue_name not in raw_venue_races:
             raw_venue_races[venue_name] = []
@@ -833,15 +825,25 @@ def parse_netkeiba_race_list_html(html_text: str):
     return venues_data
 
 
-def fetch_venues_for_date_raw(date_str: str) -> List[dict]:
-    """指定日付 (YYYY-MM-DD または YYYYMMDD) のJRA開催会場・レース一覧を取得しキャッシュ"""
+def fetch_venues_for_date_raw(date_str: str, force_refresh: bool = False) -> List[dict]:
+    """指定日付 (YYYY-MM-DD または YYYYMMDD) のJRA開催会場・レース一覧を取得しキャッシュ (出走時刻変更対応)"""
     clean_d = date_str.replace("-", "")
     if len(clean_d) != 8 or not clean_d.isdigit():
         return []
     formatted_date = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}"
 
-    if formatted_date in _period_venues_cache:
-        return json.loads(json.dumps(_period_venues_cache[formatted_date]))
+    now = time.time()
+    today_s = today_jst_str()
+    # 当日開催日（または指定日）の出走時刻変更を迅速に検知するためTTLを60秒とする
+    cache_ttl = 60.0 if formatted_date == today_s else 3600.0
+
+    if not force_refresh and formatted_date in _period_venues_cache:
+        c_entry = _period_venues_cache[formatted_date]
+        if isinstance(c_entry, dict) and "venues" in c_entry:
+            if now - c_entry.get("updated_at", 0) < cache_ttl:
+                return json.loads(json.dumps(c_entry["venues"]))
+        elif isinstance(c_entry, list):
+            return json.loads(json.dumps(c_entry))
 
     urls = [
         f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={clean_d}",
@@ -864,7 +866,10 @@ def fetch_venues_for_date_raw(date_str: str) -> List[dict]:
             # 1会場あたり8R以上ある場合のみ正式な出走表確定済み開催日とみなす（次週の未確定枠を除外）
             valid_venues = [v for v in venues if len(v.get("races", [])) >= 8]
             if valid_venues:
-                _period_venues_cache[formatted_date] = valid_venues
+                _period_venues_cache[formatted_date] = {
+                    "venues": valid_venues,
+                    "updated_at": now
+                }
                 ensure_schedules_registered_for_venues(formatted_date, valid_venues)
                 return json.loads(json.dumps(valid_venues))
         except Exception:
@@ -1030,7 +1035,10 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
 
 
 @app.get("/races/today")
-def get_today_races(date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)")):
+def get_today_races(
+    date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)"),
+    force_refresh: bool = Query(False, description="手動でレース一覧・発走時刻を再取得する場合True")
+):
     now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
 
@@ -1064,7 +1072,7 @@ def get_today_races(date: Optional[str] = Query(None, description="対象日付 
         else:
             target_date = available_dates[-1]
 
-    venues = fetch_venues_for_date_raw(target_date)
+    venues = fetch_venues_for_date_raw(target_date, force_refresh=force_refresh)
     if venues:
         if target_date not in available_dates:
             available_dates = sorted(list(set(available_dates + [target_date])))
@@ -1138,8 +1146,15 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     race_data2_tag = soup.select_one(".RaceData02")
     race_data2_text = race_data2_tag.get_text(separator=" ", strip=True) if race_data2_tag else ""
 
-    post_time_m = re.search(r"(\d{1,2}:\d{2})\s*発走", race_data_text)
-    post_time = f"{post_time_m.group(1)}発走" if post_time_m else ""
+    all_post_m = re.findall(r"(\d{1,2}:\d{2})\s*発走", race_data_text)
+    if all_post_m:
+        post_time = f"{all_post_m[-1]}発走"
+    else:
+        post_time_m = re.search(r"(\d{1,2}:\d{2})", race_data_text)
+        post_time = f"{post_time_m.group(1)}発走" if post_time_m else ""
+
+    if post_time:
+        _latest_post_times[race_id] = post_time
 
     weather_m = re.search(r"天候\s*:\s*([^\s/]+)", race_data_text)
     weather = weather_m.group(1) if weather_m else ""
@@ -2378,6 +2393,33 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         for h in cached_pred.get("horses", []):
             if "score" not in h or h["score"] is None:
                 h["score"] = round(float(h.get("prob_win") or 0.0) * 100.0, 1)
+
+        # ★ 実際の最新出走時刻の反映・更新（固定マップからの是正および発走時刻変更対応） ★
+        latest_pt = _latest_post_times.get(race_id)
+        if not latest_pt and supabase:
+            try:
+                s_res = supabase.table("keiba_scheduled_races").select("post_datetime").eq("race_id", race_id).execute()
+                if s_res.data and s_res.data[0].get("post_datetime"):
+                    p_dt_raw = s_res.data[0]["post_datetime"]
+                    m_pt = re.search(r"(\d{1,2}):(\d{2})", p_dt_raw)
+                    if m_pt:
+                        latest_pt = f"{int(m_pt.group(1)):02d}:{int(m_pt.group(2)):02d}発走"
+                        _latest_post_times[race_id] = latest_pt
+            except Exception:
+                pass
+
+        if latest_pt:
+            r_details = cached_pred.get("race_details") or {}
+            cur_pt = r_details.get("post_time", "")
+            if cur_pt != latest_pt:
+                r_details["post_time"] = latest_pt
+                cached_pred["race_details"] = r_details
+                if supabase:
+                    try:
+                        supabase.table("keiba_predictions_cache").update({"data_json": cached_pred}).eq("race_id", race_id).execute()
+                    except Exception as ue:
+                        print(f"予想キャッシュ出走時刻更新エラー ({race_id}): {ue}")
+
         return cached_pred
 
     try:
@@ -5260,6 +5302,56 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/sync-active-post-times")
+def endpoint_sync_active_post_times(dates: Optional[str] = Query(None, description="カンマ区切りの対象日 (YYYY-MM-DD)")):
+    """現在メイン画面に表示される開催期間の全レースについて、実際の出走時刻をスクレイピングしてDBに反映（変更対応）"""
+    if dates:
+        target_dates = [d.strip() for d in dates.split(",") if d.strip()]
+    else:
+        now_dt = now_jst_naive()
+        target_dates = discover_period_kaisai_dates(now_dt)
+        if not target_dates:
+            target_dates = ["2026-10-12", "2026-10-11", "2026-10-10"]
+
+    results = {}
+    for d_str in target_dates:
+        venues = fetch_venues_for_date_raw(d_str, force_refresh=True)
+        count = 0
+        for v in venues:
+            for r in v.get("races", []):
+                r_id = r.get("race_id")
+                r_info = r.get("race_info", "")
+                m = re.search(r"(\d{1,2}):(\d{2})", r_info)
+                if r_id and m:
+                    hour_int, min_int = int(m.group(1).split(":")[0]), int(m.group(1).split(":")[1])
+                    pt_str = f"{hour_int:02d}:{min_int:02d}発走"
+                    _latest_post_times[r_id] = pt_str
+                    # DB更新
+                    if supabase:
+                        try:
+                            # 1. scheduled_races
+                            d_parts = [int(p) for p in d_str.split("-")]
+                            post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour_int, min_int, 0)
+                            supabase.table("keiba_scheduled_races").update({
+                                "post_datetime": post_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            }).eq("race_id", r_id).execute()
+                            # 2. predictions_cache
+                            p_res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", r_id).execute()
+                            if p_res.data and p_res.data[0].get("data_json"):
+                                dj = p_res.data[0]["data_json"]
+                                dj_details = dj.get("race_details") or {}
+                                if dj_details.get("post_time") != pt_str:
+                                    dj_details["post_time"] = pt_str
+                                    dj["race_details"] = dj_details
+                                    supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", r_id).execute()
+                        except Exception:
+                            pass
+                    count += 1
+        results[d_str] = count
+
+    return {"status": "ok", "updated_races_by_date": results}
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
@@ -5267,3 +5359,6 @@ async def startup_event():
     normalize_mislabeled_dates()
     fix_cancelled_races_2026()
     asyncio.create_task(background_maintenance_loop())
+    # 起動時にメイン画面対象日の出走時刻をバックグラウンドで最新化
+    asyncio.create_task(asyncio.to_thread(endpoint_sync_active_post_times, None))
+
