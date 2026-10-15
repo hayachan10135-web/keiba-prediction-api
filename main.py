@@ -2564,25 +2564,25 @@ def calculate_hybrid_pass_benefit_info(
     actual_order: Optional[int],
     pred_data: Optional[dict] = None
 ) -> dict:
-    """見送りレースにおける仮想損益 (+1,000円 - 的中時払戻) の算出"""
-    hypo_bet = 1000
+    """見送りレースにおける仮想損益 (+200円 - 的中時払戻) の算出"""
+    hypo_bet = 200
     hypo_pay = 0
     payouts_data = race_res.get("payouts", {}) if race_res else {}
     tan_map = payouts_data.get("tansho", {})
     fuku_map = payouts_data.get("fukusho", {})
 
-    # 本命馬の単複(単700+複300)を仮想買い目として検証
+    # 本命馬の単複(単100+複100)を仮想買い目として検証
     hit_details = []
     if target_u is not None:
         unit_tan = tan_map.get(target_u, 0) or tan_map.get(str(target_u), 0)
         unit_fuku = fuku_map.get(target_u, 0) or fuku_map.get(str(target_u), 0)
-        pay_tan = int(7 * unit_tan)
-        pay_fuku = int(3 * unit_fuku)
+        pay_tan = int(1 * unit_tan)
+        pay_fuku = int(1 * unit_fuku)
         hypo_pay = pay_tan + pay_fuku
         if pay_tan > 0:
-            hit_details.append(f"単勝{target_u}番({pay_tan:,}円)")
+            hit_details.append(f"単勝{target_u}({pay_tan:,}円)")
         if pay_fuku > 0:
-            hit_details.append(f"複勝{target_u}番({pay_fuku:,}円)")
+            hit_details.append(f"複勝{target_u}({pay_fuku:,}円)")
 
     pass_benefit = hypo_bet - hypo_pay
 
@@ -2591,7 +2591,11 @@ def calculate_hybrid_pass_benefit_info(
     top3_orders = extract_top3_orders(pred_data, orders)
     marks_summary = format_mark_orders_text(mark_orders)
 
-    reason_str = h_rec.get("reason", "期待値基準外") if h_rec else "見送り推奨"
+    raw_reason = h_rec.get("reason", "期待値基準外") if h_rec else "見送り推奨"
+    if "条件不一致" in raw_reason:
+        reason_str = "条件不一致 (資金保全のため見送り)"
+    else:
+        reason_str = raw_reason
     hit_summary = f" ({' ＆ '.join(hit_details)} 的中)" if hit_details else " (不的中・払戻0円)"
     benefit_note = "資金保全成功！" if pass_benefit > 0 else (f"機会損失 (-{abs(pass_benefit):,}円)" if pass_benefit < 0 else "損益なし")
     marks_line = f"\n{marks_summary}" if marks_summary else ""
