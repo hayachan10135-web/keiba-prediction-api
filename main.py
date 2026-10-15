@@ -2262,7 +2262,7 @@ def compute_hybrid_rec_from_inputs(
         virtual_total_amount = total_amount
         virtual_strategy_name = strategy_name
         virtual_badge = real_bet_badge
-    elif is_valid_race_type and w0_u > 0:
+    elif w0_u > 0:
         est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
         virtual_strategy_name = "🎮 仮想観戦枠: 安定単複 (単100円＋複100円)"
         virtual_badge = "🎮【仮想観戦】単複ミニマム"
@@ -2275,7 +2275,7 @@ def compute_hybrid_rec_from_inputs(
                 "odds": w0_odds,
                 "expected_payout": int(round(100 * w0_odds)),
                 "is_real_odds": True,
-                "memo": f"単勝 {w0_u}番 ({w0_name}) 100円"
+                "memo": f"単勝 {w0_u} ({w0_name}) 100円"
             },
             {
                 "ticket_type": "複勝",
@@ -2285,7 +2285,7 @@ def compute_hybrid_rec_from_inputs(
                 "odds": est_fuku_odds,
                 "expected_payout": int(round(100 * est_fuku_odds)),
                 "is_real_odds": False,
-                "memo": f"複勝 {w0_u}番 ({w0_name}) 100円"
+                "memo": f"複勝 {w0_u} ({w0_name}) 100円"
             }
         ]
         virtual_total_amount = 200
