@@ -4863,49 +4863,40 @@ def fix_mislabeled_20261011_races():
 # --- DB構成・スキーマバージョン管理 ---
 CURRENT_DB_VERSION = "v5_umaren_3point_strategy"
 
-def clear_all_database():
+def clear_all_database(sync_today: bool = False):
     """Supabaseの全テーブル（メタ、キャッシュ、台帳、スケジュール）を完全クリア・初期化"""
     if not supabase:
         print("[ClearDB] Supabase未接続のためスキップします。")
         return {"status": "skipped", "message": "Supabase not connected"}
     try:
         print("[ClearDB] Supabase全テーブルの初期化クリーンアップを開始します...")
-        try:
-            supabase.table("keiba_predictions_cache").delete().neq("race_id", "0").execute()
-        except Exception as e:
-            print(f"[ClearDB] predictions_cache clear warning: {e}")
-        try:
-            supabase.table("keiba_race_results_cache").delete().neq("race_id", "0").execute()
-        except Exception as e:
-            print(f"[ClearDB] results_cache clear warning: {e}")
-        try:
-            supabase.table("keiba_race_settlements").delete().neq("race_id", "0").execute()
-        except Exception as e:
-            print(f"[ClearDB] race_settlements clear warning: {e}")
-        try:
-            supabase.table("keiba_scheduled_races").delete().neq("race_id", "0").execute()
-        except Exception as e:
-            print(f"[ClearDB] scheduled_races clear warning: {e}")
+        for tbl in ["keiba_predictions_cache", "keiba_race_results_cache", "keiba_race_settlements", "keiba_scheduled_races"]:
+            try:
+                supabase.table(tbl).delete().neq("race_id", "0").execute()
+            except Exception as e:
+                print(f"[ClearDB] {tbl} clear warning: {e}")
         try:
             supabase.table("keiba_app_meta").delete().neq("key", "__keep__").execute()
         except Exception as e:
             print(f"[ClearDB] app_meta clear warning: {e}")
 
-        # 初期化後、直ちに本日（JST）のレーススケジュールを再取得・再登録
-        today_str = today_jst_str()
-        today_clean = today_str.replace("-", "")
-        today_info = get_today_races(today_clean)
-        venues = today_info.get("venues", [])
-        synced = 0
-        for v in venues:
-            for r in v.get("races", []):
-                try:
-                    fetch_shutuba_table(r["race_id"], race_date=today_str)
-                    synced += 1
-                except Exception:
-                    pass
+        invalidate_summary_caches()
 
-        msg = f"全DBテーブル初期化完了 ＆ 本日レーススケジュール再登録完了 ({synced}レース)"
+        synced = 0
+        if sync_today:
+            today_str = today_jst_str()
+            today_clean = today_str.replace("-", "")
+            today_info = get_today_races(today_clean)
+            venues = today_info.get("venues", [])
+            for v in venues:
+                for r in v.get("races", []):
+                    try:
+                        fetch_shutuba_table(r["race_id"], race_date=today_str)
+                        synced += 1
+                    except Exception:
+                        pass
+
+        msg = f"全DBテーブル初期化完了 (本日同期: {synced}レース)"
         print(f"[ClearDB] {msg}")
         return {"status": "ok", "message": msg, "synced_races": synced}
     except Exception as e:
@@ -4961,8 +4952,8 @@ def check_and_apply_db_migration():
 
 
 @app.post("/admin/clear-db")
-def endpoint_clear_db():
-    res = clear_all_database()
+def endpoint_clear_db(sync_today: bool = False):
+    res = clear_all_database(sync_today=sync_today)
     if supabase and res.get("status") == "ok":
         try:
             supabase.table("keiba_app_meta").upsert({
