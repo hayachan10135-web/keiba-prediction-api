@@ -12,12 +12,48 @@ import threading
 import requests
 import numpy as np
 import lightgbm as lgb
+import traceback
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 
 app = FastAPI(title="Keiba Prediction & Verification API")
+
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    err_list = exc.errors()
+    tb_str = traceback.format_exc()
+    err_msg = f"【ResponseValidationError】レスポンス型不整合エラー ({len(err_list)}件):\n{json.dumps(err_list, ensure_ascii=False, default=str)}\n{tb_str}"
+    print(f"[ERROR ResponseValidationError] {err_msg}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": err_msg}
+    )
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    err_list = exc.errors()
+    err_msg = f"【RequestValidationError】リクエスト入力バリデーションエラー:\n{json.dumps(err_list, ensure_ascii=False, default=str)}"
+    print(f"[ERROR RequestValidationError] {err_msg}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": err_msg}
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    tb_str = traceback.format_exc()
+    err_msg = f"【サーバー内部未捕捉例外 [{exc.__class__.__name__}]】: {str(exc)}\n{tb_str}"
+    print(f"[ERROR GlobalException] {err_msg}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": err_msg}
+    )
 
 # --- 日本時間 (JST) ユーティリティ ---
 JST = zoneinfo.ZoneInfo("Asia/Tokyo")
