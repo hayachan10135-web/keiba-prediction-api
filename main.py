@@ -199,11 +199,11 @@ class HorsePrediction(BaseModel):
     wakuban: int
     horse_name: str
     jockey: str
-    trainer: Optional[str]
+    trainer: Optional[str] = None
     kinryo: float
-    odds: Optional[float]
-    popularity: Optional[int]
-    score: float
+    odds: Optional[float] = None
+    popularity: Optional[int] = None
+    score: Optional[float] = 0.0
     prob_win: Optional[float] = None
     prob_top3: Optional[float] = None
     mark: str
@@ -2213,6 +2213,10 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
 
     cached_pred = get_cached_prediction(race_id)
     if not force_refresh and cached_pred:
+        # scoreキーの欠損を補完（FastAPIのレスポンスバリデーション安全化）
+        for h in cached_pred.get("horses", []):
+            if "score" not in h or h["score"] is None:
+                h["score"] = round(float(h.get("prob_win") or 0.0) * 100.0, 1)
         return cached_pred
 
     try:
