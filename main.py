@@ -5323,7 +5323,7 @@ def endpoint_sync_active_post_times(dates: Optional[str] = Query(None, descripti
                 r_info = r.get("race_info", "")
                 m = re.search(r"(\d{1,2}):(\d{2})", r_info)
                 if r_id and m:
-                    hour_int, min_int = int(m.group(1).split(":")[0]), int(m.group(1).split(":")[1])
+                    hour_int, min_int = int(m.group(1)), int(m.group(2))
                     pt_str = f"{hour_int:02d}:{min_int:02d}発走"
                     _latest_post_times[r_id] = pt_str
                     # DB更新
