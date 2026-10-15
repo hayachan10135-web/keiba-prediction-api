@@ -2730,9 +2730,14 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         soup = BeautifulSoup(html, "html.parser")
         sp_title = soup.title.get_text(strip=True) if soup.title else ""
 
-        r_title = soup.select_one(".RaceName, h1, .Race_Title")
-        if r_title:
-            race_name = r_title.get_text(strip=True)
+        if not race_name or race_name.startswith("Race "):
+            r_title = soup.select_one(".RaceName, h1, .Race_Title")
+            if r_title and r_title.get_text(strip=True):
+                race_name = r_title.get_text(strip=True)
+            elif sp_title:
+                m = re.match(r"^(.+?)\s*(?:結果・払戻|\s*\|)", sp_title)
+                if m:
+                    race_name = m.group(1).strip()
 
         for tr in soup.select("table[class*='Payout'] tr, table[class*='Pay'] tr, .Payout_Detail tr"):
             th = tr.select_one("th")
@@ -2800,9 +2805,14 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
             soup = BeautifulSoup(html, "html.parser")
             pc_title = soup.title.get_text(strip=True) if soup.title else ""
 
-            r_title = soup.select_one(".RaceName, h1")
-            if r_title and not race_name:
-                race_name = r_title.get_text(strip=True)
+            if not race_name or race_name.startswith("Race "):
+                r_title = soup.select_one(".RaceName, .Race_Title, h1")
+                if r_title and r_title.get_text(strip=True):
+                    race_name = r_title.get_text(strip=True)
+                elif pc_title:
+                    m = re.match(r"^(.+?)\s*(?:結果・払戻|\s*\|)", pc_title)
+                    if m:
+                        race_name = m.group(1).strip()
 
             for tr in soup.select("table.Payout_Detail_Table tr, table[class*='Payout'] tr"):
                 th = tr.select_one("th")
