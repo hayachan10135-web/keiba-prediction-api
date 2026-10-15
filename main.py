@@ -2216,7 +2216,7 @@ def compute_hybrid_rec_from_inputs(
             real_bet_badge = None
             strategy_name = "見送り推奨 (資金保全)"
             strategy_type = "skip"
-            skip_reason = f"カスケード条件不一致 (確信度: {confidence_score:.3f}, オッズ: {w0_odds:.1f}倍: 資金保全のため見送り)"
+            skip_reason = "カスケード条件不一致 (資金保全のため見送り)"
     else:
         # 頭数不足 / 障害戦 / 新馬戦 -> 見送り
         is_participate = False
@@ -2241,12 +2241,12 @@ def compute_hybrid_rec_from_inputs(
 
     if is_participate:
         if assigned_tier == "B":
-            summary_str = f"{strategy_name} [単勝{w0_u}番 500円 ＋ 馬単{len(umatan_bets)}点 各200円 / 計{total_amount:,}円]"
+            summary_str = f"{strategy_name} [単勝{w0_u} 500円 ＋ 馬単{len(umatan_bets)}点 各200円 / 計{total_amount:,}円]"
         elif assigned_tier in ("A", "A_hole"):
-            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u}番 {w0_name}) / 計{total_amount:,}円]"
+            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u} {w0_name}) / 計{total_amount:,}円]"
         elif assigned_tier == "C":
-            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u}番 {w0_name}) / 計{total_amount:,}円]"
-        reason_str = f"動的確信度スコア: {confidence_score:.3f} (戦略{assigned_tier}採択)"
+            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u} {w0_name}) / 計{total_amount:,}円]"
+        reason_str = f"戦略{assigned_tier}採択"
     else:
         summary_str = f"見送り推奨 ({skip_reason})"
         reason_str = skip_reason
