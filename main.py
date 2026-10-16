@@ -871,7 +871,7 @@ def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dic
 
 
 def clear_kaisai_period_caches():
-    """金曜20:00の開催期間キャッシュ破棄（成績 keiba_race_settlements は永続保持）"""
+    """金曜20:00の開催期間キャッシュ整理（直近10開催期間＝約75日間は完全保持し、それ以前の過去分のみ安全破棄）"""
     global _period_venues_cache, _period_checked_empty_dates, _latest_post_times, _last_weight_check_ts
     _period_venues_cache.clear()
     _period_checked_empty_dates.clear()
@@ -880,10 +880,12 @@ def clear_kaisai_period_caches():
     if not supabase:
         return
     try:
-        supabase.table("keiba_predictions_cache").delete().neq("race_id", "SCHEMA_VERSION").execute()
-        supabase.table("keiba_race_results_cache").delete().neq("race_id", "0").execute()
-        supabase.table("keiba_scheduled_races").delete().neq("race_id", "0").execute()
-        print("[Cleanup] 金曜20:00 開催期間の一時キャッシュ（予想・結果HTML・スケジュール）を破棄しました（成績台帳は保持）。")
+        # 直近10開催期間（約75日間）より古いキャッシュのみを削除（10開催分は完全保持）
+        cutoff_date = (datetime.datetime.now(JST).date() - datetime.timedelta(days=75)).strftime("%Y-%m-%d")
+        supabase.table("keiba_predictions_cache").delete().neq("race_id", "SCHEMA_VERSION").lt("race_date", cutoff_date).execute()
+        supabase.table("keiba_race_results_cache").delete().neq("race_id", "0").lt("race_date", cutoff_date).execute()
+        supabase.table("keiba_scheduled_races").delete().neq("race_id", "0").lt("race_date", cutoff_date).execute()
+        print(f"[Cleanup] 金曜20:00 キャッシュ整理完了: {cutoff_date} 以前の古いキャッシュのみ破棄しました（直近10開催期間分は完全保持）。")
     except Exception as e:
         print(f"[Cleanup] キャッシュ破棄エラー: {e}")
     invalidate_summary_caches()
@@ -1141,29 +1143,37 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
     if now_dt is None:
         now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
+
+    # 過去10開催期間（約75日間）のDBに保存されている開催日を取得
+    cutoff_d = (now_dt.date() - datetime.timedelta(days=75)).strftime("%Y-%m-%d")
+    past_db_dates = set()
+    if supabase:
+        try:
+            # 1. scheduled_races
+            s_res = supabase.table("keiba_scheduled_races").select("race_date").gte("race_date", cutoff_d).lte("race_date", p_info["today_str"]).execute()
+            for row in (s_res.data or []):
+                if row.get("race_date"):
+                    past_db_dates.add(row["race_date"])
+            # 2. predictions_cache
+            p_res = supabase.table("keiba_predictions_cache").select("race_date").gte("race_date", cutoff_d).lte("race_date", p_info["today_str"]).neq("race_id", "SCHEMA_VERSION").execute()
+            for row in (p_res.data or []):
+                if row.get("race_date"):
+                    past_db_dates.add(row["race_date"])
+        except Exception:
+            pass
+
     if p_info["is_waiting_period"]:
-        return []
+        return sorted(list(past_db_dates))
 
     start_d = p_info["period_start_date"]
     today_d = p_info["today_date"]
 
-    # DB上ですでに今開催期間のスケジュールまたは予想キャッシュがある日付を取得
-    db_dates = set()
-    if supabase:
-        try:
-            s_res = supabase.table("keiba_scheduled_races").select("race_date").gte("race_date", p_info["period_start"]).lte("race_date", p_info["today_str"]).execute()
-            for row in (s_res.data or []):
-                if row.get("race_date"):
-                    db_dates.add(row["race_date"])
-        except Exception:
-            pass
-
-    available_dates = []
+    available_dates = list(past_db_dates)
     cur_d = start_d
     while cur_d <= today_d:
         d_str = cur_d.strftime("%Y-%m-%d")
         # 当日の場合は朝7:30以降のみ新規取得対象とする
-        if cur_d == today_d and (now_dt.hour < 7 or (now_dt.hour == 7 and now_dt.minute < 30)) and d_str not in db_dates and d_str not in _period_venues_cache:
+        if cur_d == today_d and (now_dt.hour < 7 or (now_dt.hour == 7 and now_dt.minute < 30)) and d_str not in past_db_dates and d_str not in _period_venues_cache:
             cur_d += datetime.timedelta(days=1)
             continue
 
@@ -1171,7 +1181,7 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
             available_dates.append(d_str)
         elif d_str in _period_checked_empty_dates:
             pass
-        elif cur_d.weekday() in (5, 6, 0) or d_str in db_dates:
+        elif cur_d.weekday() in (5, 6, 0) or d_str in past_db_dates:
             # 土・日・月（祝日3日間開催等）またはDB登録済みの日を走査
             v = fetch_venues_for_date_raw(d_str)
             if v:
@@ -3710,7 +3720,7 @@ def save_settlement(data: dict):
     if not supabase:
         return
     try:
-        supabase.table("keiba_race_settlements").upsert({
+        row_dict = {
             "race_id": data["race_id"],
             "race_date": data["race_date"],
             "race_name": data["race_name"],
@@ -3739,7 +3749,26 @@ def save_settlement(data: dict):
             "fukusho_bet": data.get("fukusho_bet", 0),
             "tansho_payout": data.get("tansho_payout", 0),
             "fukusho_payout": data.get("fukusho_payout", 0)
-        }).execute()
+        }
+        if "track_bias" in data and data["track_bias"] is not None:
+            row_dict["track_bias"] = data["track_bias"]
+        if "odds_alerts" in data and data["odds_alerts"] is not None:
+            row_dict["odds_alerts"] = data["odds_alerts"]
+
+        try:
+            supabase.table("keiba_race_settlements").upsert(row_dict).execute()
+        except Exception as col_err:
+            # カラム（track_bias, odds_alerts）が未定義の場合の安全フォールバック（bet_details内に退避）
+            if "track_bias" in row_dict or "odds_alerts" in row_dict:
+                b_det = row_dict.get("bet_details") or {}
+                if "track_bias" in row_dict:
+                    b_det["track_bias"] = row_dict.pop("track_bias")
+                if "odds_alerts" in row_dict:
+                    b_det["odds_alerts"] = row_dict.pop("odds_alerts")
+                row_dict["bet_details"] = b_det
+                supabase.table("keiba_race_settlements").upsert(row_dict).execute()
+            else:
+                raise col_err
         invalidate_summary_caches()
     except Exception as e:
         print(f"Supabase収支台帳保存エラー: {e}")
@@ -3996,6 +4025,21 @@ def process_settlement_calculation(
     race_res: dict,
     from_cache: bool = False
 ) -> dict:
+    t_bias = pred_data.get("track_bias") if isinstance(pred_data, dict) else None
+    o_alerts = [
+        {
+            "umaban": h.get("umaban"),
+            "horse_name": h.get("horse_name"),
+            "odds": h.get("odds"),
+            "odds_trend": h.get("odds_trend"),
+            "odds_alert": h.get("odds_alert"),
+            "bias_match": h.get("bias_match"),
+            "odds_history": h.get("odds_history")
+        }
+        for h in (pred_data.get("horses", []) if isinstance(pred_data, dict) else [])
+        if h.get("odds_alert") or h.get("odds_trend") or h.get("bias_match") or h.get("odds_history")
+    ]
+
     # 開催中止・取りやめレースの全額返還処理 (投資0円・払戻0円・見送り扱い)
     if race_res.get("is_cancelled"):
         settlement = {
@@ -4036,7 +4080,9 @@ def process_settlement_calculation(
             "tansho_payout": 0,
             "fukusho_payout": 0,
             "mark_orders": [],
-            "top3_orders": []
+            "top3_orders": [],
+            "track_bias": t_bias,
+            "odds_alerts": o_alerts
         }
         save_settlement(settlement)
         if supabase:
@@ -4147,7 +4193,9 @@ def process_settlement_calculation(
             "bet_details": {"real_bet_meta": real_bet_meta},
             "payout_details": None,
             "mark_orders": mark_orders,
-            "top3_orders": top3_orders
+            "top3_orders": top3_orders,
+            "track_bias": t_bias,
+            "odds_alerts": o_alerts
         }
         save_settlement(settlement)
         if supabase:
@@ -4436,7 +4484,9 @@ def process_settlement_calculation(
         },
         "payout_details": all_hits,
         "mark_orders": mark_orders,
-        "top3_orders": top3_orders
+        "top3_orders": top3_orders,
+        "track_bias": t_bias,
+        "odds_alerts": o_alerts
     }
     save_settlement(settlement)
     if supabase:
