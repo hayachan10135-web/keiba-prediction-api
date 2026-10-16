@@ -651,8 +651,12 @@ class DailySummary(BaseModel):
     settled_races: List[dict]
     pass_benefit_total: Optional[int] = 0
     pass_avoided_losses: Optional[int] = 0
-    pass_missed_profits: Optional[int] = 0
     ticket_breakdowns: Optional[List[TicketTypeSummary]] = []
+    real_ticket_breakdowns: Optional[List[TicketTypeSummary]] = []
+    real_pass_races: Optional[int] = 0
+    real_pass_benefit_total: Optional[int] = 0
+    real_pass_avoided_losses: Optional[int] = 0
+    real_pass_missed_profits: Optional[int] = 0
     umaren_hit_races: Optional[int] = 0
     trio_hit_races: Optional[int] = 0
     umaren_bet_total: Optional[int] = 0
@@ -5074,6 +5078,74 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         st["recovery_rate"] = round((st["payout_amount"] / st["bet_amount"]) * 100.0, 2) if st["bet_amount"] > 0 else 0.0
         ticket_breakdowns.append(st)
 
+    # 実戦推奨用の券種別内訳集計
+    real_ticket_stats = {}
+    for r in real_bet_rows:
+        b_map = r.get("bet_breakdown")
+        if not b_map or not isinstance(b_map, dict):
+            b_map = {}
+            if (r.get("umaren_bet") or 0) > 0:
+                b_map["馬連"] = r["umaren_bet"]
+            if (r.get("trio_bet") or 0) > 0:
+                b_map["三連複"] = r["trio_bet"]
+        p_map = r.get("payout_breakdown")
+        if not p_map or not isinstance(p_map, dict):
+            p_map = {}
+            if (r.get("umaren_payout") or 0) > 0:
+                p_map["馬連"] = r["umaren_payout"]
+            if (r.get("trio_payout") or 0) > 0:
+                p_map["三連複"] = r["trio_payout"]
+
+        for t_type, b_amt in b_map.items():
+            if b_amt > 0:
+                st = real_ticket_stats.setdefault(t_type, {
+                    "ticket_type": t_type,
+                    "bet_amount": 0,
+                    "payout_amount": 0,
+                    "hit_count": 0,
+                    "bet_count": 0,
+                    "recovery_rate": 0.0
+                })
+                st["bet_amount"] += b_amt
+                st["bet_count"] += 1
+                p_amt = p_map.get(t_type, 0)
+                st["payout_amount"] += p_amt
+                if p_amt > 0:
+                    st["hit_count"] += 1
+
+    real_ticket_breakdowns = []
+    for t_type, st in real_ticket_stats.items():
+        st["recovery_rate"] = round((st["payout_amount"] / st["bet_amount"]) * 100.0, 2) if st["bet_amount"] > 0 else 0.0
+        real_ticket_breakdowns.append(st)
+
+    # 実戦推奨視点での見送り損益集計:
+    real_pass_rows = [r for r in rows if not (r.get("is_real_bet_target") and r.get("is_pass") == 0)]
+    real_pass_races = len(real_pass_rows)
+    real_pass_avoided_losses = 0
+    real_pass_missed_profits = 0
+    real_pass_benefit_total = 0
+
+    for r in real_pass_rows:
+        if r.get("is_pass") == 0:
+            # 仮想参戦レース（実戦推奨外だが全参戦で買ったレース）
+            r_profit = (r.get("total_payout") or 0) - (r.get("total_bet") or 0)
+            if r_profit < 0:
+                loss_avoided = abs(r_profit)
+                real_pass_avoided_losses += loss_avoided
+                real_pass_benefit_total += loss_avoided
+            elif r_profit > 0:
+                real_pass_missed_profits += r_profit
+                real_pass_benefit_total -= r_profit
+        else:
+            # 完全見送りレース
+            pb = r.get("pass_benefit")
+            if pb is not None:
+                real_pass_benefit_total += pb
+                if pb > 0:
+                    real_pass_avoided_losses += pb
+                elif pb < 0:
+                    real_pass_missed_profits += abs(pb)
+
     # ハイブリッド内訳集計 (後方互換用)
     umaren_hit_races = sum(1 for r in rows if (r.get("umaren_payout") or 0) > 0 and r.get("is_pass") == 0)
     trio_hit_races = sum(1 for r in rows if (r.get("trio_payout") or 0) > 0 and r.get("is_pass") == 0)
@@ -5121,6 +5193,11 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         "pass_avoided_losses": pass_avoided_losses,
         "pass_missed_profits": pass_missed_profits,
         "ticket_breakdowns": ticket_breakdowns,
+        "real_ticket_breakdowns": real_ticket_breakdowns,
+        "real_pass_races": real_pass_races,
+        "real_pass_benefit_total": real_pass_benefit_total,
+        "real_pass_avoided_losses": real_pass_avoided_losses,
+        "real_pass_missed_profits": real_pass_missed_profits,
         "umaren_hit_races": umaren_hit_races,
         "trio_hit_races": trio_hit_races,
         "umaren_bet_total": umaren_bet_total,
