@@ -2914,9 +2914,10 @@ def compute_track_bias_and_matches(
             # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを keiba_race_settlements から取得
             # JRA仕様: race_id の先頭10桁 (YYYY + VENUE + KAI + NICHI) は同一開催日で100%一致
             day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
+            start_rid = f"{day_prefix}01"
             s_res = supabase.table("keiba_race_settlements")\
                 .select("race_id, top3_orders, bet_details")\
-                .like("race_id", f"{day_prefix}%")\
+                .gte("race_id", start_rid)\
                 .lt("race_id", race_id)\
                 .execute()
 
@@ -2936,6 +2937,9 @@ def compute_track_bias_and_matches(
                     .execute()
                 pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
 
+                is_target_turf = "芝" in surface_name
+                is_target_dirt = ("ダ" in surface_name) or ("ダート" in surface_name)
+
                 for s_row in settled_rows:
                     r_id = str(s_row.get("race_id") or "")
                     # top3_orders を専用カラムまたは bet_details.real_bet_meta から確実に抽出
@@ -2943,12 +2947,19 @@ def compute_track_bias_and_matches(
                     if not top3:
                         b_det = s_row.get("bet_details") if isinstance(s_row.get("bet_details"), dict) else {}
                         top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
-                    if len(top3) < 3:
+                    if not top3 or len(top3) < 3:
                         continue
 
                     dj = pred_map.get(r_id, {})
                     c_details = (dj.get("race_details") or {}).get("course_details", "")
-                    if surface_name not in c_details:
+                    # トラック種別の一致判定 (芝: '芝', ダート: 'ダ' or 'ダート')
+                    past_is_turf = "芝" in c_details
+                    past_is_dirt = ("ダ" in c_details) or ("ダート" in c_details)
+                    if is_target_turf and not past_is_turf:
+                        continue
+                    if is_target_dirt and not past_is_dirt:
+                        continue
+                    if not is_target_turf and not is_target_dirt:
                         continue
 
                     sample_races += 1
@@ -2956,9 +2967,22 @@ def compute_track_bias_and_matches(
                     w_map = {int(h["umaban"]): int(h.get("wakuban") or 0) for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
 
                     for item in top3[:3]:
-                        u_num = int(item.get("umaban") or 0)
-                        order_num = int(item.get("order") or 0)
+                        if isinstance(item, dict):
+                            u_num = int(item.get("umaban") or 0)
+                            order_num = int(item.get("order") or 0)
+                            h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
+                        else:
+                            try:
+                                u_num = int(item)
+                            except Exception:
+                                u_num = 0
+                            order_num = 1
+                            h_clean = ""
+
                         waku_num = w_map.get(u_num, 0)
+                        # 枠番が未設定の場合のフォールバック (馬番から近似)
+                        if waku_num == 0 and u_num > 0:
+                            waku_num = min(8, max(1, (u_num - 1) // 2 + 1))
 
                         if waku_num in (1, 2, 3):
                             inside_count += 1
@@ -2967,8 +2991,7 @@ def compute_track_bias_and_matches(
                         elif waku_num in (6, 7, 8):
                             outside_count += 1
 
-                        if order_num == 1:
-                            h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
+                        if order_num == 1 and h_clean:
                             st = stats_dict.get("horse_stats", {}).get(h_clean, {})
                             if float(st.get("last_corner_final", 8.0)) <= 4.0:
                                 front_wins += 1
