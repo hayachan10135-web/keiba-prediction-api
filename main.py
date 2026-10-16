@@ -488,6 +488,7 @@ class HorsePrediction(BaseModel):
     weight_diff: Optional[int] = None
     sex_age: Optional[str] = None
     base_odds: Optional[float] = None
+    odds_history: Optional[Dict[str, float]] = None
     odds_change_pct: Optional[float] = None
     odds_trend: Optional[str] = None
     odds_alert: Optional[str] = None
@@ -2193,6 +2194,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         if u3: opponents.append((u3, u03_odds, u03_is_real, "△"))
 
         r_date_str = (course_meta or {}).get("race_date") or today_jst_str()
+        force_final_flag = bool((course_meta or {}).get("force_final_odds", False))
         hybrid_rec = compute_hybrid_rec_from_inputs(
             race_name=race_name,
             race_details=race_details,
@@ -2204,7 +2206,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             u0=u0,
             honmei_horse=honmei_horse,
             race_date_str=r_date_str,
-            force_final_odds=False,
+            force_final_odds=force_final_flag,
             real_trio_odds=trio_real_map
         )
 
@@ -2310,7 +2312,7 @@ def compute_hybrid_rec_from_inputs(
     )
     edge_ratio = round(win_edge, 2)
 
-    # 確定オッズ・発走前判定 (発走25分前以降は確定オッズ扱い)
+    # 確定オッズ・発走前判定 (Stage 5: 発走7分前〜5分前以降は確定オッズ扱い)
     is_final_odds = force_final_odds
     if not is_final_odds:
         post_time_str = race_details.get("post_time", "") if race_details else ""
@@ -2322,7 +2324,7 @@ def compute_hybrid_rec_from_inputs(
                 r_date_str = race_date_str or today_jst_str()
                 d_parts = [int(p) for p in r_date_str.split("-")]
                 post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hh, mm)
-                if now_dt >= post_dt - datetime.timedelta(minutes=25):
+                if now_dt >= post_dt - datetime.timedelta(minutes=7):
                     is_final_odds = True
             except Exception:
                 pass
@@ -2621,13 +2623,39 @@ def compute_hybrid_rec_from_inputs(
 # ★ Supabase CRUD ヘルパー
 # =========================================================================
 
-def apply_odds_anomaly_indicators(horses: List[dict], prev_horses: Optional[List[dict]] = None):
+ODDS_STAGE_ORDER = ["0830", "60m", "30m", "15m", "05m"]
+ODDS_STAGE_RANK = {"0830": 1, "60m": 2, "30m": 3, "15m": 4, "05m": 5}
+
+
+def infer_odds_stage_from_minutes(mins_to_post: Optional[float]) -> str:
+    """発走までの残り分数から現在のオッズ取得ステージを判定"""
+    if mins_to_post is None or mins_to_post > 65.0:
+        return "0830"
+    elif mins_to_post > 33.0:
+        return "60m"
+    elif mins_to_post > 17.0:
+        return "30m"
+    elif mins_to_post > 6.5:
+        return "15m"
+    else:
+        return "05m"
+
+
+def apply_odds_anomaly_indicators(
+    horses: List[dict],
+    prev_horses: Optional[List[dict]] = None,
+    odds_stage: Optional[str] = None
+):
     """
-    【Step 4】異常オッズ・直前急変の検知（支持率変動 ＆ AI期待値乖離インジケーター）
-    1. 時系列オッズ変動: 初回予想時オッズ(base_odds)と現在オッズ(odds)を比較し、
-       - 25%以上の急落（かつ1.0倍以上低下）: 🔥大口急落 (plunge)
-       - 15%〜25%の低下（かつ0.5倍以上低下）: 📉支持増 (drop)
-       - 30%以上の上昇（かつ1.5倍以上上昇）: 📈人気軟化 (drift)
+    【Step 4】異常オッズ・直前急変の検知（マルチステージ時系列支持率変動 ＆ AI期待値乖離インジケーター）
+    ・5段階の時系列スナップショット ["0830", "60m", "30m", "15m", "05m"] を `odds_history` に保持。
+    1. 時系列オッズ変動:
+       - 🔥連続急落 / 🔥直前急落 / 🔥大口急落 (plunge):
+         3ステージ以上の連続下落、または馬体重発表後(60m/30m/15m)からの直前20%以上急落、または基準比25%以上急落（かつ1.0倍以上低下）
+       - 📉連続支持増 / 📉支持増 (drop):
+         基準比15%〜25%の低下（かつ0.5倍以上低下）、または連続下落で10%以上低下
+       - 📈人気軟化 (drift):
+         基準比30%以上の上昇（かつ1.5倍以上上昇）
     2. AI評価×市場オッズの異常乖離シグナル:
        - AI印あり(◎◯▲△☆) かつ 5番人気以下(または単勝10倍以上) かつ 期待値(prob_win * odds) >= 1.15: 💎妙味穴 (value_gap)
        - AI無印(-) かつ 1〜2番人気(または単勝3.5倍以下) かつ 期待値(prob_win * odds) < 0.45: ⚠️過剰人気 (overbet)
@@ -2647,18 +2675,73 @@ def apply_odds_anomaly_indicators(horses: List[dict], prev_horses: Optional[List
         except Exception:
             continue
         curr_raw = h.get("odds")
-        curr_odds = float(curr_raw) if (curr_raw is not None and float(curr_raw) > 0) else None
+        curr_odds = round(float(curr_raw), 1) if (curr_raw is not None and float(curr_raw) > 0) else None
         prev_h = prev_map.get(u, {})
 
-        base_raw = h.get("base_odds") or prev_h.get("base_odds") or prev_h.get("odds") or curr_odds
+        # 既存の odds_history を引き継ぎ・統合
+        hist: Dict[str, float] = {}
+        for src in (prev_h.get("odds_history"), h.get("odds_history")):
+            if isinstance(src, dict):
+                for k, v in src.items():
+                    if k in ODDS_STAGE_RANK and v is not None:
+                        try:
+                            fv = round(float(v), 1)
+                            if fv > 0:
+                                hist[k] = fv
+                        except Exception:
+                            pass
+
+        base_raw = hist.get("0830") or h.get("base_odds") or prev_h.get("base_odds") or prev_h.get("odds") or curr_odds
         base_odds = round(float(base_raw), 1) if (base_raw is not None and float(base_raw) > 0) else None
+        if base_odds and "0830" not in hist:
+            hist["0830"] = base_odds
+
+        if curr_odds:
+            if odds_stage in ODDS_STAGE_RANK:
+                hist[odds_stage] = curr_odds
+            elif not hist:
+                hist["0830"] = curr_odds
+
+        ordered_hist = {k: hist[k] for k in ODDS_STAGE_ORDER if k in hist}
+        h["odds_history"] = ordered_hist
         h["base_odds"] = base_odds
+
+        # 馬体重発表後(60m)の基準オッズおよび直前比較用オッズ
+        weight_base = ordered_hist.get("60m") or base_odds
+        stage_vals = [ordered_hist[k] for k in ODDS_STAGE_ORDER if k in ordered_hist]
+        if curr_odds and (not stage_vals or stage_vals[-1] != curr_odds):
+            stage_vals.append(curr_odds)
+
+        # 連続同一値を圧縮した推移リスト (表示・連続下落判定用)
+        compact_vals: List[float] = []
+        for v in stage_vals:
+            if not compact_vals or compact_vals[-1] != v:
+                compact_vals.append(v)
+
+        is_continuous_drop = len(compact_vals) >= 3 and all(
+            compact_vals[i] > compact_vals[i + 1] for i in range(len(compact_vals) - 1)
+        )
 
         if curr_odds and base_odds and base_odds > 0:
             pct = round(((curr_odds - base_odds) / base_odds) * 100.0, 1)
         else:
             pct = 0.0
         h["odds_change_pct"] = pct
+
+        late_pct = 0.0
+        is_late_plunge = False
+        if curr_odds and weight_base and weight_base > 0 and "60m" in ordered_hist:
+            late_pct = round(((curr_odds - weight_base) / weight_base) * 100.0, 1)
+            if curr_odds <= weight_base * 0.80 and (weight_base - curr_odds) >= 1.0:
+                is_late_plunge = True
+
+        # 推移テキスト (3点以上ある場合は直近3ステップの推移を表示)
+        if len(compact_vals) >= 3:
+            traj_str = "→".join(f"{v:.1f}" for v in compact_vals[-3:]) + "倍"
+        elif base_odds and curr_odds:
+            traj_str = f"{base_odds:.1f}→{curr_odds:.1f}倍"
+        else:
+            traj_str = f"{curr_odds:.1f}倍" if curr_odds else ""
 
         mark = str(h.get("mark") or "-")
         pop_raw = h.get("popularity")
@@ -2669,12 +2752,27 @@ def apply_odds_anomaly_indicators(horses: List[dict], prev_horses: Optional[List
 
         trend = None
         alert = None
-        if curr_odds and base_odds and curr_odds <= base_odds * 0.75 and (base_odds - curr_odds) >= 1.0:
+        if curr_odds and base_odds and (
+            (curr_odds <= base_odds * 0.75 and (base_odds - curr_odds) >= 1.0)
+            or is_late_plunge
+            or (is_continuous_drop and curr_odds <= base_odds * 0.82 and (base_odds - curr_odds) >= 1.0)
+        ):
             trend = "plunge"
-            alert = f"🔥大口急落 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
-        elif curr_odds and base_odds and curr_odds <= base_odds * 0.85 and (base_odds - curr_odds) >= 0.5:
+            if is_continuous_drop:
+                alert = f"🔥連続急落 {traj_str} ({pct:+.0f}%)"
+            elif is_late_plunge and pct > -25.0:
+                alert = f"🔥直前急落 {weight_base:.1f}→{curr_odds:.1f}倍 ({late_pct:+.0f}%)"
+            else:
+                alert = f"🔥大口急落 {traj_str} ({pct:+.0f}%)"
+        elif curr_odds and base_odds and (
+            (curr_odds <= base_odds * 0.85 and (base_odds - curr_odds) >= 0.5)
+            or (is_continuous_drop and curr_odds <= base_odds * 0.90 and (base_odds - curr_odds) >= 0.5)
+        ):
             trend = "drop"
-            alert = f"📉支持増 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
+            if is_continuous_drop:
+                alert = f"📉連続支持増 {traj_str} ({pct:+.0f}%)"
+            else:
+                alert = f"📉支持増 {traj_str} ({pct:+.0f}%)"
         elif mark in ("◎", "◯", "〇", "○", "▲", "△", "☆") and curr_odds and ((pop is not None and pop >= 5) or curr_odds >= 10.0) and ev >= 1.15:
             trend = "value_gap"
             pop_str = f"{pop}人気" if pop else f"{curr_odds:.1f}倍"
@@ -2685,7 +2783,7 @@ def apply_odds_anomaly_indicators(horses: List[dict], prev_horses: Optional[List
             alert = f"⚠️過剰人気 ({pop_str} / AI無印)"
         elif curr_odds and base_odds and curr_odds >= base_odds * 1.30 and (curr_odds - base_odds) >= 1.5:
             trend = "drift"
-            alert = f"📈人気軟化 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
+            alert = f"📈人気軟化 {traj_str} ({pct:+.0f}%)"
 
         h["odds_trend"] = trend
         h["odds_alert"] = alert
@@ -2727,7 +2825,12 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
         print(f"Supabase予想保存エラー ({race_id}): {e}")
 
 
-def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: bool = False) -> dict:
+def predict_race_core(
+    race_id: str,
+    force_refresh: bool = False,
+    is_auto_final: bool = False,
+    odds_stage: Optional[str] = None
+) -> dict:
     if len(race_id) != 12 or not race_id.isdigit():
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
@@ -2768,12 +2871,38 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                     except Exception as ue:
                         print(f"予想キャッシュ出走時刻更新エラー ({race_id}): {ue}")
 
-        # ★ 【Step 3】キャッシュに馬体重・性齢が未反映の場合の自動反映・自己修復 ★
+        # ★ 【Step 3 & Step 4】マルチステージ自動リフレッシュ（60m馬体重 -> 30m -> 15m -> 05m最終確定）＆過去レース自己修復 ★
         has_cached_weights = any(h.get("horse_weight") is not None for h in cached_pred.get("horses", []))
         has_cached_sex_age = any(bool(h.get("sex_age")) for h in cached_pred.get("horses", []))
-        should_auto_refresh_weight = False
-        if not has_cached_weights or not has_cached_sex_age:
-            now_ts = time.time()
+        cached_stage = str(cached_pred.get("last_odds_stage") or "0830")
+        cached_stage_rank = ODDS_STAGE_RANK.get(cached_stage, 1)
+
+        should_auto_refresh = False
+        now_ts = time.time()
+
+        if sched_race_date == today_jst_str() and sched_post_dt_raw:
+            try:
+                post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
+                now_dt_obj = now_jst_naive()
+                mins_to_post = (post_dt_obj - now_dt_obj).total_seconds() / 60.0
+                if 0.0 < mins_to_post <= 65.0:
+                    target_stage = odds_stage or infer_odds_stage_from_minutes(mins_to_post)
+                    target_rank = ODDS_STAGE_RANK.get(target_stage, 1)
+                    cooldown_sec = 60.0 if target_stage == "05m" else 180.0
+                    # 新しいステージ（60m/30m/15m/05m）に到達したか、馬体重がまだ未取得の場合に自動再推論
+                    if target_rank > cached_stage_rank or (not has_cached_weights and now_ts - _last_weight_check_ts.get(race_id, 0.0) >= cooldown_sec):
+                        if target_rank > cached_stage_rank or (now_ts - _last_weight_check_ts.get(race_id, 0.0) >= cooldown_sec):
+                            _last_weight_check_ts[race_id] = now_ts
+                            should_auto_refresh = True
+                            odds_stage = target_stage
+                            if target_stage == "05m":
+                                is_auto_final = True
+                            print(f"[Auto-StageRefresh] {race_id}: ステージ {cached_stage} -> {target_stage} (残り{mins_to_post:.1f}分) の最新オッズ・馬体重推論を実行します。")
+            except Exception:
+                pass
+
+        # 発走済み・過去レースで馬体重や性齢が欠損している場合は、確定済みの買い目を変えずにメタデータのみ自己修復
+        if not should_auto_refresh and (not has_cached_weights or not has_cached_sex_age):
             if now_ts - _last_weight_check_ts.get(race_id, 0.0) >= 180.0:
                 is_past_or_post = False
                 if sched_race_date and sched_race_date < today_jst_str():
@@ -2781,20 +2910,14 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                 elif sched_race_date == today_jst_str() and sched_post_dt_raw:
                     try:
                         post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
-                        now_dt_obj = now_jst_naive()
-                        if (post_dt_obj - datetime.timedelta(minutes=75)) <= now_dt_obj < post_dt_obj:
-                            _last_weight_check_ts[race_id] = now_ts
-                            should_auto_refresh_weight = True
-                            print(f"[Auto-Weight] {race_id}: 発走75分前圏内のため直前馬体重の反映＆再推論を実行します。")
-                        elif now_dt_obj >= post_dt_obj:
+                        if now_jst_naive() >= post_dt_obj:
                             is_past_or_post = True
                     except Exception:
                         pass
                 elif not sched_race_date:
                     is_past_or_post = True
 
-                # 発走済み・過去レースで馬体重や性齢が欠損している場合は、確定済みの買い目を変えずにメタデータのみ自己修復
-                if is_past_or_post and not should_auto_refresh_weight:
+                if is_past_or_post:
                     _last_weight_check_ts[race_id] = now_ts
                     try:
                         _, _, fresh_horses, _ = fetch_shutuba_table(race_id, race_date=sched_race_date)
@@ -2817,7 +2940,7 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                     except Exception as he:
                         print(f"[Auto-Weight Heal Warning] {race_id}: {he}")
 
-        if not should_auto_refresh_weight:
+        if not should_auto_refresh:
             return cached_pred
 
     try:
@@ -2869,6 +2992,26 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         if not horses:
             raise HTTPException(status_code=404, detail="出走馬情報を取得できませんでした。")
 
+        # 発走時刻から現在のオッズ取得ステージを自動推定（未指定時）
+        if not odds_stage:
+            if is_auto_final:
+                odds_stage = "05m"
+            elif target_race_date == today_jst_str():
+                est_post_dt = scheduled_post_dt
+                if not est_post_dt:
+                    p_str = (race_details or {}).get("post_time", "")
+                    m_t = re.search(r"(\d{1,2}):(\d{2})", p_str)
+                    if m_t:
+                        d_parts = [int(p) for p in target_race_date.split("-")]
+                        est_post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], int(m_t.group(1)), int(m_t.group(2)))
+                if est_post_dt:
+                    mins_left = (est_post_dt - now_jst_naive()).total_seconds() / 60.0
+                    odds_stage = infer_odds_stage_from_minutes(mins_left)
+                else:
+                    odds_stage = "0830"
+            else:
+                odds_stage = "0830"
+
         # 手動再予想時に出走表側の発走時刻でも発走後と判明した場合はブロック
         if force_refresh and not is_auto_final and cached_pred is not None:
             p_str = (race_details or {}).get("post_time", "")
@@ -2882,10 +3025,12 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         if course_meta is None:
             course_meta = {}
         course_meta["race_date"] = target_race_date
+        if is_auto_final or odds_stage == "05m":
+            course_meta["force_final_odds"] = True
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
         prev_horses_list = cached_pred.get("horses", []) if isinstance(cached_pred, dict) else None
-        apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list)
+        apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list, odds_stage=odds_stage)
 
         resp_data = {
             "race_id": race_id,
@@ -2893,7 +3038,8 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
             "race_details": result["race_details"],
             "horses": result["horses"],
             "recommendation": result["recommendation"],
-            "hybrid_recommendation": result.get("hybrid_recommendation")
+            "hybrid_recommendation": result.get("hybrid_recommendation"),
+            "last_odds_stage": odds_stage
         }
 
         save_cached_prediction(race_id, target_race_date, resp_data)
@@ -2901,11 +3047,18 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         if supabase:
             try:
                 is_final = bool((resp_data.get("hybrid_recommendation") or {}).get("is_final_odds", False))
-                pred_flag = 2 if (is_final or is_auto_final) else 1
-                if pred_flag == 2:
-                    supabase.table("keiba_scheduled_races").update({"is_predicted": 2}).eq("race_id", race_id).execute()
+                has_weights_now = any(h.get("horse_weight") is not None for h in result["horses"])
+                if is_final or is_auto_final or odds_stage == "05m":
+                    new_pred_flag = 5
+                elif odds_stage == "15m":
+                    new_pred_flag = 4
+                elif odds_stage == "30m":
+                    new_pred_flag = 3
+                elif odds_stage == "60m":
+                    new_pred_flag = 2 if has_weights_now else 1
                 else:
-                    supabase.table("keiba_scheduled_races").update({"is_predicted": 1}).eq("race_id", race_id).neq("is_predicted", 2).execute()
+                    new_pred_flag = 1
+                supabase.table("keiba_scheduled_races").update({"is_predicted": new_pred_flag}).eq("race_id", race_id).lt("is_predicted", new_pred_flag).execute()
             except Exception:
                 pass
 
@@ -5153,7 +5306,7 @@ async def background_maintenance_loop():
                                     summary_body = "\n".join(real_races[:5])
                                     if len(real_races) > 5:
                                         summary_body += f"\n他{len(real_races)-5}レース"
-                                    summary_body += "\n※各レース発走20分前に最新オッズで確定通知します。"
+                                    summary_body += "\n※発走60分前(馬体重)・30分前・15分前・5分前(最終確定)にオッズ推移を追跡し判定します。"
                                     send_fcm_notification(
                                         title=f"🌅【本日実戦推奨候補】計{len(real_races)}レース該当！",
                                         body=summary_body,
@@ -5166,42 +5319,39 @@ async def background_maintenance_loop():
                     last_830_predict_date = today_str
 
             if supabase:
-                # --- ③ 各レース【発走 20分前】の直前再予想実行（直前オッズで本確定へ昇格） ---
+                # --- ③ 各レース【発走 60分前 / 30分前 / 15分前 / 5分前】のマルチステージ自動推論 ＆ 最終確定通知 ---
                 try:
                     res_pred = supabase.table("keiba_scheduled_races")\
                         .select("*")\
                         .eq("race_date", today_str)\
-                        .lt("is_predicted", 2)\
+                        .lt("is_predicted", 5)\
                         .execute()
                     unpredicted_races = res_pred.data or []
 
                     for r in unpredicted_races:
                         r_id = r["race_id"]
                         p_dt_str = r["post_datetime"]
+                        cur_stage = int(r.get("is_predicted") or 0)
                         try:
                             post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
                         except Exception:
                             continue
 
-                        trigger_weight_time = post_dt - datetime.timedelta(minutes=65)
-                        trigger_predict_time = post_dt - datetime.timedelta(minutes=20)
-                        if trigger_weight_time <= now_dt < trigger_predict_time:
-                            # 発走65分前〜20分前: 馬体重未反映の場合は自動で馬体重を取得・再計算（predict_race_core内の3分クールダウン制御付き）
+                        mins_to_post = (post_dt - now_dt).total_seconds() / 60.0
+                        if mins_to_post <= 0 or mins_to_post > 65.0:
+                            continue
+
+                        # Stage 5: 発走 5分前 (0 < mins <= 6.5) -> 最終オッズ推論 ＆ 確定通知
+                        if mins_to_post <= 6.5 and cur_stage < 5:
+                            print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
                             try:
-                                predict_race_core(r_id, force_refresh=False, is_auto_final=False)
-                            except Exception as we:
-                                print(f"[Auto-Weight] 馬体重更新チェック失敗 ({r_id}): {we}")
-                        elif trigger_predict_time <= now_dt < post_dt:
-                            print(f"[Auto-Predict] 発走20分前検知: {r_id} ({r.get('race_name')}) の確定予想を実行します...")
-                            try:
-                                pred_res = predict_race_core(r_id, force_refresh=True, is_auto_final=True)
+                                pred_res = predict_race_core(r_id, force_refresh=True, is_auto_final=True, odds_stage="05m")
                                 supabase.table("keiba_scheduled_races")\
-                                    .update({"is_predicted": 2})\
+                                    .update({"is_predicted": 5})\
                                     .eq("race_id", r_id)\
                                     .execute()
-                                print(f"[Auto-Predict] 確定予想完了: {r_id}")
+                                print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
 
-                                # 本確定の実戦推奨レースの場合、プッシュ通知を発火！
                                 h_rec = pred_res.get("hybrid_recommendation") or {}
                                 if h_rec.get("is_real_bet_target"):
                                     badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
@@ -5210,11 +5360,11 @@ async def background_maintenance_loop():
                                     h_name = pred_res.get("recommendation", {}).get("horse_name", "")
                                     r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
 
-                                    u_bets = h_rec.get("umaren_bets", [])
-                                    bets_summary = ", ".join([f"{b.get('combination_str')}({b.get('amount')}円)" for b in u_bets[:3]])
+                                    all_tickets = (h_rec.get("tansho_bets") or []) + (h_rec.get("fukusho_bets") or []) + (h_rec.get("umatan_bets") or [])
+                                    bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])
                                     tot_amt = h_rec.get("total_amount", 0)
 
-                                    body_text = f"◎{target_u}番 {h_name} (期待エッジ:{edge}倍)\n【推奨買い目】馬連: {bets_summary} 計{tot_amt:,}円"
+                                    body_text = f"◎{target_u}番 {h_name} (期待エッジ:{edge}倍)\n【推奨買い目】{bets_summary} 計{tot_amt:,}円"
                                     send_fcm_notification(
                                         title=f"{badge} {r_name}！",
                                         body=body_text,
@@ -5226,7 +5376,38 @@ async def background_maintenance_loop():
                                         }
                                     )
                             except Exception as pe:
-                                print(f"[Auto-Predict] 予想実行失敗 ({r_id}): {pe}")
+                                print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
+
+                        # Stage 4: 発走 15分前 (6.5 < mins <= 17.0) -> 本馬場入場後オッズ更新
+                        elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
+                            print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
+                            try:
+                                predict_race_core(r_id, force_refresh=True, is_auto_final=False, odds_stage="15m")
+                                supabase.table("keiba_scheduled_races")\
+                                    .update({"is_predicted": 4})\
+                                    .eq("race_id", r_id)\
+                                    .execute()
+                            except Exception as pe:
+                                print(f"[Auto-Predict Stage4] 更新失敗 ({r_id}): {pe}")
+
+                        # Stage 3: 発走 30分前 (17.0 < mins <= 33.0) -> パドック後オッズ更新
+                        elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
+                            print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
+                            try:
+                                predict_race_core(r_id, force_refresh=True, is_auto_final=False, odds_stage="30m")
+                                supabase.table("keiba_scheduled_races")\
+                                    .update({"is_predicted": 3})\
+                                    .eq("race_id", r_id)\
+                                    .execute()
+                            except Exception as pe:
+                                print(f"[Auto-Predict Stage3] 更新失敗 ({r_id}): {pe}")
+
+                        # Stage 2: 発走 60分前 (33.0 < mins <= 65.0) -> 馬体重反映・第1回再計算
+                        elif 33.0 < mins_to_post <= 65.0 and cur_stage < 2:
+                            try:
+                                predict_race_core(r_id, force_refresh=False, is_auto_final=False, odds_stage="60m")
+                            except Exception as we:
+                                print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
 
