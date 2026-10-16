@@ -9,7 +9,10 @@ import re
 import json
 import asyncio
 import threading
+import random
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
 import lightgbm as lgb
 import traceback
@@ -71,10 +74,90 @@ def today_jst_str() -> str:
     return now_jst().strftime("%Y-%m-%d")
 
 
+# --- 堅牢なスクレイピング用 HTTP クライアント基盤 (Step 1 冗長化) ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+]
+
 HEADERS_PC = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": USER_AGENTS[0],
     "Referer": "https://race.netkeiba.com/"
 }
+
+
+def create_robust_session() -> requests.Session:
+    """自動リトライ、コネクションプール、タイムアウト制御を備えた堅牢なセッション"""
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=30)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+GLOBAL_HTTP_SESSION = create_robust_session()
+
+
+def safe_scrape_get(
+    url: str,
+    headers: Optional[dict] = None,
+    timeout: float = 10.0,
+    referer: str = "https://race.netkeiba.com/",
+    max_retries: int = 3
+) -> requests.Response:
+    """
+    User-Agentローテーション、リトライ、ジッター、接続保持を統合した安全なHTTP GET
+    """
+    req_headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": referer,
+        "Connection": "keep-alive"
+    }
+    if headers:
+        req_headers.update(headers)
+
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                sleep_time = 0.3 * (2 ** attempt) + random.uniform(0.05, 0.2)
+                time.sleep(sleep_time)
+            resp = GLOBAL_HTTP_SESSION.get(url, headers=req_headers, timeout=timeout)
+            if resp.status_code in [429, 500, 502, 503, 504]:
+                if attempt < max_retries - 1:
+                    continue
+            return resp
+        except (requests.exceptions.RequestException, Exception) as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts")
+
+
+def safe_decode_html(resp: requests.Response) -> str:
+    """EUC-JP / UTF-8 をスマートに自動判定して文字列デコード"""
+    content = resp.content
+    raw_head = content[:400].lower()
+    if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head or b"utf-8" in raw_head:
+        return content.decode("utf-8", errors="replace")
+    try:
+        return content.decode("euc-jp")
+    except UnicodeDecodeError:
+        return content.decode("utf-8", errors="replace")
+
 
 GLOBAL_VENUE_MAP = {
     1: "札幌", 2: "函館", 3: "福島", 4: "新潟", 5: "東京",
@@ -678,7 +761,7 @@ def fetch_real_odds(race_id: str) -> dict:
     # 1. 馬連 (type=4)
     try:
         u_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=4&action=init&output=json"
-        oresp = requests.get(u_url, headers=HEADERS_PC, timeout=6)
+        oresp = safe_scrape_get(u_url, timeout=6.0)
         if oresp.status_code == 200:
             d = oresp.json()
             if isinstance(d, str):
@@ -704,7 +787,7 @@ def fetch_real_odds(race_id: str) -> dict:
     # 2. 三連複 (type=7)
     try:
         t_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=7&action=init&output=json"
-        oresp = requests.get(t_url, headers=HEADERS_PC, timeout=6)
+        oresp = safe_scrape_get(t_url, timeout=6.0)
         if oresp.status_code == 200:
             d = oresp.json()
             if isinstance(d, str):
@@ -1008,15 +1091,10 @@ def fetch_venues_for_date_raw(date_str: str, force_refresh: bool = False) -> Lis
     ]
     for url in urls:
         try:
-            resp = requests.get(url, headers=HEADERS_PC, timeout=10)
-            raw_head = resp.content[:300].lower()
-            if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head:
-                text = resp.content.decode("utf-8", errors="replace")
-            else:
-                try:
-                    text = resp.content.decode("euc-jp")
-                except UnicodeDecodeError:
-                    text = resp.content.decode("utf-8", errors="replace")
+            resp = safe_scrape_get(url, timeout=10.0)
+            if resp.status_code != 200:
+                continue
+            text = safe_decode_html(resp)
 
             venues = parse_netkeiba_race_list_html(text)
             # 1会場あたり8R以上ある場合のみ正式な出走表確定済み開催日とみなす（次週の未確定枠を除外）
@@ -1251,18 +1329,29 @@ def get_today_races(
 
 
 def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
-    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    resp = requests.get(url, headers=HEADERS_PC, timeout=10)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"netkeiba出馬表の取得に失敗しました (Status: {resp.status_code})。ダミー値生成は行いません。")
-    raw_head = resp.content[:300].lower()
-    if b'charset="utf-8"' in raw_head or b"charset=utf-8" in raw_head or b"utf-8" in raw_head:
-        html = resp.content.decode("utf-8", errors="replace")
-    else:
+    # PC版出走表を第一候補、SP版をフォールバックとして二重冗長化
+    urls_to_try = [
+        f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    ]
+    html = ""
+    last_err = ""
+    for target_url in urls_to_try:
         try:
-            html = resp.content.decode("euc-jp")
-        except UnicodeDecodeError:
-            html = resp.content.decode("utf-8", errors="replace")
+            resp = safe_scrape_get(target_url, timeout=10.0)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                html = safe_decode_html(resp)
+                if "HorseList" in html or "shutuba" in html or "出馬表" in html:
+                    break
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail=f"netkeiba出馬表の取得に失敗しました (race_id={race_id}, error={last_err})。ダミー値生成は行いません。"
+        )
     soup = BeautifulSoup(html, "html.parser")
 
     race_num_int = int(race_id[10:12]) if len(race_id) == 12 and race_id[10:12].isdigit() else 1
@@ -1392,7 +1481,7 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
     odds_map = {}
     try:
         odds_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&output=json"
-        oresp = requests.get(odds_url, headers=HEADERS_PC, timeout=5)
+        oresp = safe_scrape_get(odds_url, timeout=6.0)
         raw_res = oresp.json()
         if isinstance(raw_res, str):
             raw_res = json.loads(raw_res)
@@ -3054,11 +3143,8 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     # SP版スクレイピング試行
     sp_url = f"https://race.sp.netkeiba.com/race/result.html?race_id={race_id}"
     try:
-        resp = requests.get(sp_url, headers=HEADERS_PC, timeout=10)
-        try:
-            html = resp.content.decode("euc-jp")
-        except UnicodeDecodeError:
-            html = resp.content.decode("utf-8", errors="replace")
+        resp = safe_scrape_get(sp_url, timeout=10.0)
+        html = safe_decode_html(resp)
         sp_html_text = html
         soup = BeautifulSoup(html, "html.parser")
         sp_title = soup.title.get_text(strip=True) if soup.title else ""
@@ -3129,11 +3215,8 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
     if not payouts["umaren"] or len(orders) < 3:
         pc_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         try:
-            resp = requests.get(pc_url, headers=HEADERS_PC, timeout=10)
-            try:
-                html = resp.content.decode("euc-jp")
-            except UnicodeDecodeError:
-                html = resp.content.decode("utf-8", errors="replace")
+            resp = safe_scrape_get(pc_url, timeout=10.0)
+            html = safe_decode_html(resp)
             pc_html_text = html
             soup = BeautifulSoup(html, "html.parser")
             pc_title = soup.title.get_text(strip=True) if soup.title else ""
@@ -3843,11 +3926,8 @@ def resolve_race_date_for_id(race_id: str) -> str:
     # netkeibaのHTMLから正確な開催年月日を抽出
     try:
         url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
-        resp = requests.get(url, headers=HEADERS_PC, timeout=5)
-        try:
-            html = resp.content.decode("euc-jp")
-        except UnicodeDecodeError:
-            html = resp.text
+        resp = safe_scrape_get(url, timeout=5.0)
+        html = safe_decode_html(resp)
         m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", html)
         if m:
             return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
