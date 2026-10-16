@@ -2911,26 +2911,52 @@ def compute_track_bias_and_matches(
         bias_info = cached_entry[1]
     elif supabase:
         try:
-            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを keiba_race_settlements から取得
-            # JRA仕様: race_id の先頭10桁 (YYYY + VENUE + KAI + NICHI) は同一開催日で100%一致
+            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを取得
+            # 1. keiba_race_results_cache から確定着順(orders)を直接取得 (最も軽量かつ安全)
             day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
             start_rid = f"{day_prefix}01"
-            s_res = supabase.table("keiba_race_settlements")\
-                .select("race_id, top3_orders")\
-                .gte("race_id", start_rid)\
-                .lt("race_id", race_id)\
-                .execute()
+            settled_races = []
+            try:
+                res_cache = supabase.table("keiba_race_results_cache")\
+                    .select("race_id, result_json")\
+                    .gte("race_id", start_rid)\
+                    .lt("race_id", race_id)\
+                    .execute()
+                for r in (res_cache.data or []):
+                    rid = r.get("race_id")
+                    rj = r.get("result_json") or {}
+                    orders = rj.get("orders") or {}
+                    if orders:
+                        settled_races.append({"race_id": rid, "orders": orders})
+            except Exception as e:
+                print(f"[TrackBias] results_cache query warning: {e}")
 
-            settled_rows = s_res.data or []
+            # 2. results_cache が空の場合は keiba_race_settlements からフォールバック取得
+            if not settled_races:
+                try:
+                    s_res = supabase.table("keiba_race_settlements")\
+                        .select("race_id, bet_details")\
+                        .gte("race_id", start_rid)\
+                        .lt("race_id", race_id)\
+                        .execute()
+                    for r in (s_res.data or []):
+                        rid = r.get("race_id")
+                        b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+                        top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
+                        if top3:
+                            settled_races.append({"race_id": rid, "top3_orders": top3})
+                except Exception as e:
+                    print(f"[TrackBias] settlements query warning: {e}")
+
             sample_races = 0
             inside_count = 0
             middle_count = 0
             outside_count = 0
             front_wins = 0
 
-            if settled_rows:
+            if settled_races:
                 # 確定レースのコース条件(芝/ダート)および枠番マップを predictions_cache から取得
-                past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
+                past_rids = [r["race_id"] for r in settled_races if r.get("race_id")]
                 pred_map = {}
                 if past_rids:
                     try:
@@ -2945,21 +2971,8 @@ def compute_track_bias_and_matches(
                 is_target_turf = "芝" in surface_name
                 is_target_dirt = ("ダ" in surface_name) or ("ダート" in surface_name)
 
-                for s_row in settled_rows:
-                    r_id = str(s_row.get("race_id") or "")
-                    # top3_orders を専用カラムから抽出、なければ個別フォールバック
-                    top3 = s_row.get("top3_orders")
-                    if not top3:
-                        try:
-                            fb = supabase.table("keiba_race_settlements").select("bet_details").eq("race_id", r_id).execute()
-                            if fb.data:
-                                b_det = fb.data[0].get("bet_details") or {}
-                                top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
-                        except Exception:
-                            top3 = []
-                    if not top3 or len(top3) < 3:
-                        continue
-
+                for s_item in settled_races:
+                    r_id = str(s_item.get("race_id") or "")
                     dj = pred_map.get(r_id, {})
                     c_details = (dj.get("race_details") or {}).get("course_details", "")
                     # トラック種別の一致判定 (芝: '芝', ダート: 'ダ' or 'ダート')
@@ -2972,22 +2985,45 @@ def compute_track_bias_and_matches(
                     if not is_target_turf and not is_target_dirt:
                         continue
 
+                    # 1〜3着馬番リストの構築
+                    top3_list = []
+                    if "orders" in s_item:
+                        for u_k, o_v in (s_item.get("orders") or {}).items():
+                            try:
+                                u_int = int(u_k)
+                                o_int = int(o_v)
+                                if o_int in (1, 2, 3):
+                                    top3_list.append({"umaban": u_int, "order": o_int})
+                            except Exception:
+                                pass
+                        top3_list.sort(key=lambda x: x["order"])
+                    elif "top3_orders" in s_item:
+                        for it in (s_item.get("top3_orders") or []):
+                            if isinstance(it, dict):
+                                top3_list.append({
+                                    "umaban": int(it.get("umaban") or 0),
+                                    "order": int(it.get("order") or 1),
+                                    "horse_name": it.get("horse_name", "")
+                                })
+                            else:
+                                try:
+                                    top3_list.append({"umaban": int(it), "order": 1, "horse_name": ""})
+                                except Exception:
+                                    pass
+
+                    if len(top3_list) < 3:
+                        continue
+
                     sample_races += 1
                     r_horses = dj.get("horses") or []
                     w_map = {int(h["umaban"]): int(h.get("wakuban") or 0) for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
+                    name_map = {int(h["umaban"]): h.get("horse_name", "") for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
 
-                    for item in top3[:3]:
-                        if isinstance(item, dict):
-                            u_num = int(item.get("umaban") or 0)
-                            order_num = int(item.get("order") or 0)
-                            h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
-                        else:
-                            try:
-                                u_num = int(item)
-                            except Exception:
-                                u_num = 0
-                            order_num = 1
-                            h_clean = ""
+                    for item in top3_list[:3]:
+                        u_num = item["umaban"]
+                        order_num = item["order"]
+                        h_name = item.get("horse_name") or name_map.get(u_num, "")
+                        h_clean = re.sub(r"[\s\u3000]", "", str(h_name))
 
                         waku_num = w_map.get(u_num, 0)
                         # 枠番が未設定の場合のフォールバック (馬番から近似)
@@ -6585,21 +6621,16 @@ def endpoint_debug_track_bias(race_id: str):
     day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
     start_rid = f"{day_prefix}01"
     
-    s_res = supabase.table("keiba_race_settlements")\
-        .select("race_id, top3_orders")\
+    # 1. results_cache
+    res_cache = supabase.table("keiba_race_results_cache")\
+        .select("race_id, result_json")\
         .gte("race_id", start_rid)\
         .lt("race_id", race_id)\
         .execute()
-    settled_rows = s_res.data or []
-    
-    # 全件で prefix にマッチするレース (確認用)
-    s_like = supabase.table("keiba_race_settlements")\
-        .select("race_id")\
-        .gte("race_id", start_rid)\
-        .lte("race_id", f"{day_prefix}12")\
-        .execute()
-    
-    past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
+    results_rows = res_cache.data or []
+
+    # 2. predictions_cache
+    past_rids = [r["race_id"] for r in results_rows if r.get("race_id")]
     pred_map = {}
     if past_rids:
         try:
@@ -6617,20 +6648,17 @@ def endpoint_debug_track_bias(race_id: str):
     this_course = (this_dj.get("race_details") or {}).get("course_details", "")
     
     eval_list = []
-    for s_row in settled_rows:
-        rid = str(s_row.get("race_id") or "")
-        top3 = s_row.get("top3_orders")
-        if not top3:
-            b_det = s_row.get("bet_details") if isinstance(s_row.get("bet_details"), dict) else {}
-            top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
-        
+    for r in results_rows:
+        rid = str(r.get("race_id") or "")
+        rj = r.get("result_json") or {}
+        orders = rj.get("orders") or {}
         dj = pred_map.get(rid, {})
         c_details = (dj.get("race_details") or {}).get("course_details", "")
         
         eval_list.append({
             "race_id": rid,
-            "has_top3": bool(top3 and len(top3) >= 3),
-            "top3_len": len(top3) if top3 else 0,
+            "has_orders": bool(orders),
+            "orders_count": len(orders),
             "course_details": c_details,
             "dj_found": bool(dj)
         })
@@ -6640,8 +6668,7 @@ def endpoint_debug_track_bias(race_id: str):
         "day_prefix": day_prefix,
         "start_rid": start_rid,
         "this_course_details": this_course,
-        "settled_count_gte_lt": len(settled_rows),
-        "settled_count_like": len(s_like.data or []),
+        "results_count": len(results_rows),
         "eval_list": eval_list
     }
 
