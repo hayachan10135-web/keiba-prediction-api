@@ -77,9 +77,9 @@ def today_jst_str() -> str:
 # --- 堅牢なスクレイピング用 HTTP クライアント基盤 (Step 1 冗長化) ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
 ]
 
 HEADERS_PC = {
@@ -1516,35 +1516,46 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
 
     for row in rows:
         umaban_tag = row.select_one("td.Umaban, td[class*='Umaban']")
-        if not umaban_tag or not umaban_tag.get_text(strip=True).isdigit():
-            continue
-        umaban = int(umaban_tag.get_text(strip=True))
-
-        wakuban = 1
         waku_tag = row.select_one("td.Waku, td[class*='Waku']")
-        if waku_tag:
-            wm = re.search(r"\d+", waku_tag.get_text(strip=True))
-            if wm:
-                wakuban = int(wm.group())
+        if umaban_tag and umaban_tag.get_text(strip=True).isdigit():
+            umaban = int(umaban_tag.get_text(strip=True))
+            wakuban = 1
+            if waku_tag:
+                wm = re.search(r"\d+", waku_tag.get_text(strip=True))
+                if wm:
+                    wakuban = int(wm.group())
+        elif waku_tag and waku_tag.get_text(strip=True).isdigit():
+            # SP版では td.WakuX のテキストが馬番、クラス名の数値が枠番
+            umaban = int(waku_tag.get_text(strip=True))
+            wakuban = 1
+            w_cls = " ".join(waku_tag.get("class") or [])
+            wm_cls = re.search(r"Waku(\d)", w_cls)
+            if wm_cls:
+                wakuban = int(wm_cls.group(1))
+        else:
+            continue
 
-        name_tag = row.select_one(".HorseName a, .Horse_Info a")
+        name_tag = row.select_one(".HorseName a, .Horse_Info dt.Horse a, .Horse_Info a")
         if not name_tag or not name_tag.get_text(strip=True):
             raise HTTPException(status_code=502, detail=f"出馬表から馬番 {umaban} の正式な馬名を取得できませんでした (ダミー値補完禁止)")
         horse_name = name_tag.get_text(strip=True)
 
-        jockey_tag = row.select_one(".Jockey a")
+        jockey_tag = row.select_one(".Jockey em, .Jockey a")
         jockey = jockey_tag.get_text(strip=True) if jockey_tag else "未定"
+        jockey = re.sub(r"\s*\d{2}(?:\.\d)?$", "", jockey).strip() or "未定"
 
-        trainer_tag = row.select_one(".Trainer a, td.Trainer")
+        trainer_tag = row.select_one("td.Trainer, .Trainer a")
         trainer = trainer_tag.get_text(strip=True) if trainer_tag else "未定"
 
-        # ★ 性齢 (td.Barei) と 斤量 (td.Barei の次の td または td.Kinryo)
+        # ★ 性齢 (PC版 td.Barei / SP版 dd.Age) と 斤量 (td.Barei の次の td または td.Kinryo / SP版 dd.Jockey)
         sex_age = None
         sex_code = 0
         age = 4.0
-        barei_tag = row.select_one("td.Barei")
+        barei_tag = row.select_one("td.Barei, dd.Age")
         if barei_tag:
-            b_str = barei_tag.get_text(strip=True)
+            b_raw = barei_tag.get_text(" ", strip=True)
+            m_sa = re.search(r"([牡牝セ騸]\d+)", b_raw)
+            b_str = m_sa.group(1) if m_sa else b_raw.split()[0] if b_raw else ""
             if b_str:
                 sex_age = b_str
                 if "牝" in b_str:
@@ -1556,7 +1567,7 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
                     age = float(m_age.group(1))
 
         kinryo = 55.0
-        kinryo_tag = barei_tag.find_next_sibling("td") if barei_tag else row.select_one("td.Kinryo")
+        kinryo_tag = (barei_tag.find_next_sibling("td") if (barei_tag and barei_tag.name == "td") else None) or row.select_one("td.Kinryo, dd.Jockey")
         if kinryo_tag:
             km = re.search(r"(\d{2}(?:\.\d)?)", kinryo_tag.get_text(strip=True))
             if km:
@@ -2680,22 +2691,54 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                     except Exception as ue:
                         print(f"予想キャッシュ出走時刻更新エラー ({race_id}): {ue}")
 
-        # ★ 【Step 3】当日発走75分前以降でキャッシュに馬体重が未反映の場合は自動再取得へ昇格 ★
+        # ★ 【Step 3】キャッシュに馬体重・性齢が未反映の場合の自動反映・自己修復 ★
         has_cached_weights = any(h.get("horse_weight") is not None for h in cached_pred.get("horses", []))
+        has_cached_sex_age = any(bool(h.get("sex_age")) for h in cached_pred.get("horses", []))
         should_auto_refresh_weight = False
-        if not has_cached_weights and sched_race_date == today_jst_str() and sched_post_dt_raw:
-            try:
-                post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
-                now_dt_obj = now_jst_naive()
-                # 発走75分前 〜 発走時刻の間、3分クールダウンで馬体重発表をチェック
-                if (post_dt_obj - datetime.timedelta(minutes=75)) <= now_dt_obj < post_dt_obj:
-                    now_ts = time.time()
-                    if now_ts - _last_weight_check_ts.get(race_id, 0.0) >= 180.0:
-                        _last_weight_check_ts[race_id] = now_ts
-                        should_auto_refresh_weight = True
-                        print(f"[Auto-Weight] {race_id}: 発走75分前圏内のため直前馬体重の反映を実行します。")
-            except Exception:
-                pass
+        if not has_cached_weights or not has_cached_sex_age:
+            now_ts = time.time()
+            if now_ts - _last_weight_check_ts.get(race_id, 0.0) >= 180.0:
+                is_past_or_post = False
+                if sched_race_date and sched_race_date < today_jst_str():
+                    is_past_or_post = True
+                elif sched_race_date == today_jst_str() and sched_post_dt_raw:
+                    try:
+                        post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
+                        now_dt_obj = now_jst_naive()
+                        if (post_dt_obj - datetime.timedelta(minutes=75)) <= now_dt_obj < post_dt_obj:
+                            _last_weight_check_ts[race_id] = now_ts
+                            should_auto_refresh_weight = True
+                            print(f"[Auto-Weight] {race_id}: 発走75分前圏内のため直前馬体重の反映＆再推論を実行します。")
+                        elif now_dt_obj >= post_dt_obj:
+                            is_past_or_post = True
+                    except Exception:
+                        pass
+                elif not sched_race_date:
+                    is_past_or_post = True
+
+                # 発走済み・過去レースで馬体重や性齢が欠損している場合は、確定済みの買い目を変えずにメタデータのみ自己修復
+                if is_past_or_post and not should_auto_refresh_weight:
+                    _last_weight_check_ts[race_id] = now_ts
+                    try:
+                        _, _, fresh_horses, _ = fetch_shutuba_table(race_id, race_date=sched_race_date)
+                        fh_map = {int(fh["umaban"]): fh for fh in fresh_horses if "umaban" in fh}
+                        patched = False
+                        for ch in cached_pred.get("horses", []):
+                            u_num = int(ch.get("umaban", 0))
+                            fh = fh_map.get(u_num)
+                            if fh:
+                                if ch.get("horse_weight") is None and fh.get("horse_weight") is not None:
+                                    ch["horse_weight"] = fh["horse_weight"]
+                                    ch["weight_diff"] = fh.get("weight_diff", 0)
+                                    patched = True
+                                if not ch.get("sex_age") and fh.get("sex_age"):
+                                    ch["sex_age"] = fh["sex_age"]
+                                    patched = True
+                        if patched and supabase:
+                            supabase.table("keiba_predictions_cache").update({"data_json": cached_pred}).eq("race_id", race_id).execute()
+                            print(f"[Auto-Weight Heal] {race_id}: 終了済レースの馬体重・性齢キャッシュを自動補完しました。")
+                    except Exception as he:
+                        print(f"[Auto-Weight Heal Warning] {race_id}: {he}")
 
         if not should_auto_refresh_weight:
             return cached_pred
