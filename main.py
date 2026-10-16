@@ -6500,68 +6500,72 @@ def endpoint_rebuild_predictions(
             if not r_id or not horses:
                 continue
 
-            # 1. オッズ変動・異常検知を再適用
-            apply_odds_anomaly_indicators(horses)
+            try:
+                # 1. オッズ変動・異常検知を再適用
+                apply_odds_anomaly_indicators(horses)
 
-            # 2. トラックバイアスを再計算
-            c_details = (d_json.get("race_details") or {}).get("course_details", "")
-            surf_str = "芝" if "芝" in c_details else ("ダート" if "ダ" in c_details else "障害")
-            tb_info = compute_track_bias_and_matches(r_id, r_date, surf_str, horses)
-            if tb_info:
-                d_json["track_bias"] = tb_info
+                # 2. トラックバイアスを再計算
+                c_details = (d_json.get("race_details") or {}).get("course_details", "")
+                surf_str = "芝" if "芝" in c_details else ("ダート" if "ダ" in c_details else "障害")
+                tb_info = compute_track_bias_and_matches(r_id, r_date, surf_str, horses)
+                if tb_info:
+                    d_json["track_bias"] = tb_info
 
-            # 3. keiba_predictions_cache を最新JSONで更新 (delete/upsert)
-            supabase.table("keiba_predictions_cache").upsert({
-                "race_id": r_id,
-                "race_date": r_date,
-                "data_json": d_json
-            }).execute()
-            updated_predictions += 1
+                # 3. keiba_predictions_cache を最新JSONで更新 (delete/upsert)
+                supabase.table("keiba_predictions_cache").upsert({
+                    "race_id": r_id,
+                    "race_date": r_date,
+                    "data_json": d_json
+                }).execute()
+                updated_predictions += 1
 
-            # 4. 成績台帳 (keiba_race_settlements) にも反映
-            if sync_settlements:
-                try:
-                    s_res = supabase.table("keiba_race_settlements").select("race_id, bet_details").eq("race_id", r_id).execute()
-                    if s_res.data and len(s_res.data) > 0:
-                        o_alerts = [
-                            {
-                                "umaban": h.get("umaban"),
-                                "horse_name": h.get("horse_name"),
-                                "odds": h.get("odds"),
-                                "odds_trend": h.get("odds_trend"),
-                                "odds_alert": h.get("odds_alert"),
-                                "bias_match": h.get("bias_match"),
-                                "odds_history": h.get("odds_history")
-                            }
-                            for h in horses
-                            if h.get("odds_alert") or h.get("odds_trend") or h.get("bias_match") or h.get("odds_history")
-                        ]
-                        patch_dict = {}
-                        if tb_info:
-                            patch_dict["track_bias"] = tb_info
-                        if o_alerts:
-                            patch_dict["odds_alerts"] = o_alerts
-                        
-                        b_det = s_res.data[0].get("bet_details") or {}
-                        t3 = b_det.get("real_bet_meta", {}).get("top3_orders")
-                        if t3:
-                            patch_dict["top3_orders"] = t3
-                        
-                        try:
-                            supabase.table("keiba_race_settlements").update(patch_dict).eq("race_id", r_id).execute()
-                            updated_settlements += 1
-                        except Exception:
-                            # カラム未作成時のフォールバック (bet_details内)
+                # 4. 成績台帳 (keiba_race_settlements) にも反映
+                if sync_settlements:
+                    try:
+                        s_res = supabase.table("keiba_race_settlements").select("race_id, bet_details").eq("race_id", r_id).execute()
+                        if s_res.data and len(s_res.data) > 0:
+                            o_alerts = [
+                                {
+                                    "umaban": h.get("umaban"),
+                                    "horse_name": h.get("horse_name"),
+                                    "odds": h.get("odds"),
+                                    "odds_trend": h.get("odds_trend"),
+                                    "odds_alert": h.get("odds_alert"),
+                                    "bias_match": h.get("bias_match"),
+                                    "odds_history": h.get("odds_history")
+                                }
+                                for h in horses
+                                if h.get("odds_alert") or h.get("odds_trend") or h.get("bias_match") or h.get("odds_history")
+                            ]
+                            patch_dict = {}
                             if tb_info:
-                                b_det["track_bias"] = tb_info
+                                patch_dict["track_bias"] = tb_info
                             if o_alerts:
-                                b_det["odds_alerts"] = o_alerts
-                            supabase.table("keiba_race_settlements").update({"bet_details": b_det}).eq("race_id", r_id).execute()
-                            updated_settlements += 1
-                except Exception as se:
-                    pass
+                                patch_dict["odds_alerts"] = o_alerts
+                            
+                            b_det = s_res.data[0].get("bet_details") or {}
+                            t3 = b_det.get("real_bet_meta", {}).get("top3_orders")
+                            if t3:
+                                patch_dict["top3_orders"] = t3
+                            
+                            try:
+                                supabase.table("keiba_race_settlements").update(patch_dict).eq("race_id", r_id).execute()
+                                updated_settlements += 1
+                            except Exception:
+                                # カラム未作成時のフォールバック (bet_details内)
+                                if tb_info:
+                                    b_det["track_bias"] = tb_info
+                                if o_alerts:
+                                    b_det["odds_alerts"] = o_alerts
+                                supabase.table("keiba_race_settlements").update({"bet_details": b_det}).eq("race_id", r_id).execute()
+                                updated_settlements += 1
+                    except Exception as se:
+                        pass
 
-            time.sleep(0.08)
+                time.sleep(0.08)
+            except Exception as row_err:
+                print(f"[Rebuild race warning] {r_id}: {row_err}")
+                continue
 
         invalidate_summary_caches()
         return {
@@ -6571,6 +6575,8 @@ def endpoint_rebuild_predictions(
             "message": f"{updated_predictions}件の予想キャッシュおよび{updated_settlements}件の成績台帳を最新ロジックで完全再同期しました。"
         }
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[Rebuild Fatal Error] {e}\n{tb}")
         raise HTTPException(status_code=500, detail=f"Rebuild error: {e}")
 
 
