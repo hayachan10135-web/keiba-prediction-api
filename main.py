@@ -1168,7 +1168,7 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
             pass
 
     if p_info["is_waiting_period"]:
-        return sorted(list(past_db_dates))
+        return sorted(list(past_db_dates))[-6:]
 
     start_d = p_info["period_start_date"]
     today_d = p_info["today_date"]
@@ -1197,7 +1197,7 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
 
         cur_d += datetime.timedelta(days=1)
 
-    return sorted(list(set(available_dates)))
+    return sorted(list(set(available_dates)))[-6:]
 
 
 def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) -> List[dict]:
