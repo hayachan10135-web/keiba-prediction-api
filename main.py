@@ -2700,9 +2700,10 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
 
         if not target_race_date:
             # キャッシュ中の開催期間から日付を逆引き
-            for d_cached, v_list in _period_venues_cache.items():
+            for d_cached, c_entry in _period_venues_cache.items():
+                v_list = c_entry.get("venues", []) if isinstance(c_entry, dict) else (c_entry if isinstance(c_entry, list) else [])
                 for v in v_list:
-                    if any(r.get("race_id") == race_id for r in v.get("races", [])):
+                    if isinstance(v, dict) and any(r.get("race_id") == race_id for r in v.get("races", [])):
                         target_race_date = d_cached
                         break
                 if target_race_date:
@@ -3914,9 +3915,10 @@ def process_settlement_calculation(
 
 def resolve_race_date_for_id(race_id: str) -> str:
     """レースIDに対応する正確な開催日 (YYYY-MM-DD) をキャッシュ・DB・netkeibaから逆引き"""
-    for d_cached, v_list in _period_venues_cache.items():
+    for d_cached, c_entry in _period_venues_cache.items():
+        v_list = c_entry.get("venues", []) if isinstance(c_entry, dict) else (c_entry if isinstance(c_entry, list) else [])
         for v in v_list:
-            if any(r.get("race_id") == race_id for r in v.get("races", [])):
+            if isinstance(v, dict) and any(r.get("race_id") == race_id for r in v.get("races", [])):
                 return d_cached
 
     # 2026年4回東京(05)・京都(08)開催の確定日程マッピング
