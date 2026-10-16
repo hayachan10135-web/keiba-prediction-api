@@ -3984,12 +3984,21 @@ def verify_race_result(
     from_cache = False
 
     if cached_data:
-        from_cache = True
-        race_res = cached_data
+        c_orders = cached_data.get("orders", {}) if isinstance(cached_data, dict) else {}
+        c_payouts = cached_data.get("payouts", {}) if isinstance(cached_data, dict) else {}
+        c_order_vals = [int(v) for v in c_orders.values() if str(v).isdigit()]
+        c_has_top3 = (1 in c_order_vals) and (2 in c_order_vals) and (3 in c_order_vals)
+        c_has_pay = bool(c_payouts.get("tansho") or c_payouts.get("umaren") or c_payouts.get("fukusho"))
+        if c_has_top3 and c_has_pay:
+            from_cache = True
+            race_res = cached_data
+        else:
+            race_res = fetch_netkeiba_race_result(race_id)
     else:
         race_res = fetch_netkeiba_race_result(race_id)
-        if not race_res:
-            raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
+
+    if not race_res:
+        raise HTTPException(status_code=400, detail="レース結果がまだ確定していないか、取得できませんでした。発走後しばらくしてから再試行してください。")
 
     # 予想情報を取得
     pred_data = predict_race_core(race_id)
