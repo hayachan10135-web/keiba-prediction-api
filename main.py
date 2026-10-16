@@ -6542,12 +6542,16 @@ def endpoint_rebuild_predictions(
                         if o_alerts:
                             patch_dict["odds_alerts"] = o_alerts
                         
+                        b_det = s_res.data[0].get("bet_details") or {}
+                        t3 = b_det.get("real_bet_meta", {}).get("top3_orders")
+                        if t3:
+                            patch_dict["top3_orders"] = t3
+                        
                         try:
                             supabase.table("keiba_race_settlements").update(patch_dict).eq("race_id", r_id).execute()
                             updated_settlements += 1
                         except Exception:
                             # カラム未作成時のフォールバック (bet_details内)
-                            b_det = s_res.data[0].get("bet_details") or {}
                             if tb_info:
                                 b_det["track_bias"] = tb_info
                             if o_alerts:
