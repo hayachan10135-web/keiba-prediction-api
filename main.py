@@ -6480,7 +6480,7 @@ def endpoint_rebuild_predictions(
         raise HTTPException(status_code=500, detail="Supabase not connected")
 
     try:
-        query = supabase.table("keiba_predictions_cache").select("race_id, race_date, data_json").neq("race_id", "SCHEMA_VERSION")
+        query = supabase.table("keiba_predictions_cache").select("race_id, race_date").neq("race_id", "SCHEMA_VERSION")
         if date:
             query = query.eq("race_date", date)
         else:
@@ -6495,12 +6495,19 @@ def endpoint_rebuild_predictions(
         for row in rows:
             r_id = row.get("race_id")
             r_date = row.get("race_date") or today_jst_str()
-            d_json = row.get("data_json") or {}
-            horses = d_json.get("horses", [])
-            if not r_id or not horses:
+            if not r_id:
                 continue
 
             try:
+                # 1レースごとに個別に data_json を取得 (巨大ペイロードによる通信バッファ枯渇を完全防止)
+                p_item = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", r_id).execute()
+                if not p_item.data:
+                    continue
+                d_json = p_item.data[0].get("data_json") or {}
+                horses = d_json.get("horses", [])
+                if not horses:
+                    continue
+
                 # 1. オッズ変動・異常検知を再適用
                 apply_odds_anomaly_indicators(horses)
 
