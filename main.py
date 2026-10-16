@@ -487,6 +487,10 @@ class HorsePrediction(BaseModel):
     horse_weight: Optional[int] = None
     weight_diff: Optional[int] = None
     sex_age: Optional[str] = None
+    base_odds: Optional[float] = None
+    odds_change_pct: Optional[float] = None
+    odds_trend: Optional[str] = None
+    odds_alert: Optional[str] = None
 
 class TicketBet(BaseModel):
     ticket_type: str
@@ -2617,13 +2621,86 @@ def compute_hybrid_rec_from_inputs(
 # ★ Supabase CRUD ヘルパー
 # =========================================================================
 
+def apply_odds_anomaly_indicators(horses: List[dict], prev_horses: Optional[List[dict]] = None):
+    """
+    【Step 4】異常オッズ・直前急変の検知（支持率変動 ＆ AI期待値乖離インジケーター）
+    1. 時系列オッズ変動: 初回予想時オッズ(base_odds)と現在オッズ(odds)を比較し、
+       - 25%以上の急落（かつ1.0倍以上低下）: 🔥大口急落 (plunge)
+       - 15%〜25%の低下（かつ0.5倍以上低下）: 📉支持増 (drop)
+       - 30%以上の上昇（かつ1.5倍以上上昇）: 📈人気軟化 (drift)
+    2. AI評価×市場オッズの異常乖離シグナル:
+       - AI印あり(◎◯▲△☆) かつ 5番人気以下(または単勝10倍以上) かつ 期待値(prob_win * odds) >= 1.15: 💎妙味穴 (value_gap)
+       - AI無印(-) かつ 1〜2番人気(または単勝3.5倍以下) かつ 期待値(prob_win * odds) < 0.45: ⚠️過剰人気 (overbet)
+    ※ LightGBMモデルの推論確率(prob_win / prob_top3)自体は一切変更しない（ゼロリーク・ベースライン厳守）。
+    """
+    if not horses:
+        return
+    prev_map = {}
+    if prev_horses:
+        for ph in prev_horses:
+            if "umaban" in ph and str(ph["umaban"]).isdigit():
+                prev_map[int(ph["umaban"])] = ph
+
+    for h in horses:
+        try:
+            u = int(h.get("umaban", 0))
+        except Exception:
+            continue
+        curr_raw = h.get("odds")
+        curr_odds = float(curr_raw) if (curr_raw is not None and float(curr_raw) > 0) else None
+        prev_h = prev_map.get(u, {})
+
+        base_raw = h.get("base_odds") or prev_h.get("base_odds") or prev_h.get("odds") or curr_odds
+        base_odds = round(float(base_raw), 1) if (base_raw is not None and float(base_raw) > 0) else None
+        h["base_odds"] = base_odds
+
+        if curr_odds and base_odds and base_odds > 0:
+            pct = round(((curr_odds - base_odds) / base_odds) * 100.0, 1)
+        else:
+            pct = 0.0
+        h["odds_change_pct"] = pct
+
+        mark = str(h.get("mark") or "-")
+        pop_raw = h.get("popularity")
+        pop = int(pop_raw) if (pop_raw is not None and str(pop_raw).isdigit() and int(pop_raw) > 0) else None
+        pw_raw = float(h.get("prob_win") or h.get("score") or 0.0)
+        prob_win = pw_raw / 100.0 if pw_raw > 1.0 else pw_raw
+        ev = round(prob_win * curr_odds, 2) if curr_odds else 0.0
+
+        trend = None
+        alert = None
+        if curr_odds and base_odds and curr_odds <= base_odds * 0.75 and (base_odds - curr_odds) >= 1.0:
+            trend = "plunge"
+            alert = f"🔥大口急落 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
+        elif curr_odds and base_odds and curr_odds <= base_odds * 0.85 and (base_odds - curr_odds) >= 0.5:
+            trend = "drop"
+            alert = f"📉支持増 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
+        elif mark in ("◎", "◯", "〇", "○", "▲", "△", "☆") and curr_odds and ((pop is not None and pop >= 5) or curr_odds >= 10.0) and ev >= 1.15:
+            trend = "value_gap"
+            pop_str = f"{pop}人気" if pop else f"{curr_odds:.1f}倍"
+            alert = f"💎妙味穴 ({pop_str} / 期待値{ev:.2f})"
+        elif mark == "-" and curr_odds and ((pop is not None and pop <= 2) or curr_odds <= 3.5) and ev < 0.45:
+            trend = "overbet"
+            pop_str = f"{pop}人気" if pop else f"{curr_odds:.1f}倍"
+            alert = f"⚠️過剰人気 ({pop_str} / AI無印)"
+        elif curr_odds and base_odds and curr_odds >= base_odds * 1.30 and (curr_odds - base_odds) >= 1.5:
+            trend = "drift"
+            alert = f"📈人気軟化 {base_odds:.1f}→{curr_odds:.1f}倍 ({pct:+.0f}%)"
+
+        h["odds_trend"] = trend
+        h["odds_alert"] = alert
+
+
 def get_cached_prediction(race_id: str) -> Optional[dict]:
     if not supabase:
         return None
     try:
         res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", race_id).execute()
         if res.data and len(res.data) > 0:
-            return res.data[0]["data_json"]
+            d_json = res.data[0]["data_json"]
+            if isinstance(d_json, dict) and "horses" in d_json:
+                apply_odds_anomaly_indicators(d_json.get("horses", []))
+            return d_json
     except Exception as e:
         print(f"Supabase予想取得エラー ({race_id}): {e}")
     return None
@@ -2807,6 +2884,9 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         course_meta["race_date"] = target_race_date
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
+        prev_horses_list = cached_pred.get("horses", []) if isinstance(cached_pred, dict) else None
+        apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list)
+
         resp_data = {
             "race_id": race_id,
             "race_name": result["race_name"],
@@ -2850,6 +2930,8 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
             r_id = row.get("race_id")
             d_json = row.get("data_json")
             if r_id and d_json:
+                if isinstance(d_json, dict) and "horses" in d_json:
+                    apply_odds_anomaly_indicators(d_json.get("horses", []))
                 preds[r_id] = d_json
         return {
             "date": target_date,
