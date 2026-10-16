@@ -955,7 +955,7 @@ def get_betting_settings_endpoint():
     """現在の自動投票設定を取得"""
     settings = load_betting_settings_from_supabase()
     cur_mode = settings.get("betting_mode", "off")
-    has_ipat_env = bool(os.getenv("IPAT_USER_NUM", "51395377") and os.getenv("IPAT_PIN", "6492"))
+    has_ipat_env = bool(os.getenv("IPAT_USER_NUM") and os.getenv("IPAT_PIN") and os.getenv("IPAT_PARS"))
     
     modes = [
         BettingModeItem(

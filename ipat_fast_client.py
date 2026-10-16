@@ -50,9 +50,9 @@ class IPATFastClient:
         pin: Optional[str] = None,
         pars: Optional[str] = None,
     ):
-        self.user_num = user_num or os.getenv("IPAT_USER_NUM", "51395377")
-        self.pin = pin or os.getenv("IPAT_PIN", "6492")
-        self.pars = pars or os.getenv("IPAT_PARS", "1916")
+        self.user_num = user_num or os.getenv("IPAT_USER_NUM", "")
+        self.pin = pin or os.getenv("IPAT_PIN", "")
+        self.pars = pars or os.getenv("IPAT_PARS", "")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -64,6 +64,11 @@ class IPATFastClient:
 
     def login(self) -> Dict[str, Any]:
         """即PATへログインし、購入限度額（残高）を取得"""
+        if not self.user_num or not self.pin or not self.pars:
+            return {
+                "success": False,
+                "error": "即PAT認証情報が未設定です。Renderの環境変数 (IPAT_USER_NUM, IPAT_PIN, IPAT_PARS) を設定してください。"
+            }
         try:
             r1 = self.session.get(f"{self.BASE_URL}/", timeout=10)
             soup1 = BeautifulSoup(r1.text, "html.parser")
