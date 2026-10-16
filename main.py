@@ -808,10 +808,147 @@ class BettingSettingsResponse(BaseModel):
     available_modes: List[BettingModeItem]
     ipat_configured: bool
     last_balance: Optional[int] = None
+    remaining_bet_amount: int = 0
+    remaining_real_races_count: int = 0
+    balance_shortfall: int = 0
     updated_at: Optional[str] = None
 
 class UpdateBettingModeRequest(BaseModel):
     betting_mode: str
+
+def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tuple[int, int, List[dict]]:
+    """
+    指定日（または本日/次回開催日）の未発走・未確定レースのうち、
+    実馬券・勝負馬券に該当するレースの残り投票予定合計金額を計算する。
+    戻り値: (残り合計金額, 該当レース数, 該当レース詳細リスト)
+    """
+    if not supabase:
+        return 0, 0, []
+
+    t_date = target_date or today_jst_str()
+    now_d = now_jst_naive()
+
+    try:
+        # スケジュールテーブルから当日または直近対象日の未確定レースを取得
+        s_res = supabase.table("keiba_scheduled_races")\
+            .select("race_id, race_date, race_name, post_datetime, is_predicted")\
+            .gte("race_date", t_date)\
+            .order("race_date")\
+            .order("race_id")\
+            .execute()
+
+        rows = s_res.data or []
+        if not rows:
+            return 0, 0, []
+
+        active_date = rows[0]["race_date"]
+        active_races = [r for r in rows if r["race_date"] == active_date]
+
+        unrun_races = []
+        for r in active_races:
+            p_str = r.get("post_datetime")
+            is_unrun = True
+            if p_str:
+                try:
+                    p_dt = datetime.datetime.strptime(p_str, "%Y-%m-%d %H:%M:%S")
+                    if now_d > p_dt + datetime.timedelta(minutes=10):
+                        is_unrun = False
+                except Exception:
+                    pass
+            if is_unrun:
+                unrun_races.append(r)
+
+        if not unrun_races:
+            return 0, 0, []
+
+        unrun_rids = [r["race_id"] for r in unrun_races]
+
+        p_res = supabase.table("keiba_predictions_cache")\
+            .select("race_id, data_json")\
+            .in_("race_id", unrun_rids)\
+            .execute()
+
+        total_remaining_amount = 0
+        real_target_races = []
+
+        for p_row in (p_res.data or []):
+            dj = p_row.get("data_json") or {}
+            h_rec = dj.get("hybrid_recommendation") or {}
+            if h_rec.get("is_real_bet_target"):
+                amt = int(h_rec.get("total_amount") or 0)
+                if amt > 0:
+                    total_remaining_amount += amt
+                    real_target_races.append({
+                        "race_id": p_row["race_id"],
+                        "race_name": dj.get("race_name", p_row["race_id"]),
+                        "amount": amt,
+                        "badge": h_rec.get("real_bet_badge", "実戦推奨")
+                    })
+
+        return total_remaining_amount, len(real_target_races), real_target_races
+    except Exception as e:
+        print(f"[RemainingBetAmount] 計算エラー: {e}")
+        return 0, 0, []
+
+_last_balance_warning_date: Optional[str] = None
+_last_warned_shortfall: int = 0
+
+def check_and_notify_balance_shortfall():
+    """
+    即PAT自動投票モードが有効な場合、残り投票予定額と即PAT残高を比較し、
+    不足が発生しそうな場合に FCM プッシュ通知を送信
+    """
+    global _last_balance_warning_date, _last_warned_shortfall
+    b_settings = load_betting_settings_from_supabase()
+    if b_settings.get("betting_mode") != "ipat":
+        return
+
+    cur_balance = b_settings.get("last_balance")
+    if cur_balance is None:
+        try:
+            client = IPATFastClient()
+            l_res = client.login()
+            if l_res.get("success"):
+                cur_balance = l_res.get("balance", 0)
+                b_settings["last_balance"] = cur_balance
+                save_betting_settings_to_supabase(b_settings)
+        except Exception:
+            return
+
+    if cur_balance is None:
+        return
+
+    rem_amt, rem_count, target_races = calculate_remaining_real_bet_amount()
+    if rem_count == 0 or rem_amt == 0:
+        return
+
+    shortfall = rem_amt - cur_balance
+    if shortfall > 0:
+        today_s = today_jst_str()
+        if _last_balance_warning_date == today_s and _last_warned_shortfall >= shortfall:
+            return
+
+        _last_balance_warning_date = today_s
+        _last_warned_shortfall = shortfall
+
+        race_names_str = "、".join([r["race_name"] for r in target_races[:3]])
+        if len(target_races) > 3:
+            race_names_str += f" 他{len(target_races)-3}レース"
+
+        title = f"⚠️【即PAT残高不足警告】{shortfall:,}円 不足の恐れ"
+        body = f"本日残り実戦投票予定: {rem_count}レース 計{rem_amt:,}円\n即PAT残高: {cur_balance:,}円 (不足額: -{shortfall:,}円)\n対象: {race_names_str}\n※即PAT口座へ追加入金を行ってください。"
+
+        print(f"[BalanceWarning] {title} を送信します")
+        send_fcm_notification(
+            title=title,
+            body=body,
+            data={
+                "type": "BALANCE_SHORTFALL_WARNING",
+                "shortfall": str(shortfall),
+                "remaining_amount": str(rem_amt),
+                "current_balance": str(cur_balance)
+            }
+        )
 
 @app.get("/settings/betting-mode", response_model=BettingSettingsResponse)
 def get_betting_settings_endpoint():
@@ -840,12 +977,20 @@ def get_betting_settings_endpoint():
             description="未テストのため現在選択できません。"
         )
     ]
+    
+    rem_amt, rem_count, _ = calculate_remaining_real_bet_amount()
+    last_bal = settings.get("last_balance") or 0
+    shortfall = max(0, rem_amt - last_bal) if (cur_mode == "ipat" and last_bal is not None) else 0
+
     return BettingSettingsResponse(
         betting_mode=cur_mode,
         auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
         available_modes=modes,
         ipat_configured=has_ipat_env,
         last_balance=settings.get("last_balance"),
+        remaining_bet_amount=rem_amt,
+        remaining_real_races_count=rem_count,
+        balance_shortfall=shortfall,
         updated_at=settings.get("updated_at")
     )
 
@@ -5968,6 +6113,7 @@ async def background_maintenance_loop():
                                         body=summary_body,
                                         data={"type": "MORNING_SUMMARY", "race_date": today_str}
                                     )
+                                    check_and_notify_balance_shortfall()
                         except Exception as fe:
                             print(f"[Scheduler] 朝通知エラー: {fe}")
                 else:
@@ -6133,6 +6279,9 @@ async def background_maintenance_loop():
                                 print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
+
+                # 予想更新時に即PAT残高不足の恐れがあればアラート通知
+                check_and_notify_balance_shortfall()
 
                 # --- ④ 各レース【発走 15分後】の個別自動照合（未確定時は5分おきにリトライ） ---
                 try:
