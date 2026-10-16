@@ -2911,11 +2911,12 @@ def compute_track_bias_and_matches(
         bias_info = cached_entry[1]
     elif supabase:
         try:
-            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを keiba_race_settlements から取得 (ゼロリーク厳格遵守)
+            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを keiba_race_settlements から取得
+            # JRA仕様: race_id の先頭10桁 (YYYY + VENUE + KAI + NICHI) は同一開催日で100%一致
+            day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
             s_res = supabase.table("keiba_race_settlements")\
                 .select("race_id, top3_orders")\
-                .eq("race_date", race_date)\
-                .like("race_id", f"{race_id[:4]}{venue_code_str}%")\
+                .like("race_id", f"{day_prefix}%")\
                 .lt("race_id", race_id)\
                 .execute()
 
