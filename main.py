@@ -2022,33 +2022,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     else:
         raise RuntimeError(f"AIモデルがロードされていないため、レース {race_id} の推論を実行できません。")
 
-    # ★ 【Step 3】直前馬体重・増減（±kg）の動的反映補正（発表済みの場合のみ適用）
-    for h in horses:
-        hw = h.get("horse_weight")
-        wd = h.get("weight_diff")
-        if hw is not None and wd is not None:
-            w_mult = 1.0
-            age_val = int(h.get("age") or 4)
-            # 1. 極端な馬体減（輸送減り・体調不安リスク）
-            if wd <= -14:
-                w_mult = 0.85 if hw < 440 else 0.89
-            elif wd <= -10:
-                w_mult = 0.92 if hw < 440 else 0.95
-            # 2. 極端な馬体増（太め残りリスク、ただし成長期の2〜3歳は軽減）
-            elif wd >= 16:
-                w_mult = 0.94 if age_val <= 3 else 0.89
-            elif wd >= 12:
-                w_mult = 0.97 if age_val <= 3 else 0.94
-            # 3. 好仕上がり・馬体絞り（-2kg 〜 -6kg または ダート大型馬の安定圏）
-            elif -6 <= wd <= -2:
-                w_mult = 1.02
-            elif surface_type == 1 and hw >= 500 and -4 <= wd <= 6:
-                w_mult = 1.02
-
-            if w_mult != 1.0:
-                h["prob_win"] = round(float(h.get("prob_win", 0.0)) * w_mult, 4)
-                h["prob_top3"] = round(float(h.get("prob_top3", 0.0)) * w_mult, 4)
-                h["score"] = h["prob_win"]
+    # ※ 馬体重および増減（horse_weight, weight_diff, abs_weight_diff, weight_ratio）は
+    #    48特徴量モデル（row48）の正式な特徴量として既に組み込まれているため、
+    #    二重補正を避け、モデル本来の48特徴量推論スコアをそのまま使用する。
 
     # 1着特化モデルのスコア順で◎, ◯を決定
     sorted_by_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
