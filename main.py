@@ -3319,6 +3319,22 @@ def get_cached_prediction(race_id: str) -> Optional[dict]:
             d_json = res.data[0]["data_json"]
             r_date = res.data[0].get("race_date") or today_jst_str()
             if isinstance(d_json, dict) and "horses" in d_json:
+                orig_horses = d_json.get("horses", [])
+                seen_u = set()
+                dedup_horses = []
+                for h in orig_horses:
+                    u = h.get("umaban")
+                    if u is not None and u not in seen_u:
+                        seen_u.add(u)
+                        dedup_horses.append(h)
+                if len(dedup_horses) != len(orig_horses):
+                    d_json["horses"] = dedup_horses
+                    if supabase:
+                        try:
+                            supabase.table("keiba_predictions_cache").update({"data_json": d_json}).eq("race_id", race_id).execute()
+                            print(f"[Self-Heal] {race_id}: キャッシュ内の重複馬番を修復しました ({len(orig_horses)}頭 -> {len(dedup_horses)}頭)")
+                        except Exception as ue:
+                            pass
                 apply_odds_anomaly_indicators(d_json.get("horses", []))
                 c_details = (d_json.get("race_details") or {}).get("course_details", "")
                 surf_str = "芝" if "芝" in c_details else ("ダート" if "ダ" in c_details else "障害")
