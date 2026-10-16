@@ -2902,7 +2902,7 @@ def compute_track_bias_and_matches(
         venue_code_int = 0
     venue_name = GLOBAL_VENUE_MAP.get(venue_code_int, "競馬場")
 
-    cache_key = f"{race_date}_{venue_code_str}_{surface_name}"
+    cache_key = f"{race_id}_{surface_name}"
     now_ts = time.time()
     cached_entry = _track_bias_cache.get(cache_key)
 
