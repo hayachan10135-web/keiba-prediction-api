@@ -2065,6 +2065,11 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     sorted_horses = sorted_by_win
     honmei_horse = next((h for h in sorted_horses if h["mark"] == "◎"), None)
 
+    # ★ 案1 & 案2 対応: 買い目生成前に各馬のオッズ異常・乖離インジケーターを算出して付与
+    prev_h_list = (course_meta or {}).get("prev_horses")
+    stg = (course_meta or {}).get("odds_stage")
+    apply_odds_anomaly_indicators(horses, prev_horses=prev_h_list, odds_stage=stg)
+
     if honmei_horse:
         u_num = honmei_horse["umaban"]
         h_name = honmei_horse["horse_name"]
@@ -2369,13 +2374,58 @@ def compute_hybrid_rec_from_inputs(
                 "memo": f"単勝 {w0_u}番 ({w0_name}) 500円"
             })
 
-            # 馬単 相手3頭 各200円 (AI勝率順 2位〜4位)
-            umatan_opps = [int(h["umaban"]) for h in s_win[1:4]]
-            for opp in umatan_opps:
-                h_opp = next((h for h in horses if int(h.get("umaban", 0)) == opp), {})
+            # 馬単 相手3頭 各200円
+            # ★ 案1: 過剰人気馬(overbet: AI無印かつ単勝3.5倍以下/1-2番人気で期待値0.45未満)の排除
+            # ★ 案2: 妙味穴(value_gap) および 妙味オッズ(3.5〜35.0倍)の連続急落穴馬のヒモ優先昇格
+            candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
+            non_overbet_opps = [h for h in candidate_opps if h.get("odds_trend") != "overbet"]
+            candidate_pool = non_overbet_opps if len(non_overbet_opps) >= 3 else candidate_opps
+
+            boosted_opps = []
+            normal_opps = []
+            for h in candidate_pool:
+                o_val = float(h.get("odds") or 0.0)
+                is_val_gap = (h.get("odds_trend") == "value_gap")
+                alert_txt = str(h.get("odds_alert") or "")
+                # 連続急落は最終オッズが過熱しすぎず(3.5倍以上)、大穴すぎない(35.0倍以下)妙味範囲の場合に追加
+                is_cont_plunge = ("連続急落" in alert_txt) and (3.5 <= o_val <= 35.0)
+
+                if is_val_gap or is_cont_plunge:
+                    tag_reason = "💎妙味穴" if is_val_gap else "🔥連続急落"
+                    boosted_opps.append((h, tag_reason))
+                else:
+                    normal_opps.append(h)
+
+            # 優先穴馬（最大2頭まで）＋ 残りはAI勝率順で選定（計3頭）
+            selected_opps = []
+            selected_u_set = set()
+            for h, reason in boosted_opps[:2]:
+                u_n = int(h["umaban"])
+                selected_opps.append((h, reason))
+                selected_u_set.add(u_n)
+
+            for h in normal_opps:
+                u_n = int(h["umaban"])
+                if u_n not in selected_u_set:
+                    selected_opps.append((h, "AI本線"))
+                    selected_u_set.add(u_n)
+                if len(selected_opps) >= 3:
+                    break
+
+            for h in candidate_pool:
+                u_n = int(h["umaban"])
+                if u_n not in selected_u_set:
+                    selected_opps.append((h, "AI本線"))
+                    selected_u_set.add(u_n)
+                if len(selected_opps) >= 3:
+                    break
+
+            for h_opp, tag in selected_opps[:3]:
+                opp = int(h_opp["umaban"])
                 opp_name = str(h_opp.get("horse_name", f"馬{opp}"))
                 opp_odds = float(h_opp.get("odds") or 10.0)
                 est_utan_odds = round(max(3.0, w0_odds * opp_odds * 0.8), 1)
+                tag_str = f" [{tag}]" if tag != "AI本線" else ""
                 umatan_bets.append({
                     "ticket_type": "馬単",
                     "combination": [w0_u, opp],
@@ -2384,7 +2434,7 @@ def compute_hybrid_rec_from_inputs(
                     "odds": est_utan_odds,
                     "expected_payout": int(round(200 * est_utan_odds)),
                     "is_real_odds": False,
-                    "memo": f"馬単 軸{w0_u}→{opp}番 ({opp_name}) 200円"
+                    "memo": f"馬単 軸{w0_u}→{opp}番 ({opp_name}){tag_str} 200円"
                 })
 
         # -------------------------------------------------------------
@@ -3025,11 +3075,13 @@ def predict_race_core(
         if course_meta is None:
             course_meta = {}
         course_meta["race_date"] = target_race_date
+        course_meta["odds_stage"] = odds_stage
+        prev_horses_list = cached_pred.get("horses", []) if isinstance(cached_pred, dict) else None
+        course_meta["prev_horses"] = prev_horses_list
         if is_auto_final or odds_stage == "05m":
             course_meta["force_final_odds"] = True
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
-        prev_horses_list = cached_pred.get("horses", []) if isinstance(cached_pred, dict) else None
         apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list, odds_stage=odds_stage)
 
         resp_data = {
