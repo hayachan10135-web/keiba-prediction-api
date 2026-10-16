@@ -3028,8 +3028,30 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
             pred_cache = get_cached_prediction(race_id)
             orders = res_cache.get("orders", {})
             b_det = d.get("bet_details") if isinstance(d.get("bet_details"), dict) else {}
-            rb_meta = b_det.get("real_bet_meta") or {}
+            rb_meta = b_det.get("real_bet_meta") if isinstance(b_det.get("real_bet_meta"), dict) else {}
             top3_orders = d.get("top3_orders") or extract_top3_orders(pred_cache, orders) or rb_meta.get("top3_orders")
+
+            # ★ 見送りレース・参戦レース問わず、1〜3着(top3_orders)が未キャッシュの場合は自動取得＆永続化 ★
+            if not top3_orders and d.get("hit_type") != "中止":
+                try:
+                    fresh_res = fetch_netkeiba_race_result(race_id)
+                    if fresh_res and fresh_res.get("orders"):
+                        res_cache = fresh_res
+                        orders = fresh_res.get("orders", {})
+                        r_date_val = d.get("race_date") or resolve_race_date_for_id(race_id)
+                        r_name_val = d.get("race_name") or fresh_res.get("race_name", f"Race {race_id}")
+                        save_cached_result(race_id, r_name_val, r_date_val, fresh_res)
+                        top3_orders = extract_top3_orders(pred_cache, orders)
+                        healed_marks = extract_mark_orders(pred_cache, orders)
+                        if top3_orders:
+                            rb_meta["top3_orders"] = top3_orders
+                            if healed_marks:
+                                rb_meta["mark_orders"] = healed_marks
+                            b_det["real_bet_meta"] = rb_meta
+                            d["bet_details"] = b_det
+                            supabase.table("keiba_race_settlements").update({"bet_details": b_det}).eq("race_id", race_id).execute()
+                except Exception as te:
+                    print(f"[Settlement Top3 Heal Warning] {race_id}: {te}")
 
             if d["is_pass"]:
                 if pred_cache and res_cache:
