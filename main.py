@@ -845,19 +845,16 @@ _last_weight_check_ts: Dict[str, float] = {}  # {race_id: timestamp} (馬体重�
 
 def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dict[str, Any]:
     """
-    1開催期間（土曜日 00:00 〜 次週金曜日 20:00）の境界と待機状態を算出。
-    - 金曜 20:00 以降 〜 土曜 07:30 未満は「次週データ取得待機期間 (is_waiting_period=True)」とする。
+    1開催期間（土曜日 00:00 〜 次週金曜日 24:00）の境界を算出。
+    ※金曜夜〜土曜朝の使用不可待機期間は完全撤廃し、常時24時間利用可能 (is_waiting_period=False)。
     """
     if now_dt is None:
         now_dt = now_jst_naive()
     today_d = now_dt.date()
     weekday = today_d.weekday()  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
 
+    # 待機期間・使用不可期間は完全撤廃（常時利用可能）
     is_waiting = False
-    if weekday == 4 and now_dt.hour >= 20:
-        is_waiting = True
-    elif weekday == 5 and (now_dt.hour < 7 or (now_dt.hour == 7 and now_dt.minute < 30)):
-        is_waiting = True
 
     days_since_sat = (weekday - 5) % 7
     period_start_d = today_d - datetime.timedelta(days=days_since_sat)
@@ -1171,9 +1168,6 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
         except Exception:
             pass
 
-    if p_info["is_waiting_period"]:
-        return sorted(list(past_db_dates))[-6:]
-
     start_d = p_info["period_start_date"]
     today_d = p_info["today_date"]
 
@@ -1181,10 +1175,6 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
     cur_d = start_d
     while cur_d <= today_d:
         d_str = cur_d.strftime("%Y-%m-%d")
-        # 当日の場合は朝7:30以降のみ新規取得対象とする
-        if cur_d == today_d and (now_dt.hour < 7 or (now_dt.hour == 7 and now_dt.minute < 30)) and d_str not in past_db_dates and d_str not in _period_venues_cache:
-            cur_d += datetime.timedelta(days=1)
-            continue
 
         if d_str in _period_venues_cache:
             available_dates.append(d_str)
@@ -1200,6 +1190,17 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
             _period_checked_empty_dates.add(d_str)
 
         cur_d += datetime.timedelta(days=1)
+
+    # 金曜夕方（17:00以降）であれば翌日（土曜）の出走表確定状況も先行走査
+    if today_d.weekday() == 4 and now_dt.hour >= 17:
+        tomorrow_d = today_d + datetime.timedelta(days=1)
+        tom_str = tomorrow_d.strftime("%Y-%m-%d")
+        if tom_str in _period_venues_cache:
+            available_dates.append(tom_str)
+        elif tom_str not in _period_checked_empty_dates:
+            v = fetch_venues_for_date_raw(tom_str)
+            if v:
+                available_dates.append(tom_str)
 
     return sorted(list(set(available_dates)))[-6:]
 
@@ -1325,12 +1326,12 @@ def get_today_races(
             return {
                 "date": "",
                 "available_dates": [],
-                "is_waiting_period": True,
-                "message": "現在表示可能な開催データはありません（土曜朝7:30頃に取得されます）。",
+                "is_waiting_period": False,
+                "message": "現在表示可能な開催データがありません。",
                 "venues": []
             }
-        # 本日が開催日なら本日、待機期間または平日の場合は直近（最新）の開催日を初期選択
-        if not p_info["is_waiting_period"] and p_info["today_str"] in available_dates:
+        # 本日が開催日なら本日、平日の場合は直近（最新）の開催日を初期選択
+        if p_info["today_str"] in available_dates:
             target_date = p_info["today_str"]
         else:
             target_date = available_dates[-1]
@@ -1350,7 +1351,7 @@ def get_today_races(
     return {
         "date": target_date,
         "available_dates": available_dates[-6:],
-        "is_waiting_period": len(available_dates) == 0,
+        "is_waiting_period": False,
         "message": "指定された開催日のレース情報が見つかりませんでした。",
         "venues": []
     }
@@ -5370,11 +5371,6 @@ def run_batch_worker(
         today_str = today_jst_str()
         p_info = get_current_kaisai_period(now_dt)
 
-        if p_info["is_waiting_period"] and not target_date:
-            batch_status["total"] = 0
-            batch_status["message"] = "現在は次週の開催データ取得待機期間（金曜20:00〜土曜朝7:30）です。"
-            return
-
         period_dates = discover_period_kaisai_dates(now_dt)
 
         # target_date が明示されている場合は指定日のみを対象とする
@@ -5756,17 +5752,14 @@ async def background_maintenance_loop():
             today_str = today_jst_str()
             p_info = get_current_kaisai_period(now_dt)
 
-            # --- ⑥ 金曜 20:00 以降（待機期間突入時）の1開催期間キャッシュ破棄 ---
-            if p_info["is_waiting_period"]:
+            # --- ⑥ 金曜 20:00 以降の古いキャッシュ自動整理 (75日以前の過去分のみ安全破棄) ---
+            if now_dt.weekday() == 4 and now_dt.hour >= 20:
                 if last_friday_cleaned_period != p_info["period_start"]:
                     clear_kaisai_period_caches()
                     last_friday_cleaned_period = p_info["period_start"]
                     last_830_predict_date = None
                     last_17h_settle_date = None
                     last_19h_settle_date = None
-                # 待機期間中（金曜20:00〜土曜朝7:30未満）は無理に出走表を取得しに行かない
-                await asyncio.sleep(60)
-                continue
 
             # --- ① JST朝 7:30 以降、当日のレーススケジュールを事前登録 ---
             if now_dt.hour > 7 or (now_dt.hour == 7 and now_dt.minute >= 30):
