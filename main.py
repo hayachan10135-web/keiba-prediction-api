@@ -2911,54 +2911,62 @@ def compute_track_bias_and_matches(
         bias_info = cached_entry[1]
     elif supabase:
         try:
-            # 同一開催日・同競馬場の確定レースキャッシュを取得
-            res = supabase.table("keiba_predictions_cache")\
-                .select("race_id, data_json")\
+            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを keiba_race_settlements から取得 (ゼロリーク厳格遵守)
+            s_res = supabase.table("keiba_race_settlements")\
+                .select("race_id, top3_orders")\
                 .eq("race_date", race_date)\
                 .like("race_id", f"{race_id[:4]}{venue_code_str}%")\
+                .lt("race_id", race_id)\
                 .execute()
 
+            settled_rows = s_res.data or []
             sample_races = 0
             inside_count = 0
             middle_count = 0
             outside_count = 0
             front_wins = 0
 
-            for row in (res.data or []):
-                r_id = str(row.get("race_id") or "")
-                if r_id == race_id:
-                    continue  # 当該レース自身は除外
+            if settled_rows:
+                # 確定レースのコース条件(芝/ダート)および枠番マップを predictions_cache から一括取得
+                past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
+                p_res = supabase.table("keiba_predictions_cache")\
+                    .select("race_id, data_json")\
+                    .in_("race_id", past_rids)\
+                    .execute()
+                pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
 
-                dj = row.get("data_json") or {}
-                c_details = (dj.get("race_details") or {}).get("course_details", "")
-                if surface_name not in c_details:
-                    continue
+                for s_row in settled_rows:
+                    r_id = str(s_row.get("race_id") or "")
+                    top3 = s_row.get("top3_orders") or []
+                    if len(top3) < 3:
+                        continue
 
-                top3 = dj.get("top3_orders") or []
-                if len(top3) < 3:
-                    continue
+                    dj = pred_map.get(r_id, {})
+                    c_details = (dj.get("race_details") or {}).get("course_details", "")
+                    if surface_name not in c_details:
+                        continue
 
-                sample_races += 1
-                r_horses = dj.get("horses") or []
-                w_map = {int(h["umaban"]): int(h.get("wakuban") or 0) for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
+                    sample_races += 1
+                    r_horses = dj.get("horses") or []
+                    w_map = {int(h["umaban"]): int(h.get("wakuban") or 0) for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
 
-                for item in top3[:3]:
-                    u_num = int(item.get("umaban") or 0)
-                    order_num = int(item.get("order") or 0)
-                    waku_num = w_map.get(u_num, 0)
+                    for item in top3[:3]:
+                        u_num = int(item.get("umaban") or 0)
+                        order_num = int(item.get("order") or 0)
+                        waku_num = w_map.get(u_num, 0)
 
-                    if waku_num in (1, 2, 3):
-                        inside_count += 1
-                    elif waku_num in (4, 5):
-                        middle_count += 1
-                    elif waku_num in (6, 7, 8):
-                        outside_count += 1
+                        if waku_num in (1, 2, 3):
+                            inside_count += 1
+                        elif waku_num in (4, 5):
+                            middle_count += 1
+                        elif waku_num in (6, 7, 8):
+                            outside_count += 1
 
-                    if order_num == 1:
-                        h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
-                        st = stats_dict.get("horse_stats", {}).get(h_clean, {})
-                        if float(st.get("last_corner_final", 8.0)) <= 4.0:
-                            front_wins += 1
+                        if order_num == 1:
+                            h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
+                            st = stats_dict.get("horse_stats", {}).get(h_clean, {})
+                            if float(st.get("last_corner_final", 8.0)) <= 4.0:
+                                front_wins += 1
 
             if sample_races < 2:
                 bias_info = {
