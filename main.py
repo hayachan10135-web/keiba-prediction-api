@@ -1684,7 +1684,12 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
         pass
 
     horses = []
-    rows = soup.select("tr.HorseList")
+    # PC版出馬表テーブルまたはID付き行に限定し、ページ下部の固定ヘッダー・スクロール用ダミー行の混入を防止
+    rows = soup.select("table.Shutuba_Table tr.HorseList, #shutuba_table tr.HorseList, tr.HorseList[id^='tr_']")
+    if not rows:
+        rows = soup.select("tr.HorseList")
+
+    seen_umaban = set()
 
     for row in rows:
         umaban_tag = row.select_one("td.Umaban, td[class*='Umaban']")
@@ -1706,6 +1711,11 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
                 wakuban = int(wm_cls.group(1))
         else:
             continue
+
+        # 馬番重複ガード (1番等の二重登録を完全防止)
+        if umaban in seen_umaban:
+            continue
+        seen_umaban.add(umaban)
 
         name_tag = row.select_one(".HorseName a, .Horse_Info dt.Horse a, .Horse_Info a")
         if not name_tag or not name_tag.get_text(strip=True):
@@ -6986,12 +6996,33 @@ def endpoint_debug_track_bias(race_id: str):
     }
 
 
+def fix_duplicated_horses_cache_2026():
+    """出馬表パース時の重複取得（1番二重登録等）を含む予測キャッシュを自動検知してクリア"""
+    if not supabase:
+        return
+    try:
+        res = supabase.table("keiba_predictions_cache").select("race_id, data_json").execute()
+        rids_to_clear = []
+        for row in (res.data or []):
+            rid = row.get("race_id")
+            dj = row.get("data_json") or {}
+            horses = dj.get("horses", [])
+            umaban_list = [h.get("umaban") for h in horses if "umaban" in h and h.get("umaban") is not None]
+            if len(umaban_list) != len(set(umaban_list)):
+                rids_to_clear.append(rid)
+        if rids_to_clear:
+            print(f"[FixDuplicates] 馬番重複を検知した {len(rids_to_clear)} レースのキャッシュをリセットします: {rids_to_clear}")
+            supabase.table("keiba_predictions_cache").delete().in_("race_id", rids_to_clear).execute()
+    except Exception as e:
+        print(f"[FixDuplicates] クリーンアップ例外: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
     normalize_mislabeled_dates()
     fix_cancelled_races_2026()
+    fix_duplicated_horses_cache_2026()
     load_stats_overlay_from_supabase()
     load_betting_settings_from_supabase()
     asyncio.create_task(background_maintenance_loop())
