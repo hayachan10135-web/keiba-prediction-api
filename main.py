@@ -1311,16 +1311,6 @@ def get_today_races(
     now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
 
-    # 金曜20:00〜土曜朝7:30の待機期間中は無理に出走表を取得しに行かず空を返す
-    if p_info["is_waiting_period"] and not date:
-        return {
-            "date": "",
-            "available_dates": [],
-            "is_waiting_period": True,
-            "message": "次週の開催データ取得待機中です（土曜朝7:30頃に自動取得されます）。",
-            "venues": []
-        }
-
     available_dates = discover_period_kaisai_dates(now_dt)
 
     if date:
@@ -1335,8 +1325,8 @@ def get_today_races(
                 "message": "現在表示可能な開催データはありません（土曜朝7:30頃に取得されます）。",
                 "venues": []
             }
-        # 本日が開催日なら本日、平日なら今開催期間の直近（最新）の開催日を初期選択
-        if p_info["today_str"] in available_dates:
+        # 本日が開催日なら本日、待機期間または平日の場合は直近（最新）の開催日を初期選択
+        if not p_info["is_waiting_period"] and p_info["today_str"] in available_dates:
             target_date = p_info["today_str"]
         else:
             target_date = available_dates[-1]
@@ -1348,14 +1338,14 @@ def get_today_races(
         venues = attach_prediction_badges_to_venues(target_date, venues)
         return {
             "date": target_date,
-            "available_dates": available_dates,
+            "available_dates": available_dates[-6:],
             "is_waiting_period": False,
             "venues": venues
         }
 
     return {
         "date": target_date,
-        "available_dates": available_dates,
+        "available_dates": available_dates[-6:],
         "is_waiting_period": len(available_dates) == 0,
         "message": "指定された開催日のレース情報が見つかりませんでした。",
         "venues": []
