@@ -818,6 +818,7 @@ def fetch_real_odds(race_id: str) -> dict:
 _period_venues_cache: Dict[str, Any] = {}
 _period_checked_empty_dates: set = set()
 _latest_post_times: Dict[str, str] = {}  # {race_id: "09:50発走"} (スクレイピングした実際の最新出走時刻)
+_last_weight_check_ts: Dict[str, float] = {}  # {race_id: timestamp} (馬体重発表チェックのクールダウン管理)
 
 
 def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dict[str, Any]:
@@ -853,10 +854,11 @@ def get_current_kaisai_period(now_dt: Optional[datetime.datetime] = None) -> Dic
 
 def clear_kaisai_period_caches():
     """金曜20:00の開催期間キャッシュ破棄（成績 keiba_race_settlements は永続保持）"""
-    global _period_venues_cache, _period_checked_empty_dates, _latest_post_times
+    global _period_venues_cache, _period_checked_empty_dates, _latest_post_times, _last_weight_check_ts
     _period_venues_cache.clear()
     _period_checked_empty_dates.clear()
     _latest_post_times.clear()
+    _last_weight_check_ts.clear()
     if not supabase:
         return
     try:
@@ -1560,16 +1562,21 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
             if km:
                 kinryo = float(km.group(1))
 
-        # ★ 馬体重・増減 (td.Weight: 例 "464(-2)" / "480(+6)")
+        # ★ 馬体重・増減 (PC版 td.Weight / SP版 .Weight 等: 例 "464(-2)" / "480(+6)" / "472(0)")
         horse_weight: Optional[int] = None
         weight_diff: Optional[int] = None
-        weight_tag = row.select_one("td.Weight")
-        if weight_tag:
-            w_str = weight_tag.get_text(strip=True)
-            wm = re.search(r"(\d{3})\s*(?:\(([+-]?\d+)\))?", w_str)
-            if wm:
-                horse_weight = int(wm.group(1))
-                weight_diff = int(wm.group(2)) if wm.group(2) is not None else 0
+        weight_tag = row.select_one("td.Weight, .Weight, td[class*='Weight'], span.Weight")
+        w_search_text = weight_tag.get_text(strip=True) if weight_tag else row.get_text(separator=" ", strip=True)
+        wm = re.search(r"\b([3-6]\d{2})(?:kg)?\s*\(([+-]?\d+|0|前計不|--)\)", w_search_text)
+        if not wm and weight_tag:
+            wm = re.search(r"\b([3-6]\d{2})\b", w_search_text)
+        if wm:
+            horse_weight = int(wm.group(1))
+            diff_raw = wm.group(2) if wm.lastindex and wm.lastindex >= 2 else None
+            if diff_raw and re.match(r"^[+-]?\d+$", diff_raw):
+                weight_diff = int(diff_raw)
+            else:
+                weight_diff = 0
 
         odds_item = odds_map.get(umaban, {})
         odds = odds_item.get("odds")
@@ -2014,6 +2021,34 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             raise RuntimeError(f"AIモデル推論エラー ({race_id}): {e}")
     else:
         raise RuntimeError(f"AIモデルがロードされていないため、レース {race_id} の推論を実行できません。")
+
+    # ★ 【Step 3】直前馬体重・増減（±kg）の動的反映補正（発表済みの場合のみ適用）
+    for h in horses:
+        hw = h.get("horse_weight")
+        wd = h.get("weight_diff")
+        if hw is not None and wd is not None:
+            w_mult = 1.0
+            age_val = int(h.get("age") or 4)
+            # 1. 極端な馬体減（輸送減り・体調不安リスク）
+            if wd <= -14:
+                w_mult = 0.85 if hw < 440 else 0.89
+            elif wd <= -10:
+                w_mult = 0.92 if hw < 440 else 0.95
+            # 2. 極端な馬体増（太め残りリスク、ただし成長期の2〜3歳は軽減）
+            elif wd >= 16:
+                w_mult = 0.94 if age_val <= 3 else 0.89
+            elif wd >= 12:
+                w_mult = 0.97 if age_val <= 3 else 0.94
+            # 3. 好仕上がり・馬体絞り（-2kg 〜 -6kg または ダート大型馬の安定圏）
+            elif -6 <= wd <= -2:
+                w_mult = 1.02
+            elif surface_type == 1 and hw >= 500 and -4 <= wd <= 6:
+                w_mult = 1.02
+
+            if w_mult != 1.0:
+                h["prob_win"] = round(float(h.get("prob_win", 0.0)) * w_mult, 4)
+                h["prob_top3"] = round(float(h.get("prob_top3", 0.0)) * w_mult, 4)
+                h["score"] = h["prob_win"]
 
     # 1着特化モデルのスコア順で◎, ◯を決定
     sorted_by_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
@@ -2641,15 +2676,19 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
 
         # ★ 実際の最新出走時刻の反映・更新（固定マップからの是正および発走時刻変更対応） ★
         latest_pt = _latest_post_times.get(race_id)
-        if not latest_pt and supabase:
+        sched_post_dt_raw = None
+        sched_race_date = None
+        if supabase:
             try:
-                s_res = supabase.table("keiba_scheduled_races").select("post_datetime").eq("race_id", race_id).execute()
-                if s_res.data and s_res.data[0].get("post_datetime"):
-                    p_dt_raw = s_res.data[0]["post_datetime"]
-                    m_pt = re.search(r"(\d{1,2}):(\d{2})", p_dt_raw)
-                    if m_pt:
-                        latest_pt = f"{int(m_pt.group(1)):02d}:{int(m_pt.group(2)):02d}発走"
-                        _latest_post_times[race_id] = latest_pt
+                s_res = supabase.table("keiba_scheduled_races").select("race_date, post_datetime").eq("race_id", race_id).execute()
+                if s_res.data and len(s_res.data) > 0:
+                    sched_race_date = s_res.data[0].get("race_date")
+                    sched_post_dt_raw = s_res.data[0].get("post_datetime")
+                    if not latest_pt and sched_post_dt_raw:
+                        m_pt = re.search(r"(\d{1,2}):(\d{2})", sched_post_dt_raw)
+                        if m_pt:
+                            latest_pt = f"{int(m_pt.group(1)):02d}:{int(m_pt.group(2)):02d}発走"
+                            _latest_post_times[race_id] = latest_pt
             except Exception:
                 pass
 
@@ -2665,7 +2704,25 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
                     except Exception as ue:
                         print(f"予想キャッシュ出走時刻更新エラー ({race_id}): {ue}")
 
-        return cached_pred
+        # ★ 【Step 3】当日発走75分前以降でキャッシュに馬体重が未反映の場合は自動再取得へ昇格 ★
+        has_cached_weights = any(h.get("horse_weight") is not None for h in cached_pred.get("horses", []))
+        should_auto_refresh_weight = False
+        if not has_cached_weights and sched_race_date == today_jst_str() and sched_post_dt_raw:
+            try:
+                post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
+                now_dt_obj = now_jst_naive()
+                # 発走75分前 〜 発走時刻の間、3分クールダウンで馬体重発表をチェック
+                if (post_dt_obj - datetime.timedelta(minutes=75)) <= now_dt_obj < post_dt_obj:
+                    now_ts = time.time()
+                    if now_ts - _last_weight_check_ts.get(race_id, 0.0) >= 180.0:
+                        _last_weight_check_ts[race_id] = now_ts
+                        should_auto_refresh_weight = True
+                        print(f"[Auto-Weight] {race_id}: 発走75分前圏内のため直前馬体重の反映を実行します。")
+            except Exception:
+                pass
+
+        if not should_auto_refresh_weight:
+            return cached_pred
 
     try:
         target_race_date = None
@@ -5003,8 +5060,15 @@ async def background_maintenance_loop():
                         except Exception:
                             continue
 
+                        trigger_weight_time = post_dt - datetime.timedelta(minutes=65)
                         trigger_predict_time = post_dt - datetime.timedelta(minutes=20)
-                        if trigger_predict_time <= now_dt < post_dt:
+                        if trigger_weight_time <= now_dt < trigger_predict_time:
+                            # 発走65分前〜20分前: 馬体重未反映の場合は自動で馬体重を取得・再計算（predict_race_core内の3分クールダウン制御付き）
+                            try:
+                                predict_race_core(r_id, force_refresh=False, is_auto_final=False)
+                            except Exception as we:
+                                print(f"[Auto-Weight] 馬体重更新チェック失敗 ({r_id}): {we}")
+                        elif trigger_predict_time <= now_dt < post_dt:
                             print(f"[Auto-Predict] 発走20分前検知: {r_id} ({r.get('race_name')}) の確定予想を実行します...")
                             try:
                                 pred_res = predict_race_core(r_id, force_refresh=True, is_auto_final=True)
