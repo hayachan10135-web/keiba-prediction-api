@@ -2133,115 +2133,127 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     # ★ 波乱度メタモデル × 動的資金配分・券種切り替え戦略
     # -------------------------------------------------------------
     hybrid_rec: Optional[dict] = None
+    track_bias_data: Optional[dict] = None
     if len(horses) < 3:
         raise ValueError(f"レース {race_id} の出走頭数が少なすぎます ({len(horses)}頭)。ダミー予想の生成は禁止されています。")
 
     # 馬番・印の取得
-        h_honmei = next((h for h in horses if h["mark"] == "◎"), sorted_horses[0])
-        h_taiko = next((h for h in horses if h["mark"] == "◯"), (sorted_horses[1] if len(sorted_horses) > 1 else sorted_horses[0]))
-        h_kuro = next((h for h in horses if h["mark"] == "▲"), (sorted_horses[2] if len(sorted_horses) > 2 else sorted_horses[0]))
-        h_osae = next((h for h in horses if h["mark"] == "△"), (sorted_horses[3] if len(sorted_horses) > 3 else sorted_horses[0]))
-        h_ana = next((h for h in horses if h["mark"] == "☆"), (sorted_horses[4] if len(sorted_horses) > 4 else sorted_horses[0]))
+    h_honmei = next((h for h in horses if h["mark"] == "◎"), sorted_horses[0])
+    h_taiko = next((h for h in horses if h["mark"] == "◯"), (sorted_horses[1] if len(sorted_horses) > 1 else sorted_horses[0]))
+    h_kuro = next((h for h in horses if h["mark"] == "▲"), (sorted_horses[2] if len(sorted_horses) > 2 else sorted_horses[0]))
+    h_osae = next((h for h in horses if h["mark"] == "△"), (sorted_horses[3] if len(sorted_horses) > 3 else sorted_horses[0]))
+    h_ana = next((h for h in horses if h["mark"] == "☆"), (sorted_horses[4] if len(sorted_horses) > 4 else sorted_horses[0]))
 
-        u0 = int(h_honmei["umaban"])
-        u1 = int(h_taiko["umaban"])
-        u2 = int(h_kuro["umaban"])
-        u3 = int(h_osae["umaban"])
-        u4 = int(h_ana["umaban"])
+    u0 = int(h_honmei["umaban"])
+    u1 = int(h_taiko["umaban"])
+    u2 = int(h_kuro["umaban"])
+    u3 = int(h_osae["umaban"])
+    u4 = int(h_ana["umaban"])
 
-        # オッズの集計
-        s_odds = sorted(horses, key=lambda x: (x.get("odds") if x.get("odds") is not None and x.get("odds") > 0 else 999.0))
-        o1 = float(s_odds[0].get("odds") or 50.0) if len(s_odds) >= 1 else 50.0
-        o2 = float(s_odds[1].get("odds") or 50.0) if len(s_odds) >= 2 else 50.0
-        o3 = float(s_odds[2].get("odds") or 50.0) if len(s_odds) >= 3 else 50.0
+    # オッズの集計
+    s_odds = sorted(horses, key=lambda x: (x.get("odds") if x.get("odds") is not None and x.get("odds") > 0 else 999.0))
+    o1 = float(s_odds[0].get("odds") or 50.0) if len(s_odds) >= 1 else 50.0
+    o2 = float(s_odds[1].get("odds") or 50.0) if len(s_odds) >= 2 else 50.0
+    o3 = float(s_odds[2].get("odds") or 50.0) if len(s_odds) >= 3 else 50.0
 
-        inv_sum = sum(1.0 / max(float(h.get("odds") or 50.0), 1.01) for h in horses)
-        shares = [(1.0 / max(float(h.get("odds") or 50.0), 1.01)) / inv_sum for h in horses]
-        top3_share = sum(sorted(shares, reverse=True)[:3])
-        entropy = -sum(p * math.log(max(p, 1e-6)) for p in shares)
+    inv_sum = sum(1.0 / max(float(h.get("odds") or 50.0), 1.01) for h in horses)
+    shares = [(1.0 / max(float(h.get("odds") or 50.0), 1.01)) / inv_sum for h in horses]
+    top3_share = sum(sorted(shares, reverse=True)[:3])
+    entropy = -sum(p * math.log(max(p, 1e-6)) for p in shares)
 
-        s_ai = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
-        ai_w1 = float(s_ai[0].get("prob_win", 0.0)) if len(s_ai) >= 1 else 0.0
-        ai_w2 = float(s_ai[1].get("prob_win", 0.0)) if len(s_ai) >= 2 else 0.0
-        ai_diff = ai_w1 - ai_w2
+    s_ai = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+    ai_w1 = float(s_ai[0].get("prob_win", 0.0)) if len(s_ai) >= 1 else 0.0
+    ai_w2 = float(s_ai[1].get("prob_win", 0.0)) if len(s_ai) >= 2 else 0.0
+    ai_diff = ai_w1 - ai_w2
 
-        front_runners = 0
-        for h in horses:
-            h_clean = re.sub(r"[\s\u3000]", "", h.get("horse_name", ""))
-            st = h_stats.get(h_clean, {})
-            if float(st.get("last_corner_final", 8.0)) <= 3.0:
-                front_runners += 1
-        front_ratio = front_runners / max(len(horses), 1)
+    front_runners = 0
+    for h in horses:
+        h_clean = re.sub(r"[\s\u3000]", "", h.get("horse_name", ""))
+        st = h_stats.get(h_clean, {})
+        if float(st.get("last_corner_final", 8.0)) <= 3.0:
+            front_runners += 1
+    front_ratio = front_runners / max(len(horses), 1)
 
-        race_feat_row = [
-            float(head_count), float(distance), float(surface_type), float(condition_code), float(venue_code),
-            float(o1), float(o2), float(o3), float(o2 / max(o1, 0.5)),
-            float(top3_share), float(entropy),
-            float(ai_w1), float(ai_w2), float(ai_diff),
-            float(front_runners), float(front_ratio),
-            float(turn_type), float(race_class_code), float(is_female_only), float(kinryo_std_in_race)
-        ]
+    race_feat_row = [
+        float(head_count), float(distance), float(surface_type), float(condition_code), float(venue_code),
+        float(o1), float(o2), float(o3), float(o2 / max(o1, 0.5)),
+        float(top3_share), float(entropy),
+        float(ai_w1), float(ai_w2), float(ai_diff),
+        float(front_runners), float(front_ratio),
+        float(turn_type), float(race_class_code), float(is_female_only), float(kinryo_std_in_race)
+    ]
 
-        if not model_gachi:
-            raise RuntimeError(f"model_gachi がロードされていないため、レース {race_id} のガチ度を推論できません。")
-        try:
-            n_g = model_gachi.num_feature()
-            prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
-        except Exception as e:
-            raise RuntimeError(f"model_gachi 推論エラー ({race_id}): {e}")
+    if not model_gachi:
+        raise RuntimeError(f"model_gachi がロードされていないため、レース {race_id} のガチ度を推論できません。")
+    try:
+        n_g = model_gachi.num_feature()
+        prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
+    except Exception as e:
+        raise RuntimeError(f"model_gachi 推論エラー ({race_id}): {e}")
 
-        if not model_himo:
-            raise RuntimeError(f"model_himo がロードされていないため、レース {race_id} の混戦度を推論できません。")
-        try:
-            n_h = model_himo.num_feature()
-            prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
-        except Exception as e:
-            raise RuntimeError(f"model_himo 推論エラー ({race_id}): {e}")
+    if not model_himo:
+        raise RuntimeError(f"model_himo がロードされていないため、レース {race_id} の混戦度を推論できません。")
+    try:
+        n_h = model_himo.num_feature()
+        prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
+    except Exception as e:
+        raise RuntimeError(f"model_himo 推論エラー ({race_id}): {e}")
 
-        # Webリアルタイムオッズ取得
-        real_odds_data = fetch_real_odds(race_id)
-        umaren_real_map = real_odds_data.get("umaren", {})
-        trio_real_map = real_odds_data.get("trio", {})
+    # Webリアルタイムオッズ取得
+    real_odds_data = fetch_real_odds(race_id)
+    umaren_real_map = real_odds_data.get("umaren", {})
+    trio_real_map = real_odds_data.get("trio", {})
 
-        def get_umaren_odds_info(ua, ub):
-            comb = (min(ua, ub), max(ua, ub))
-            if comb in umaren_real_map:
-                return umaren_real_map[comb], True
-            else:
-                h_a = next((h for h in horses if int(h.get("umaban", 0)) == ua), {})
-                h_b = next((h for h in horses if int(h.get("umaban", 0)) == ub), {})
-                oa = float(h_a.get("odds") or 0.0)
-                ob = float(h_b.get("odds") or 0.0)
-                est_o = round(max(2.5, 0.65 * oa * ob), 1) if (oa > 0 and ob > 0) else 0.0
-                return est_o, False
+    def get_umaren_odds_info(ua, ub):
+        comb = (min(ua, ub), max(ua, ub))
+        if comb in umaren_real_map:
+            return umaren_real_map[comb], True
+        else:
+            h_a = next((h for h in horses if int(h.get("umaban", 0)) == ua), {})
+            h_b = next((h for h in horses if int(h.get("umaban", 0)) == ub), {})
+            oa = float(h_a.get("odds") or 0.0)
+            ob = float(h_b.get("odds") or 0.0)
+            est_o = round(max(2.5, 0.65 * oa * ob), 1) if (oa > 0 and ob > 0) else 0.0
+            return est_o, False
 
-        u01_odds, u01_is_real = get_umaren_odds_info(u0, u1) if (u0 and u1) else (0.0, False)
-        u02_odds, u02_is_real = get_umaren_odds_info(u0, u2) if (u0 and u2) else (0.0, False)
-        u03_odds, u03_is_real = get_umaren_odds_info(u0, u3) if (u0 and u3) else (0.0, False)
+    u01_odds, u01_is_real = get_umaren_odds_info(u0, u1) if (u0 and u1) else (0.0, False)
+    u02_odds, u02_is_real = get_umaren_odds_info(u0, u2) if (u0 and u2) else (0.0, False)
+    u03_odds, u03_is_real = get_umaren_odds_info(u0, u3) if (u0 and u3) else (0.0, False)
 
-        any_real_odds = u01_is_real or u02_is_real or u03_is_real
+    any_real_odds = u01_is_real or u02_is_real or u03_is_real
 
-        opponents = []
-        if u1: opponents.append((u1, u01_odds, u01_is_real, "◯"))
-        if u2: opponents.append((u2, u02_odds, u02_is_real, "▲"))
-        if u3: opponents.append((u3, u03_odds, u03_is_real, "△"))
+    opponents = []
+    if u1: opponents.append((u1, u01_odds, u01_is_real, "◯"))
+    if u2: opponents.append((u2, u02_odds, u02_is_real, "▲"))
+    if u3: opponents.append((u3, u03_odds, u03_is_real, "△"))
 
-        r_date_str = (course_meta or {}).get("race_date") or today_jst_str()
-        force_final_flag = bool((course_meta or {}).get("force_final_odds", False))
-        hybrid_rec = compute_hybrid_rec_from_inputs(
-            race_name=race_name,
-            race_details=race_details,
-            horses=horses,
-            surface_type=surface_type,
-            prob_gachi=prob_gachi,
-            prob_himo=prob_himo,
-            opponents=opponents,
-            u0=u0,
-            honmei_horse=honmei_horse,
-            race_date_str=r_date_str,
-            force_final_odds=force_final_flag,
-            real_trio_odds=trio_real_map
-        )
+    r_date_str = (course_meta or {}).get("race_date") or today_jst_str()
+    force_final_flag = bool((course_meta or {}).get("force_final_odds", False))
+
+    c_det = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
+    surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
+    track_bias_data = compute_track_bias_and_matches(
+        race_id=race_id,
+        race_date=r_date_str,
+        surface_name=surf_str,
+        horses=sorted_horses
+    )
+
+    hybrid_rec = compute_hybrid_rec_from_inputs(
+        race_name=race_name,
+        race_details=race_details,
+        horses=sorted_horses,
+        surface_type=surface_type,
+        prob_gachi=prob_gachi,
+        prob_himo=prob_himo,
+        opponents=opponents,
+        u0=u0,
+        honmei_horse=honmei_horse,
+        race_date_str=r_date_str,
+        force_final_odds=force_final_flag,
+        real_trio_odds=trio_real_map,
+        track_bias_data=track_bias_data
+    )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
 
@@ -2266,15 +2278,6 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "summary": hybrid_rec.get("summary", "")
         }
 
-    c_det = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
-    surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
-    track_bias_data = compute_track_bias_and_matches(
-        race_id=race_id,
-        race_date=r_date_str,
-        surface_name=surf_str,
-        horses=horses_sorted_by_num
-    )
-
     return {
         "race_name": race_name,
         "race_details": race_details,
@@ -2297,20 +2300,18 @@ def compute_hybrid_rec_from_inputs(
     honmei_horse: Optional[dict],
     race_date_str: str,
     force_final_odds: bool = False,
-    real_trio_odds: Optional[dict] = None
+    real_trio_odds: Optional[dict] = None,
+    track_bias_data: Optional[dict] = None
 ) -> dict:
     """
-    【B -> A -> C カスケード動的配分モデル】
-    ・優先度 1 (戦略B: 超高確信度好配当レバレッジ):
-      条件: confidence_score >= 0.78 かつ 2.5 <= w0_odds <= 10.0
-      買い目: 単勝 500円 ＋ 馬単 相手3頭(AI勝率2位〜4位) 各200円 (計1,100円)
-    ・優先度 2 (戦略A: 芝厳選エッジ比例ケリー傾斜):
-      条件: surface_type == 0 (芝) かつ confidence_score >= 0.72
-      買い目: 単複ケリー傾斜配分 (単75% + 複25%)
-    ・優先度 3 (戦略C: ダート手堅い本命単複):
-      条件: surface_type == 1 (ダート) かつ 春秋開催(6〜9月以外) かつ confidence_score >= 0.72 かつ 2.2 <= w0_odds <= 6.0
-      買い目: 単勝 700円 ＋ 複勝 300円 (計1,000円)
-    ・見送り: 上記いずれにも非該当、または頭数6頭未満、障害戦、新馬戦 (投資0円)
+    【B -> A -> C カスケード動的配分モデル × トラックバイアス・オッズ推移連動】
+    ・本命馬(w0):
+      - トラックバイアス合致(追い風: 絶好/有利/合致)時は、投資比率を1.5倍に資金ブースト（厚張り）！
+      - トラックバイアス逆風(外枠逆風/内枠逆風)時も、ThreeTierの能力・オッズ妙味で激走可能なため見送り(PASS)せず基準投資(1.0倍)を継続。
+    ・相手馬(ヒモ):
+      - 過剰人気馬(overbet)のヒモ除外
+      - 逆風馬(adverse)のヒモ除外
+      - 妙味穴(value_gap)、連続急落穴、絶好バイアス穴(4.0〜50倍)のヒモ優先昇格！
     """
     course_details_str = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
     if "障害" in race_name or "障" in course_details_str:
@@ -2355,6 +2356,13 @@ def compute_hybrid_rec_from_inputs(
     )
     edge_ratio = round(win_edge, 2)
 
+    # トラックバイアス判定 (本命馬)
+    w0_bias = str(w0.get("bias_match") or "")
+    is_bias_favorable = any(fav in w0_bias for fav in ("絶好バイアス", "有利", "合致"))
+    is_bias_adverse = "逆風" in w0_bias
+    bias_boost_mult = 1.5 if is_bias_favorable else 1.0
+    bias_tag = " [⚡バイアス追い風×1.5倍]" if is_bias_favorable else (" [⚠️逆風激走期待]" if is_bias_adverse else "")
+
     # 確定オッズ・発走前判定 (Stage 5: 発走7分前〜5分前以降は確定オッズ扱い)
     is_final_odds = force_final_odds
     if not is_final_odds:
@@ -2394,30 +2402,37 @@ def compute_hybrid_rec_from_inputs(
         if confidence_score >= 0.78 and (2.5 <= w0_odds <= 10.0):
             assigned_tier = "B"
             strategy_type = "strategy_b"
-            strategy_name = "🔥 戦略B: 超高確信度馬単レバレッジ (単500円＋馬単600円)"
-            real_bet_badge = f"🔥【超勝負R】単勝＋馬単レバレッジ{suffix}"
+            b_tan_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
+            b_utan_amt = int(round(200 * bias_boost_mult / 100.0) * 100)
+            strategy_name = f"🔥 戦略B: 超高確信度馬単レバレッジ (単{b_tan_amt}円＋馬単各{b_utan_amt}円)"
+            real_bet_badge = f"🔥【超勝負R】単勝＋馬単レバレッジ{bias_tag}{suffix}"
             real_bet_level = "high"
             is_participate = True
             is_real_bet_target = True
 
-            # 単勝 500円
+            # 単勝
             tansho_bets.append({
                 "ticket_type": "単勝",
                 "combination": [w0_u],
                 "combination_str": f"{w0_u}",
-                "amount": 500,
+                "amount": b_tan_amt,
                 "odds": w0_odds,
-                "expected_payout": int(round(500 * w0_odds)),
+                "expected_payout": int(round(b_tan_amt * w0_odds)),
                 "is_real_odds": True,
-                "memo": f"単勝 {w0_u}番 ({w0_name}) 500円"
+                "memo": f"単勝 {w0_u}番 ({w0_name}){bias_tag} {b_tan_amt}円"
             })
 
-            # 馬単 相手3頭 各200円
-            # ★ 案1: 過剰人気馬(overbet: AI無印かつ単勝3.5倍以下/1-2番人気で期待値0.45未満)の排除
-            # ★ 案2: 妙味穴(value_gap) および 妙味オッズ(3.5〜35.0倍)の連続急落穴馬のヒモ優先昇格
+            # 馬単 相手3頭
+            # 1. 過剰人気馬(overbet)の排除
+            # 2. 逆風馬(adverse)のヒモ除外 (候補が3頭以上残る場合)
+            # 3. 妙味穴(value_gap)、連続急落穴、絶好バイアス穴(4.0〜50倍)のヒモ優先昇格
             candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
             non_overbet_opps = [h for h in candidate_opps if h.get("odds_trend") != "overbet"]
-            candidate_pool = non_overbet_opps if len(non_overbet_opps) >= 3 else candidate_opps
+            base_pool = non_overbet_opps if len(non_overbet_opps) >= 3 else candidate_opps
+
+            # 逆風馬除外フィルタ
+            non_adverse_opps = [h for h in base_pool if "逆風" not in str(h.get("bias_match") or "")]
+            candidate_pool = non_adverse_opps if len(non_adverse_opps) >= 3 else base_pool
 
             boosted_opps = []
             normal_opps = []
@@ -2425,11 +2440,17 @@ def compute_hybrid_rec_from_inputs(
                 o_val = float(h.get("odds") or 0.0)
                 is_val_gap = (h.get("odds_trend") == "value_gap")
                 alert_txt = str(h.get("odds_alert") or "")
-                # 連続急落は最終オッズが過熱しすぎず(3.5倍以上)、大穴すぎない(35.0倍以下)妙味範囲の場合に追加
+                b_match = str(h.get("bias_match") or "")
                 is_cont_plunge = ("連続急落" in alert_txt) and (3.5 <= o_val <= 35.0)
+                is_bias_sweet = ("絶好バイアス" in b_match) and (4.0 <= o_val <= 50.0)
 
-                if is_val_gap or is_cont_plunge:
-                    tag_reason = "💎妙味穴" if is_val_gap else "🔥連続急落"
+                if is_val_gap or is_cont_plunge or is_bias_sweet:
+                    if is_val_gap:
+                        tag_reason = "💎妙味穴"
+                    elif is_bias_sweet:
+                        tag_reason = "🎯絶好穴"
+                    else:
+                        tag_reason = "🔥連続急落"
                     boosted_opps.append((h, tag_reason))
                 else:
                     normal_opps.append(h)
@@ -2468,11 +2489,11 @@ def compute_hybrid_rec_from_inputs(
                     "ticket_type": "馬単",
                     "combination": [w0_u, opp],
                     "combination_str": f"{w0_u}→{opp}",
-                    "amount": 200,
+                    "amount": b_utan_amt,
                     "odds": est_utan_odds,
-                    "expected_payout": int(round(200 * est_utan_odds)),
+                    "expected_payout": int(round(b_utan_amt * est_utan_odds)),
                     "is_real_odds": False,
-                    "memo": f"馬単 軸{w0_u}→{opp}番 ({opp_name}){tag_str} 200円"
+                    "memo": f"馬単 軸{w0_u}→{opp}番 ({opp_name}){tag_str} {b_utan_amt}円"
                 })
 
         # -------------------------------------------------------------
@@ -2482,12 +2503,12 @@ def compute_hybrid_rec_from_inputs(
             assigned_tier = "A"
             strategy_type = "strategy_a"
             strategy_name = "⭐ 戦略A: 芝厳選エッジ投資 (単複ケリー傾斜配分)"
-            real_bet_badge = f"⭐【芝厳選】単複ケリー傾斜{suffix}"
+            real_bet_badge = f"⭐【芝厳選】単複ケリー傾斜{bias_tag}{suffix}"
             real_bet_level = "standard"
             is_participate = True
             is_real_bet_target = True
 
-            mult = float(np.clip(win_edge, 0.7, 1.8))
+            mult = float(np.clip(win_edge, 0.7, 1.8)) * bias_boost_mult
             bt = int(round(1000.0 * mult * 0.75 / 100.0) * 100)
             bf = int(round(1000.0 * mult * 0.25 / 100.0) * 100)
 
@@ -2500,7 +2521,7 @@ def compute_hybrid_rec_from_inputs(
                     "odds": w0_odds,
                     "expected_payout": int(round(bt * w0_odds)),
                     "is_real_odds": True,
-                    "memo": f"単勝(ケリー傾斜) {w0_u}番 ({w0_name}) {bt}円"
+                    "memo": f"単勝(ケリー傾斜) {w0_u}番 ({w0_name}){bias_tag} {bt}円"
                 })
             if bf > 0:
                 est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
@@ -2512,7 +2533,7 @@ def compute_hybrid_rec_from_inputs(
                     "odds": est_fuku_odds,
                     "expected_payout": int(round(bf * est_fuku_odds)),
                     "is_real_odds": False,
-                    "memo": f"複勝(ケリー傾斜) {w0_u}番 ({w0_name}) {bf}円"
+                    "memo": f"複勝(ケリー傾斜) {w0_u}番 ({w0_name}){bias_tag} {bf}円"
                 })
 
         # -------------------------------------------------------------
@@ -2521,8 +2542,10 @@ def compute_hybrid_rec_from_inputs(
         elif surface_type == 1 and is_summer == 0 and confidence_score >= 0.72 and (2.2 <= w0_odds <= 6.0):
             assigned_tier = "C"
             strategy_type = "strategy_c"
-            strategy_name = "🛡️ 戦略C: ダート手堅い本命 (単700円＋複300円)"
-            real_bet_badge = f"🛡️【ダート本命】手堅い単複防衛{suffix}"
+            c_tan_amt = int(round(700 * bias_boost_mult / 100.0) * 100)
+            c_fuku_amt = int(round(300 * bias_boost_mult / 100.0) * 100)
+            strategy_name = f"🛡️ 戦略C: ダート手堅い本命 (単{c_tan_amt}円＋複{c_fuku_amt}円)"
+            real_bet_badge = f"🛡️【ダート本命】手堅い単複防衛{bias_tag}{suffix}"
             real_bet_level = "standard"
             is_participate = True
             is_real_bet_target = True
@@ -2531,22 +2554,22 @@ def compute_hybrid_rec_from_inputs(
                 "ticket_type": "単勝",
                 "combination": [w0_u],
                 "combination_str": f"{w0_u}",
-                "amount": 700,
+                "amount": c_tan_amt,
                 "odds": w0_odds,
-                "expected_payout": int(round(700 * w0_odds)),
+                "expected_payout": int(round(c_tan_amt * w0_odds)),
                 "is_real_odds": True,
-                "memo": f"単勝(本命厚め) {w0_u}番 ({w0_name}) 700円"
+                "memo": f"単勝(本命厚め) {w0_u}番 ({w0_name}){bias_tag} {c_tan_amt}円"
             })
             est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
             fukusho_bets.append({
                 "ticket_type": "複勝",
                 "combination": [w0_u],
                 "combination_str": f"{w0_u}",
-                "amount": 300,
+                "amount": c_fuku_amt,
                 "odds": est_fuku_odds,
-                "expected_payout": int(round(300 * est_fuku_odds)),
+                "expected_payout": int(round(c_fuku_amt * est_fuku_odds)),
                 "is_real_odds": False,
-                "memo": f"複勝(防衛) {w0_u}番 ({w0_name}) 300円"
+                "memo": f"複勝(防衛) {w0_u}番 ({w0_name}){bias_tag} {c_fuku_amt}円"
             })
 
         # -------------------------------------------------------------
@@ -2556,8 +2579,10 @@ def compute_hybrid_rec_from_inputs(
         elif surface_type == 0 and confidence_score >= 0.70 and w0_odds >= 6.0 and prob_gachi <= 0.10:
             assigned_tier = "A_hole"
             strategy_type = "strategy_a_hole"
-            strategy_name = "⚡ 戦略A-2: 芝波乱妙味 (単500円＋複500円)"
-            real_bet_badge = f"⚡【芝波乱妙味】単複好配当狙い{suffix}"
+            h_tan_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
+            h_fuku_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
+            strategy_name = f"⚡ 戦略A-2: 芝波乱妙味 (単{h_tan_amt}円＋複{h_fuku_amt}円)"
+            real_bet_badge = f"⚡【芝波乱妙味】単複好配当狙い{bias_tag}{suffix}"
             real_bet_level = "standard"
             is_participate = True
             is_real_bet_target = True
@@ -2566,22 +2591,22 @@ def compute_hybrid_rec_from_inputs(
                 "ticket_type": "単勝",
                 "combination": [w0_u],
                 "combination_str": f"{w0_u}",
-                "amount": 500,
+                "amount": h_tan_amt,
                 "odds": w0_odds,
-                "expected_payout": int(round(500 * w0_odds)),
+                "expected_payout": int(round(h_tan_amt * w0_odds)),
                 "is_real_odds": True,
-                "memo": f"単勝(妙味狙い) {w0_u}番 ({w0_name}) 500円"
+                "memo": f"単勝(妙味狙い) {w0_u}番 ({w0_name}){bias_tag} {h_tan_amt}円"
             })
             est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
             fukusho_bets.append({
                 "ticket_type": "複勝",
                 "combination": [w0_u],
                 "combination_str": f"{w0_u}",
-                "amount": 500,
+                "amount": h_fuku_amt,
                 "odds": est_fuku_odds,
-                "expected_payout": int(round(500 * est_fuku_odds)),
+                "expected_payout": int(round(h_fuku_amt * est_fuku_odds)),
                 "is_real_odds": False,
-                "memo": f"複勝(妙味狙い) {w0_u}番 ({w0_name}) 500円"
+                "memo": f"複勝(妙味狙い) {w0_u}番 ({w0_name}){bias_tag} {h_fuku_amt}円"
             })
 
         else:
