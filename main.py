@@ -20,11 +20,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
 
 app = FastAPI(title="Keiba Prediction & Verification API")
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -1425,6 +1427,10 @@ def fetch_venues_for_date_raw(date_str: str, force_refresh: bool = False) -> Lis
     return []
 
 
+_period_kaisai_dates_cache: Dict[str, Tuple[float, List[str]]] = {}
+_today_races_cache: Dict[str, Tuple[float, dict]] = {}
+
+
 def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> List[str]:
     """
     現在の1開催期間（土曜日〜次週金曜日20:00）における、本日までのJRA開催日リスト(昇順)を返す。
@@ -1433,6 +1439,12 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
     if now_dt is None:
         now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
+
+    now_ts = time.time()
+    today_k = p_info["today_str"]
+    c_dates = _period_kaisai_dates_cache.get(today_k)
+    if c_dates and (now_ts - c_dates[0] < 300.0):
+        return list(c_dates[1])
 
     # 過去10開催期間（約75日間）のDBに保存されている開催日を取得
     cutoff_d = (now_dt.date() - datetime.timedelta(days=75)).strftime("%Y-%m-%d")
@@ -1491,7 +1503,9 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
             if v:
                 available_dates.append(tom_str)
 
-    return sorted(list(set(available_dates)))[-6:]
+    res_dates = sorted(list(set(available_dates)))[-6:]
+    _period_kaisai_dates_cache[today_k] = (now_ts, res_dates)
+    return res_dates
 
 
 def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) -> List[dict]:
@@ -1605,12 +1619,22 @@ def get_today_races(
     now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
 
-    available_dates = discover_period_kaisai_dates(now_dt)
-
     if date:
         clean_d = date.replace("-", "")
         target_date = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else date
     else:
+        target_date = p_info["today_str"]
+
+    now_ts = time.time()
+    cache_ttl = 30.0 if target_date == p_info["today_str"] else 3600.0
+    if not force_refresh:
+        c_val = _today_races_cache.get(target_date)
+        if c_val and (now_ts - c_val[0] < cache_ttl):
+            return c_val[1]
+
+    available_dates = discover_period_kaisai_dates(now_dt)
+
+    if not date:
         if not available_dates:
             return {
                 "date": "",
@@ -1630,20 +1654,24 @@ def get_today_races(
         if target_date not in available_dates:
             available_dates = sorted(list(set(available_dates + [target_date])))
         venues = attach_prediction_badges_to_venues(target_date, venues)
-        return {
+        resp = {
             "date": target_date,
             "available_dates": available_dates[-6:],
             "is_waiting_period": False,
             "venues": venues
         }
+        _today_races_cache[target_date] = (now_ts, resp)
+        return resp
 
-    return {
+    resp_empty = {
         "date": target_date,
         "available_dates": available_dates[-6:],
         "is_waiting_period": False,
         "message": "指定された開催日のレース情報が見つかりませんでした。",
         "venues": []
     }
+    _today_races_cache[target_date] = (now_ts, resp_empty)
+    return resp_empty
 
 
 
@@ -3197,12 +3225,16 @@ def apply_odds_anomaly_indicators(
 
 
 _track_bias_cache: Dict[str, Tuple[float, dict]] = {}
+_day_results_cache: Dict[str, Tuple[float, List[dict]]] = {}
+_past_pred_cache: Dict[str, dict] = {}
 
 def compute_track_bias_and_matches(
     race_id: str,
     race_date: str,
     surface_name: str,
-    horses: List[dict]
+    horses: List[dict],
+    prefetched_settled_races: Optional[List[dict]] = None,
+    prefetched_pred_map: Optional[Dict[str, dict]] = None
 ) -> Optional[dict]:
     """
     【Step 5】トラックバイアス（当日の馬場傾向：内枠/外枠・先行/差し有利）のリアルタイム分析
@@ -3230,42 +3262,58 @@ def compute_track_bias_and_matches(
         bias_info = cached_entry[1]
     elif supabase:
         try:
-            # 同一開催日・同競馬場の「当該レースより前(r_id < race_id)」の確定レースを取得
-            # 1. keiba_race_results_cache から確定着順(orders)を直接取得 (最も軽量かつ安全)
             day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
-            start_rid = f"{day_prefix}01"
             settled_races = []
-            try:
-                res_cache = supabase.table("keiba_race_results_cache")\
-                    .select("race_id, result_json")\
-                    .gte("race_id", start_rid)\
-                    .lt("race_id", race_id)\
-                    .execute()
-                for r in (res_cache.data or []):
-                    rid = r.get("race_id")
-                    rj = r.get("result_json") or {}
-                    orders = rj.get("orders") or {}
-                    if orders:
-                        settled_races.append({"race_id": rid, "orders": orders})
-            except Exception as e:
-                print(f"[TrackBias] results_cache query warning: {e}")
 
-            # 2. results_cache が空の場合は keiba_race_settlements からフォールバック取得
-            if not settled_races:
-                try:
-                    s_res = supabase.table("keiba_race_settlements")\
-                        .select("race_id, bet_details")\
-                        .gte("race_id", start_rid)\
-                        .lt("race_id", race_id)\
-                        .execute()
-                    for r in (s_res.data or []):
-                        rid = r.get("race_id")
-                        b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
-                        top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
-                        if top3:
-                            settled_races.append({"race_id": rid, "top3_orders": top3})
-                except Exception as e:
-                    print(f"[TrackBias] settlements query warning: {e}")
+            if prefetched_settled_races is not None:
+                for r in prefetched_settled_races:
+                    rid = str(r.get("race_id") or "")
+                    if rid[:10] == day_prefix and rid < race_id:
+                        settled_races.append(r)
+            else:
+                c_day_entry = _day_results_cache.get(day_prefix)
+                if c_day_entry and (now_ts - c_day_entry[0] < 60.0):
+                    for r in c_day_entry[1]:
+                        if str(r.get("race_id") or "") < race_id:
+                            settled_races.append(r)
+                else:
+                    start_rid = f"{day_prefix}01"
+                    day_settled = []
+                    try:
+                        res_cache = supabase.table("keiba_race_results_cache")\
+                            .select("race_id, result_json")\
+                            .gte("race_id", start_rid)\
+                            .lte("race_id", f"{day_prefix}12")\
+                            .execute()
+                        for r in (res_cache.data or []):
+                            rid = r.get("race_id")
+                            rj = r.get("result_json") or {}
+                            orders = rj.get("orders") or {}
+                            if orders:
+                                day_settled.append({"race_id": rid, "orders": orders})
+                    except Exception as e:
+                        print(f"[TrackBias] results_cache query warning: {e}")
+
+                    if not day_settled:
+                        try:
+                            s_res = supabase.table("keiba_race_settlements")\
+                                .select("race_id, bet_details")\
+                                .gte("race_id", start_rid)\
+                                .lte("race_id", f"{day_prefix}12")\
+                                .execute()
+                            for r in (s_res.data or []):
+                                rid = r.get("race_id")
+                                b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+                                top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
+                                if top3:
+                                    day_settled.append({"race_id": rid, "top3_orders": top3})
+                        except Exception as e:
+                            print(f"[TrackBias] settlements query warning: {e}")
+
+                    _day_results_cache[day_prefix] = (now_ts, day_settled)
+                    for r in day_settled:
+                        if str(r.get("race_id") or "") < race_id:
+                            settled_races.append(r)
 
             sample_races = 0
             inside_count = 0
@@ -3274,18 +3322,25 @@ def compute_track_bias_and_matches(
             front_wins = 0
 
             if settled_races:
-                # 確定レースのコース条件(芝/ダート)および枠番マップを predictions_cache から取得
-                past_rids = [r["race_id"] for r in settled_races if r.get("race_id")]
+                # 確定レースのコース条件(芝/ダート)および枠番マップを取得
+                past_rids = [str(r["race_id"]) for r in settled_races if r.get("race_id")]
                 pred_map = {}
-                if past_rids:
-                    try:
-                        p_res = supabase.table("keiba_predictions_cache")\
-                            .select("race_id, data_json")\
-                            .in_("race_id", past_rids)\
-                            .execute()
-                        pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
-                    except Exception as pe:
-                        print(f"[TrackBias] predictions_cache fetch warning: {pe}")
+                if prefetched_pred_map is not None:
+                    pred_map = prefetched_pred_map
+                elif past_rids:
+                    missing_rids = [r for r in past_rids if r not in _past_pred_cache]
+                    if missing_rids:
+                        try:
+                            p_res = supabase.table("keiba_predictions_cache")\
+                                .select("race_id, data_json")\
+                                .in_("race_id", missing_rids)\
+                                .execute()
+                            for row in (p_res.data or []):
+                                if row.get("race_id"):
+                                    _past_pred_cache[row["race_id"]] = (row.get("data_json") or {})
+                        except Exception as pe:
+                            print(f"[TrackBias] predictions_cache fetch warning: {pe}")
+                    pred_map = {r: _past_pred_cache.get(r, {}) for r in past_rids}
 
                 is_target_turf = "芝" in surface_name
                 is_target_dirt = ("ダ" in surface_name) or ("ダート" in surface_name)
@@ -3509,6 +3564,8 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
             "race_date": race_date,
             "data_json": data_dict
         }).execute()
+        _all_predictions_cache.pop(race_date, None)
+        _today_races_cache.pop(race_date, None)
     except Exception as e:
         print(f"Supabase予想保存エラー ({race_id}): {e}")
 
@@ -3760,6 +3817,8 @@ def predict_race_core(
         raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
 
 
+_all_predictions_cache: Dict[str, Tuple[float, dict]] = {}
+
 @app.get("/predict/all")
 def get_all_predictions_for_date(date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)")):
     """指定日付の全レースのキャッシュ済み予想を一括返却（アプリの先読み・ゼロレイテンシ用）"""
@@ -3767,10 +3826,42 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
     if not supabase:
         return {"date": target_date, "count": 0, "predictions": {}}
 
+    now_ts = time.time()
+    today_str = today_jst_str()
+    all_cache_ttl = 30.0 if target_date == today_str else 3600.0
+    cached_all = _all_predictions_cache.get(target_date)
+    if cached_all and (now_ts - cached_all[0] < all_cache_ttl):
+        return cached_all[1]
+
     try:
         res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
+        rows = res.data or []
+        if not rows:
+            return {"date": target_date, "count": 0, "predictions": {}}
+
+        pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in rows if row.get("race_id")}
+        all_day_rids = list(pred_map.keys())
+
+        # 当日確定結果を一括バッチフェッチ (全レース分を1回のクエリに集約)
+        parsed_settled = []
+        try:
+            r_res = supabase.table("keiba_race_results_cache").select("race_id, result_json").eq("race_date", target_date).execute()
+            raw_results = r_res.data or []
+            if not raw_results and all_day_rids:
+                r_res2 = supabase.table("keiba_race_results_cache").select("race_id, result_json").in_("race_id", all_day_rids).execute()
+                raw_results = r_res2.data or []
+
+            for r in raw_results:
+                rid = r.get("race_id")
+                rj = r.get("result_json") or {}
+                orders = rj.get("orders") or {}
+                if orders:
+                    parsed_settled.append({"race_id": rid, "orders": orders})
+        except Exception as e_res:
+            print(f"[get_all_predictions] results fetch warning: {e_res}")
+
         preds = {}
-        for row in res.data or []:
+        for row in rows:
             r_id = row.get("race_id")
             d_json = row.get("data_json")
             if r_id and d_json:
@@ -3778,15 +3869,25 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                     apply_odds_anomaly_indicators(d_json.get("horses", []))
                     c_det = (d_json.get("race_details") or {}).get("course_details", "")
                     surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
-                    tb_info = compute_track_bias_and_matches(r_id, target_date, surf_str, d_json.get("horses", []))
+                    tb_info = compute_track_bias_and_matches(
+                        r_id,
+                        target_date,
+                        surf_str,
+                        d_json.get("horses", []),
+                        prefetched_settled_races=parsed_settled,
+                        prefetched_pred_map=pred_map
+                    )
                     if tb_info:
                         d_json["track_bias"] = tb_info
                 preds[r_id] = d_json
-        return {
+
+        result_payload = {
             "date": target_date,
             "count": len(preds),
             "predictions": preds
         }
+        _all_predictions_cache[target_date] = (now_ts, result_payload)
+        return result_payload
     except Exception as e:
         print(f"全予想一括取得エラー ({target_date}): {e}")
         return {"date": target_date, "count": 0, "predictions": {}}
