@@ -6566,6 +6566,72 @@ def endpoint_test_umaca_connection():
     }
 
 
+@app.get("/debug/track-bias/{race_id}")
+def endpoint_debug_track_bias(race_id: str):
+    """トラックバイアス計算の内部動作を詳細に診断して返す"""
+    if not supabase:
+        return {"error": "Supabase not connected"}
+    
+    day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
+    start_rid = f"{day_prefix}01"
+    
+    s_res = supabase.table("keiba_race_settlements")\
+        .select("race_id, top3_orders, bet_details")\
+        .gte("race_id", start_rid)\
+        .lt("race_id", race_id)\
+        .execute()
+    settled_rows = s_res.data or []
+    
+    # 全件で prefix にマッチするレース (確認用)
+    s_like = supabase.table("keiba_race_settlements")\
+        .select("race_id")\
+        .like("race_id", f"{day_prefix}%")\
+        .execute()
+    
+    past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
+    pred_map = {}
+    if past_rids:
+        p_res = supabase.table("keiba_predictions_cache")\
+            .select("race_id, data_json")\
+            .in_("race_id", past_rids)\
+            .execute()
+        pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
+
+    # 当該レースの情報
+    this_p = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", race_id).execute()
+    this_dj = (this_p.data[0].get("data_json") or {}) if this_p.data else {}
+    this_course = (this_dj.get("race_details") or {}).get("course_details", "")
+    
+    eval_list = []
+    for s_row in settled_rows:
+        rid = str(s_row.get("race_id") or "")
+        top3 = s_row.get("top3_orders")
+        if not top3:
+            b_det = s_row.get("bet_details") if isinstance(s_row.get("bet_details"), dict) else {}
+            top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
+        
+        dj = pred_map.get(rid, {})
+        c_details = (dj.get("race_details") or {}).get("course_details", "")
+        
+        eval_list.append({
+            "race_id": rid,
+            "has_top3": bool(top3 and len(top3) >= 3),
+            "top3_len": len(top3) if top3 else 0,
+            "course_details": c_details,
+            "dj_found": bool(dj)
+        })
+
+    return {
+        "target_race_id": race_id,
+        "day_prefix": day_prefix,
+        "start_rid": start_rid,
+        "this_course_details": this_course,
+        "settled_count_gte_lt": len(settled_rows),
+        "settled_count_like": len(s_like.data or []),
+        "eval_list": eval_list
+    }
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
