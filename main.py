@@ -492,6 +492,7 @@ class HorsePrediction(BaseModel):
     odds_change_pct: Optional[float] = None
     odds_trend: Optional[str] = None
     odds_alert: Optional[str] = None
+    bias_match: Optional[str] = None
 
 class TicketBet(BaseModel):
     ticket_type: str
@@ -555,6 +556,17 @@ class RaceDetails(BaseModel):
     post_time: str
     course_details: str
 
+class TrackBiasInfo(BaseModel):
+    venue_name: str
+    surface_name: str
+    sample_races: int
+    bias_summary: str
+    waku_bias: str = "flat"  # "inside" | "outside" | "flat"
+    running_style_bias: str = "flat"  # "front" | "closer" | "flat"
+    inside_top3_ratio: float = 0.0
+    outside_top3_ratio: float = 0.0
+    detail_text: str = ""
+
 class PredictResponse(BaseModel):
     race_id: str
     race_name: str
@@ -562,6 +574,7 @@ class PredictResponse(BaseModel):
     horses: List[HorsePrediction]
     recommendation: TanFukuRecommendation
     hybrid_recommendation: Optional[HybridRecommendation] = None
+    track_bias: Optional[TrackBiasInfo] = None
 
 
 def calc_trio_odds(o1: float, o2: float, o3: float) -> float:
@@ -2238,12 +2251,22 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "summary": hybrid_rec.get("summary", "")
         }
 
+    c_det = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
+    surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
+    track_bias_data = compute_track_bias_and_matches(
+        race_id=race_id,
+        race_date=r_date_str,
+        surface_name=surf_str,
+        horses=horses_sorted_by_num
+    )
+
     return {
         "race_name": race_name,
         "race_details": race_details,
         "horses": horses_sorted_by_num,
         "recommendation": recommendation,
-        "hybrid_recommendation": hybrid_rec
+        "hybrid_recommendation": hybrid_rec,
+        "track_bias": track_bias_data
     }
 
 
@@ -2839,15 +2862,198 @@ def apply_odds_anomaly_indicators(
         h["odds_alert"] = alert
 
 
+_track_bias_cache: Dict[str, Tuple[float, dict]] = {}
+
+def compute_track_bias_and_matches(
+    race_id: str,
+    race_date: str,
+    surface_name: str,
+    horses: List[dict]
+) -> Optional[dict]:
+    """
+    【Step 5】トラックバイアス（当日の馬場傾向：内枠/外枠・先行/差し有利）のリアルタイム分析
+    1. 当日(race_date)・同競馬場(race_id[4:6])・同トラック種別(芝/ダート)の確定済みレース(1〜3着)を集計。
+    2. 内枠(1〜3枠)・外枠(6〜8枠)の複勝シェア率、および先行逃げ(4角4番手以内)の勝率から馬場バイアス指数を算出。
+    3. 出走各馬の枠番・脚質とのマッチ度(bias_match)を判定。
+    ※ モデル推論確率(prob_win/prob_top3)自体は変更しない（ゼロリーク・ベースライン厳守）。
+    """
+    if not surface_name or surface_name in ("障害", ""):
+        return None
+
+    venue_code_str = race_id[4:6] if len(race_id) >= 6 else "00"
+    try:
+        venue_code_int = int(venue_code_str)
+    except Exception:
+        venue_code_int = 0
+    venue_name = GLOBAL_VENUE_MAP.get(venue_code_int, "競馬場")
+
+    cache_key = f"{race_date}_{venue_code_str}_{surface_name}"
+    now_ts = time.time()
+    cached_entry = _track_bias_cache.get(cache_key)
+
+    bias_info = None
+    if cached_entry and (now_ts - cached_entry[0] < 120.0):
+        bias_info = cached_entry[1]
+    elif supabase:
+        try:
+            # 同一開催日・同競馬場の確定レースキャッシュを取得
+            res = supabase.table("keiba_predictions_cache")\
+                .select("race_id, data_json")\
+                .eq("race_date", race_date)\
+                .like("race_id", f"{race_id[:4]}{venue_code_str}%")\
+                .execute()
+
+            sample_races = 0
+            inside_count = 0
+            middle_count = 0
+            outside_count = 0
+            front_wins = 0
+
+            for row in (res.data or []):
+                r_id = str(row.get("race_id") or "")
+                if r_id == race_id:
+                    continue  # 当該レース自身は除外
+
+                dj = row.get("data_json") or {}
+                c_details = (dj.get("race_details") or {}).get("course_details", "")
+                if surface_name not in c_details:
+                    continue
+
+                top3 = dj.get("top3_orders") or []
+                if len(top3) < 3:
+                    continue
+
+                sample_races += 1
+                r_horses = dj.get("horses") or []
+                w_map = {int(h["umaban"]): int(h.get("wakuban") or 0) for h in r_horses if "umaban" in h and str(h["umaban"]).isdigit()}
+
+                for item in top3[:3]:
+                    u_num = int(item.get("umaban") or 0)
+                    order_num = int(item.get("order") or 0)
+                    waku_num = w_map.get(u_num, 0)
+
+                    if waku_num in (1, 2, 3):
+                        inside_count += 1
+                    elif waku_num in (4, 5):
+                        middle_count += 1
+                    elif waku_num in (6, 7, 8):
+                        outside_count += 1
+
+                    if order_num == 1:
+                        h_clean = re.sub(r"[\s\u3000]", "", str(item.get("horse_name") or ""))
+                        st = stats_dict.get("horse_stats", {}).get(h_clean, {})
+                        if float(st.get("last_corner_final", 8.0)) <= 4.0:
+                            front_wins += 1
+
+            if sample_races < 2:
+                bias_info = {
+                    "venue_name": venue_name,
+                    "surface_name": surface_name,
+                    "sample_races": sample_races,
+                    "bias_summary": f"⚖️ 当日{surface_name}分析中 (確定{sample_races}R)",
+                    "waku_bias": "flat",
+                    "running_style_bias": "flat",
+                    "inside_top3_ratio": 0.0,
+                    "outside_top3_ratio": 0.0,
+                    "detail_text": f"本日{surface_name}: 確定{sample_races}レースのためフラット判定"
+                }
+            else:
+                total_top3 = sample_races * 3
+                in_pct = round((inside_count / total_top3) * 100.0, 1)
+                out_pct = round((outside_count / total_top3) * 100.0, 1)
+                front_pct = round((front_wins / sample_races) * 100.0, 1)
+
+                waku_bias = "inside" if in_pct >= 50.0 else ("outside" if out_pct >= 50.0 else "flat")
+                style_bias = "front" if front_pct >= 60.0 else ("closer" if front_pct <= 25.0 else "flat")
+
+                if waku_bias == "inside" and style_bias == "front":
+                    sum_txt = "🔥内枠先行超有利 (前残りバイアス)"
+                elif waku_bias == "inside" and style_bias == "closer":
+                    sum_txt = "🟢内枠有利 (ロスなし差し)"
+                elif waku_bias == "inside":
+                    sum_txt = "🟢内枠有利 (経済コース優位)"
+                elif waku_bias == "outside" and style_bias == "closer":
+                    sum_txt = "⚡外枠外差し有利 (上がり最速優位)"
+                elif waku_bias == "outside" and style_bias == "front":
+                    sum_txt = "🔵外枠有利 (スムーズ先行)"
+                elif waku_bias == "outside":
+                    sum_txt = "🔵外枠有利 (馬場外伸び)"
+                elif style_bias == "front":
+                    sum_txt = "🏃先行逃げ有利 (前残り馬場)"
+                elif style_bias == "closer":
+                    sum_txt = "🌪️差し追込有利 (直線外伸び)"
+                else:
+                    sum_txt = "⚖️内外・脚質フラット"
+
+                detail = f"本日{venue_name}{surface_name}{sample_races}R確定: 内枠(1-3枠) 複勝率{in_pct:.0f}% / 外枠 {out_pct:.0f}% / 先行逃げ {front_wins}勝"
+                bias_info = {
+                    "venue_name": venue_name,
+                    "surface_name": surface_name,
+                    "sample_races": sample_races,
+                    "bias_summary": sum_txt,
+                    "waku_bias": waku_bias,
+                    "running_style_bias": style_bias,
+                    "inside_top3_ratio": in_pct,
+                    "outside_top3_ratio": out_pct,
+                    "detail_text": detail
+                }
+
+            _track_bias_cache[cache_key] = (now_ts, bias_info)
+        except Exception as be:
+            print(f"[TrackBias Warning] 集計エラー: {be}")
+
+    # 各出走馬へのバイアスマッチング (bias_match)
+    if bias_info and horses:
+        waku_b = bias_info.get("waku_bias", "flat")
+        style_b = bias_info.get("running_style_bias", "flat")
+        h_stats = stats_dict.get("horse_stats", {})
+
+        for h in horses:
+            w = int(h.get("wakuban") or 0)
+            h_clean = re.sub(r"[\s\u3000]", "", str(h.get("horse_name") or ""))
+            st = h_stats.get(h_clean, {})
+            is_front = float(st.get("last_corner_final", 8.0)) <= 4.0
+
+            match_tag = None
+            if waku_b == "inside" and w in (1, 2, 3):
+                if is_front and style_b == "front":
+                    match_tag = "🎯絶好バイアス (内先行)"
+                else:
+                    match_tag = "🟢内枠有利"
+            elif waku_b == "inside" and w in (7, 8):
+                match_tag = "⚠️外枠逆風"
+            elif waku_b == "outside" and w in (6, 7, 8):
+                if not is_front and style_b == "closer":
+                    match_tag = "🎯絶好バイアス (外差し)"
+                else:
+                    match_tag = "🔵外枠有利"
+            elif waku_b == "outside" and w in (1, 2):
+                match_tag = "⚠️内枠逆風"
+            elif style_b == "front" and is_front:
+                match_tag = "🏃前残り合致"
+            elif style_b == "closer" and not is_front:
+                match_tag = "🌪️差し合致"
+
+            h["bias_match"] = match_tag
+
+    return bias_info
+
+
 def get_cached_prediction(race_id: str) -> Optional[dict]:
     if not supabase:
         return None
     try:
-        res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", race_id).execute()
+        res = supabase.table("keiba_predictions_cache").select("data_json, race_date").eq("race_id", race_id).execute()
         if res.data and len(res.data) > 0:
             d_json = res.data[0]["data_json"]
+            r_date = res.data[0].get("race_date") or today_jst_str()
             if isinstance(d_json, dict) and "horses" in d_json:
                 apply_odds_anomaly_indicators(d_json.get("horses", []))
+                c_details = (d_json.get("race_details") or {}).get("course_details", "")
+                surf_str = "芝" if "芝" in c_details else ("ダート" if "ダ" in c_details else "障害")
+                tb_info = compute_track_bias_and_matches(race_id, r_date, surf_str, d_json.get("horses", []))
+                if tb_info:
+                    d_json["track_bias"] = tb_info
             return d_json
     except Exception as e:
         print(f"Supabase予想取得エラー ({race_id}): {e}")
@@ -3091,6 +3297,7 @@ def predict_race_core(
             "horses": result["horses"],
             "recommendation": result["recommendation"],
             "hybrid_recommendation": result.get("hybrid_recommendation"),
+            "track_bias": result.get("track_bias"),
             "last_odds_stage": odds_stage
         }
 
@@ -3137,6 +3344,11 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
             if r_id and d_json:
                 if isinstance(d_json, dict) and "horses" in d_json:
                     apply_odds_anomaly_indicators(d_json.get("horses", []))
+                    c_det = (d_json.get("race_details") or {}).get("course_details", "")
+                    surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
+                    tb_info = compute_track_bias_and_matches(r_id, target_date, surf_str, d_json.get("horses", []))
+                    if tb_info:
+                        d_json["track_bias"] = tb_info
                 preds[r_id] = d_json
         return {
             "date": target_date,
