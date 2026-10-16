@@ -2916,7 +2916,7 @@ def compute_track_bias_and_matches(
             day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
             start_rid = f"{day_prefix}01"
             s_res = supabase.table("keiba_race_settlements")\
-                .select("race_id, top3_orders, bet_details")\
+                .select("race_id, top3_orders")\
                 .gte("race_id", start_rid)\
                 .lt("race_id", race_id)\
                 .execute()
@@ -2929,24 +2929,34 @@ def compute_track_bias_and_matches(
             front_wins = 0
 
             if settled_rows:
-                # 確定レースのコース条件(芝/ダート)および枠番マップを predictions_cache から一括取得
+                # 確定レースのコース条件(芝/ダート)および枠番マップを predictions_cache から取得
                 past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
-                p_res = supabase.table("keiba_predictions_cache")\
-                    .select("race_id, data_json")\
-                    .in_("race_id", past_rids)\
-                    .execute()
-                pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
+                pred_map = {}
+                if past_rids:
+                    try:
+                        p_res = supabase.table("keiba_predictions_cache")\
+                            .select("race_id, data_json")\
+                            .in_("race_id", past_rids)\
+                            .execute()
+                        pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
+                    except Exception as pe:
+                        print(f"[TrackBias] predictions_cache fetch warning: {pe}")
 
                 is_target_turf = "芝" in surface_name
                 is_target_dirt = ("ダ" in surface_name) or ("ダート" in surface_name)
 
                 for s_row in settled_rows:
                     r_id = str(s_row.get("race_id") or "")
-                    # top3_orders を専用カラムまたは bet_details.real_bet_meta から確実に抽出
+                    # top3_orders を専用カラムから抽出、なければ個別フォールバック
                     top3 = s_row.get("top3_orders")
                     if not top3:
-                        b_det = s_row.get("bet_details") if isinstance(s_row.get("bet_details"), dict) else {}
-                        top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
+                        try:
+                            fb = supabase.table("keiba_race_settlements").select("bet_details").eq("race_id", r_id).execute()
+                            if fb.data:
+                                b_det = fb.data[0].get("bet_details") or {}
+                                top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
+                        except Exception:
+                            top3 = []
                     if not top3 or len(top3) < 3:
                         continue
 
@@ -6576,7 +6586,7 @@ def endpoint_debug_track_bias(race_id: str):
     start_rid = f"{day_prefix}01"
     
     s_res = supabase.table("keiba_race_settlements")\
-        .select("race_id, top3_orders, bet_details")\
+        .select("race_id, top3_orders")\
         .gte("race_id", start_rid)\
         .lt("race_id", race_id)\
         .execute()
@@ -6585,17 +6595,21 @@ def endpoint_debug_track_bias(race_id: str):
     # 全件で prefix にマッチするレース (確認用)
     s_like = supabase.table("keiba_race_settlements")\
         .select("race_id")\
-        .like("race_id", f"{day_prefix}%")\
+        .gte("race_id", start_rid)\
+        .lte("race_id", f"{day_prefix}12")\
         .execute()
     
     past_rids = [r["race_id"] for r in settled_rows if r.get("race_id")]
     pred_map = {}
     if past_rids:
-        p_res = supabase.table("keiba_predictions_cache")\
-            .select("race_id, data_json")\
-            .in_("race_id", past_rids)\
-            .execute()
-        pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
+        try:
+            p_res = supabase.table("keiba_predictions_cache")\
+                .select("race_id, data_json")\
+                .in_("race_id", past_rids)\
+                .execute()
+            pred_map = {row["race_id"]: (row.get("data_json") or {}) for row in (p_res.data or [])}
+        except Exception as pe:
+            print(f"[Debug] pred_map fetch err: {pe}")
 
     # 当該レースの情報
     this_p = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", race_id).execute()
