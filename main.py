@@ -2915,7 +2915,7 @@ def compute_track_bias_and_matches(
             # JRA仕様: race_id の先頭10桁 (YYYY + VENUE + KAI + NICHI) は同一開催日で100%一致
             day_prefix = race_id[:10] if len(race_id) >= 10 else race_id[:6]
             s_res = supabase.table("keiba_race_settlements")\
-                .select("race_id, top3_orders")\
+                .select("race_id, top3_orders, bet_details")\
                 .like("race_id", f"{day_prefix}%")\
                 .lt("race_id", race_id)\
                 .execute()
@@ -2938,7 +2938,11 @@ def compute_track_bias_and_matches(
 
                 for s_row in settled_rows:
                     r_id = str(s_row.get("race_id") or "")
-                    top3 = s_row.get("top3_orders") or []
+                    # top3_orders を専用カラムまたは bet_details.real_bet_meta から確実に抽出
+                    top3 = s_row.get("top3_orders")
+                    if not top3:
+                        b_det = s_row.get("bet_details") if isinstance(s_row.get("bet_details"), dict) else {}
+                        top3 = b_det.get("real_bet_meta", {}).get("top3_orders") or []
                     if len(top3) < 3:
                         continue
 
