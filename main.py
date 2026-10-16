@@ -2759,6 +2759,31 @@ def predict_race_core(race_id: str, force_refresh: bool = False, is_auto_final: 
         raise HTTPException(status_code=500, detail=f"推論処理中にエラーが発生しました: {e}")
 
 
+@app.get("/predict/all")
+def get_all_predictions_for_date(date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)")):
+    """指定日付の全レースのキャッシュ済み予想を一括返却（アプリの先読み・ゼロレイテンシ用）"""
+    target_date = date if date else today_jst_str()
+    if not supabase:
+        return {"date": target_date, "count": 0, "predictions": {}}
+
+    try:
+        res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
+        preds = {}
+        for row in res.data or []:
+            r_id = row.get("race_id")
+            d_json = row.get("data_json")
+            if r_id and d_json:
+                preds[r_id] = d_json
+        return {
+            "date": target_date,
+            "count": len(preds),
+            "predictions": preds
+        }
+    except Exception as e:
+        print(f"全予想一括取得エラー ({target_date}): {e}")
+        return {"date": target_date, "count": 0, "predictions": {}}
+
+
 @app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str, force_refresh: bool = Query(False, description="手動で予想を再実行する場合True")):
     return predict_race_core(race_id, force_refresh=force_refresh, is_auto_final=False)
