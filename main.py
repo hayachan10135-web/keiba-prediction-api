@@ -6475,6 +6475,8 @@ def endpoint_rebuild_predictions(
                 except Exception as se:
                     pass
 
+            time.sleep(0.08)
+
         invalidate_summary_caches()
         return {
             "status": "ok",
