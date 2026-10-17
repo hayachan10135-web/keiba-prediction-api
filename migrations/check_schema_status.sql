@@ -48,3 +48,4 @@ LEFT JOIN (
 ORDER BY 
     CASE WHEN t.table_name IS NULL THEN 1 ELSE 2 END,
     rt.table_name;
+

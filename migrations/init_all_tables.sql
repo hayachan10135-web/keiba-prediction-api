@@ -101,3 +101,4 @@ CREATE TABLE IF NOT EXISTS keiba_app_meta (
     value JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
