@@ -19,7 +19,7 @@ from typing import Dict, Any, List, Optional, Tuple, Callable
 from fastapi import HTTPException
 
 from app.core.database import get_supabase_client
-from app.core.timezone import today_jst_str, now_jst, now_jst_naive
+from app.core.timezone import today_jst_str, now_jst, now_jst_naive, is_before_morning_prediction
 from app.ml.model_loader import (
     model,
     model_win,
@@ -914,6 +914,18 @@ def predict_race_core(
                     except Exception as ue:
                         print(f"予想キャッシュ出走時刻更新エラー ({race_id}): {ue}")
 
+        if is_before_morning_prediction(r_d_str):
+            hr = cached_pred.get("hybrid_recommendation")
+            if hr and isinstance(hr, dict):
+                hr["is_real_bet_target"] = False
+                hr["real_bet_badge"] = None
+                hr["real_bet_level"] = "none"
+                hr["is_virtual_bet_target"] = False
+                hr["virtual_bet_slot"] = None
+                hr["virtual_badge"] = None
+                hr["is_promoted_today"] = False
+            return cached_pred
+
         if _sync_virtual_badge_handler:
             return _sync_virtual_badge_handler(race_id, cached_pred, r_d_str)
         return cached_pred
@@ -974,14 +986,25 @@ def predict_race_core(
         if _save_cached_pred_handler:
             _save_cached_pred_handler(race_id, target_race_date, resp_data)
 
-        try:
-            promoted_rid = ensure_daily_single_real_bet(target_race_date)
-            if promoted_rid == race_id and not (resp_data.get("hybrid_recommendation") or {}).get("is_real_bet_target"):
-                reloaded = _get_cached_pred_handler(race_id) if _get_cached_pred_handler else None
-                if reloaded:
-                    resp_data = reloaded
-        except Exception as de:
-            print(f"[predict_race_core] daily_top同期警告 ({race_id}): {de}")
+        if is_before_morning_prediction(target_race_date):
+            hr = resp_data.get("hybrid_recommendation")
+            if hr and isinstance(hr, dict):
+                hr["is_real_bet_target"] = False
+                hr["real_bet_badge"] = None
+                hr["real_bet_level"] = "none"
+                hr["is_virtual_bet_target"] = False
+                hr["virtual_bet_slot"] = None
+                hr["virtual_badge"] = None
+                hr["is_promoted_today"] = False
+        else:
+            try:
+                promoted_rid = ensure_daily_single_real_bet(target_race_date)
+                if promoted_rid == race_id and not (resp_data.get("hybrid_recommendation") or {}).get("is_real_bet_target"):
+                    reloaded = _get_cached_pred_handler(race_id) if _get_cached_pred_handler else None
+                    if reloaded:
+                        resp_data = reloaded
+            except Exception as de:
+                print(f"[predict_race_core] daily_top同期警告 ({race_id}): {de}")
 
         supabase = get_supabase_client()
         if supabase:
@@ -1001,7 +1024,7 @@ def predict_race_core(
             except Exception:
                 pass
 
-        if _sync_virtual_badge_handler:
+        if not is_before_morning_prediction(target_race_date) and _sync_virtual_badge_handler:
             return _sync_virtual_badge_handler(race_id, resp_data, target_race_date)
         return resp_data
     except HTTPException:

@@ -57,3 +57,23 @@ def parse_post_datetime(p_dt_str: Optional[str], fallback_date_str: Optional[str
                 pass
     return None
 
+
+def is_before_morning_prediction(target_date: Optional[str] = None) -> bool:
+    """
+    朝08:30の一括事前予想前であるかを判定。
+    対象日付が当日以降（当日または未来日）かつ、現在時刻が朝08:30前であれば True を返す。
+    ※ 過去日（昨日以前）の場合は既にレース確定済みのため常に False を返す。
+    """
+    now_dt = now_jst_naive()
+    today_s = today_jst_str()
+    t_date = target_date if target_date else today_s
+    clean_t = t_date.replace("-", "")
+    clean_today = today_s.replace("-", "")
+
+    if clean_t < clean_today:
+        return False
+    if clean_t > clean_today:
+        return True
+    # 当日の場合: 朝08:30前かどうか (08:30以降であれば False)
+    return (now_dt.hour < 8 or (now_dt.hour == 8 and now_dt.minute < 30))
+

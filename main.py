@@ -26,7 +26,7 @@ from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
 from umaca_fast_client import UMACAFastClient
 
-from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_post_datetime
+from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_post_datetime, is_before_morning_prediction
 from app.strategies import (
     StrategyArbiter,
     NATURAL_REAL_STRATEGIES,
@@ -661,57 +661,70 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                         d_json["track_bias"] = tb_info
                 preds[r_id] = d_json
 
-        # 実馬券厳選保証: 自然条件(戦略B/A/C/A-2)を満たすレースは全て実馬券とし、0レースの時のみ当日No.1の1レースを実馬券に昇格
-        real_count = sum(1 for p in preds.values() if (p.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
-        has_downgraded_ref = any("参考推奨" in str((p.get("hybrid_recommendation") or {}).get("real_bet_badge") or "") for p in preds.values())
-        if (real_count == 0 or has_downgraded_ref) and target_date >= today_jst_str() and preds:
-            ensure_daily_single_real_bet(target_date)
-            fresh_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
-            for row in (fresh_res.data or []):
-                if row.get("race_id") and row.get("data_json"):
-                    preds[row["race_id"]] = row["data_json"]
-        # 各会場確信度上位3枠（仮想観戦枠）バッジを予測データにも同期反映（対象外は見送りに完全整合）
-        cached_venues_entry = _today_races_cache.get(target_date)
-        venues_list = []
-        if cached_venues_entry:
-            v_data = cached_venues_entry[1]
-            venues_list = v_data.get("venues", []) if isinstance(v_data, dict) else (v_data if isinstance(v_data, list) else [])
-        else:
-            try:
-                raw_v = fetch_venues_for_date_raw(target_date)
-                if raw_v:
-                    venues_list = attach_prediction_badges_to_venues(target_date, raw_v)
-            except Exception:
-                venues_list = []
-
-        if venues_list:
-            for venue in venues_list:
-                for r in venue.get("races", []):
-                    rid = r.get("race_id")
-                    if rid in preds:
-                        hr = preds[rid].get("hybrid_recommendation")
-                        if hr and not hr.get("is_real_bet_target"):
-                            if r.get("is_virtual_bet_target"):
-                                hr["is_virtual_bet_target"] = True
-                                hr["virtual_bet_slot"] = r.get("virtual_bet_slot")
-                                hr["real_bet_level"] = r.get("real_bet_level", "virtual")
-                                hr["real_bet_badge"] = r.get("real_bet_badge")
-                                hr["virtual_badge"] = r.get("real_bet_badge")
-                            else:
-                                hr["is_virtual_bet_target"] = False
-                                hr["virtual_bet_slot"] = None
-                                hr["real_bet_level"] = "none"
-                                hr["real_bet_badge"] = None
-                                hr["virtual_badge"] = None
-        else:
+        if is_before_morning_prediction(target_date):
+            # 朝08:30の一括事前予想前は、当日および未来日のバッジ（実戦・勝負・仮想・見送り等）は一切表示しない（無印状態）
             for rid, p_obj in preds.items():
                 hr = p_obj.get("hybrid_recommendation")
-                if hr and not hr.get("is_real_bet_target") and hr.get("real_bet_level") != "virtual":
+                if hr and isinstance(hr, dict):
+                    hr["is_real_bet_target"] = False
+                    hr["real_bet_badge"] = None
+                    hr["real_bet_level"] = "none"
                     hr["is_virtual_bet_target"] = False
                     hr["virtual_bet_slot"] = None
-                    hr["real_bet_level"] = "none"
-                    hr["real_bet_badge"] = None
                     hr["virtual_badge"] = None
+                    hr["is_promoted_today"] = False
+        else:
+            # 実馬券厳選保証: 自然条件(戦略B/A/C/A-2)を満たすレースは全て実馬券とし、0レースの時のみ当日No.1の1レースを実馬券に昇格
+            real_count = sum(1 for p in preds.values() if (p.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
+            has_downgraded_ref = any("参考推奨" in str((p.get("hybrid_recommendation") or {}).get("real_bet_badge") or "") for p in preds.values())
+            if (real_count == 0 or has_downgraded_ref) and target_date >= today_jst_str() and preds:
+                ensure_daily_single_real_bet(target_date)
+                fresh_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
+                for row in (fresh_res.data or []):
+                    if row.get("race_id") and row.get("data_json"):
+                        preds[row["race_id"]] = row["data_json"]
+            # 各会場確信度上位3枠（仮想観戦枠）バッジを予測データにも同期反映（対象外は見送りに完全整合）
+            cached_venues_entry = _today_races_cache.get(target_date)
+            venues_list = []
+            if cached_venues_entry:
+                v_data = cached_venues_entry[1]
+                venues_list = v_data.get("venues", []) if isinstance(v_data, dict) else (v_data if isinstance(v_data, list) else [])
+            else:
+                try:
+                    raw_v = fetch_venues_for_date_raw(target_date)
+                    if raw_v:
+                        venues_list = attach_prediction_badges_to_venues(target_date, raw_v)
+                except Exception:
+                    venues_list = []
+
+            if venues_list:
+                for venue in venues_list:
+                    for r in venue.get("races", []):
+                        rid = r.get("race_id")
+                        if rid in preds:
+                            hr = preds[rid].get("hybrid_recommendation")
+                            if hr and not hr.get("is_real_bet_target"):
+                                if r.get("is_virtual_bet_target"):
+                                    hr["is_virtual_bet_target"] = True
+                                    hr["virtual_bet_slot"] = r.get("virtual_bet_slot")
+                                    hr["real_bet_level"] = r.get("real_bet_level", "virtual")
+                                    hr["real_bet_badge"] = r.get("real_bet_badge")
+                                    hr["virtual_badge"] = r.get("real_bet_badge")
+                                else:
+                                    hr["is_virtual_bet_target"] = False
+                                    hr["virtual_bet_slot"] = None
+                                    hr["real_bet_level"] = "none"
+                                    hr["real_bet_badge"] = None
+                                    hr["virtual_badge"] = None
+            else:
+                for rid, p_obj in preds.items():
+                    hr = p_obj.get("hybrid_recommendation")
+                    if hr and not hr.get("is_real_bet_target") and hr.get("real_bet_level") != "virtual":
+                        hr["is_virtual_bet_target"] = False
+                        hr["virtual_bet_slot"] = None
+                        hr["real_bet_level"] = "none"
+                        hr["real_bet_badge"] = None
+                        hr["virtual_badge"] = None
 
         result_payload = {
             "date": target_date,
@@ -835,11 +848,41 @@ set_admin_dependencies(
 )
 
 
+def _clear_morning_unannounced_badges():
+    """朝08:30前に誤って付与された当日レースのバッジ（実戦・勝負・仮想・見送り等）をSupabaseキャッシュおよびメモリから解除"""
+    today_s = today_jst_str()
+    if is_before_morning_prediction(today_s):
+        _daily_top_race_id_cache.pop(today_s, None)
+        _all_predictions_cache.pop(today_s, None)
+        _today_races_cache.pop(today_s, None)
+        if supabase:
+            try:
+                res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", today_s).execute()
+                for row in (res.data or []):
+                    rid = row.get("race_id")
+                    dj = row.get("data_json") or {}
+                    hrec = dj.get("hybrid_recommendation")
+                    if hrec and (hrec.get("is_real_bet_target") or hrec.get("real_bet_badge") or hrec.get("is_virtual_bet_target") or hrec.get("virtual_badge")):
+                        hrec["is_real_bet_target"] = False
+                        hrec["real_bet_badge"] = None
+                        hrec["real_bet_level"] = "none"
+                        hrec["is_virtual_bet_target"] = False
+                        hrec["virtual_bet_slot"] = None
+                        hrec["virtual_badge"] = None
+                        hrec["is_promoted_today"] = False
+                        supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
+                        print(f"[ClearMorningBadges] {rid} の朝発表前バッジを解除しました。")
+            except Exception as e:
+                print(f"[ClearMorningBadges Warning] {e}")
+
+
 def _startup_background_init():
     try:
         normalize_mislabeled_dates()
         fix_duplicated_horses_cache_2026()
-        ensure_daily_single_real_bet(today_jst_str())
+        _clear_morning_unannounced_badges()
+        if not is_before_morning_prediction(today_jst_str()):
+            ensure_daily_single_real_bet(today_jst_str())
         endpoint_sync_active_post_times(today_jst_str())
         heal_today_weights_and_results(today_jst_str())
     except Exception as e:

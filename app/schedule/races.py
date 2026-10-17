@@ -12,7 +12,7 @@ from typing import Optional, Callable, Dict, Any, List, Set, Tuple
 from fastapi import Query
 
 from app.core.database import get_supabase_client
-from app.core.timezone import now_jst_naive, today_jst_str
+from app.core.timezone import now_jst_naive, today_jst_str, is_before_morning_prediction
 from app.scrapers import (
     fetch_venues_for_date_raw,
     register_crawler_post_time_handler,
@@ -156,6 +156,22 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
     """レース一覧の各レースにSupabase上の予想・実戦推奨バッジ情報および確定・的中結果を付与"""
     if not venues:
         return []
+
+    # 朝08:30の一括事前予想前は、当日および未来日のバッジ（実戦・勝負・仮想・見送り等）は一切付与しない（無印状態）
+    if is_before_morning_prediction(formatted_date):
+        for venue in venues:
+            for race in venue.get("races", []):
+                race["is_real_bet_target"] = False
+                race["real_bet_badge"] = None
+                race["real_bet_level"] = "none"
+                race["is_virtual_bet_target"] = False
+                race["virtual_bet_slot"] = None
+                race["virtual_badge"] = None
+                race["is_recommended"] = False
+                race["recommendation_badge"] = ""
+                race["real_bet_summary"] = None
+                race["is_promoted_today"] = False
+        return venues
     cached_preds_map = {}
     raw_preds_cache = {}
     settled_map = {}
