@@ -22,3 +22,4 @@ __all__ = [
     "sync_daily_schedules_if_needed",
     "set_scheduler_dependencies",
 ]
+

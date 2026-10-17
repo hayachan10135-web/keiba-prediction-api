@@ -118,6 +118,20 @@ from app.batch import (
     sync_daily_schedules_if_needed,
     set_scheduler_dependencies,
 )
+from app.maintenance import (
+    recalculate_period_records,
+    set_recalculator_dependencies,
+    CURRENT_DB_VERSION,
+    fix_mislabeled_20261011_races,
+    clear_all_database,
+    check_and_apply_db_migration,
+    normalize_mislabeled_dates,
+    sync_and_process_target_dates,
+    fix_duplicated_horses_cache_2026,
+    heal_today_weights_and_results,
+    heal_settlement_marks,
+    set_healer_dependencies,
+)
 from app.routers.settlement import (
     router as settlement_router,
     set_settlement_handler,
@@ -1263,174 +1277,12 @@ set_batch_worker_dependencies(
 )
 
 
-def recalculate_period_records():
-    """今開催期間のキャッシュ済み予想・確定成績に最新の買い目・実戦推奨ロジックを再適用して一括更新"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase未接続")
-
-    preds_res = supabase.table("keiba_predictions_cache").select("race_id, race_date, data_json").execute()
-    results_res = supabase.table("keiba_race_results_cache").select("race_id, race_date, result_json").execute()
-
-    preds_list = preds_res.data or []
-    res_map = {r["race_id"]: r.get("result_json") for r in (results_res.data or [])}
-    valid_rids = set(res_map.keys())
-
-    updated_preds = 0
-    updated_settlements = 0
-    participating_count = 0
-    total_bet_sum = 0
-    total_pay_sum = 0
-    total_pass_benefit = 0
-    rb_count = 0
-    rb_bet_sum = 0
-    rb_pay_sum = 0
-
-    for row in preds_list:
-        rid = row["race_id"]
-        rdate = row.get("race_date") or today_jst_str()
-        pred_data = row.get("data_json") or {}
-        if not pred_data:
-            continue
-
-        rname = pred_data.get("race_name", "")
-        rdetails = pred_data.get("race_details") or {}
-        horses = pred_data.get("horses") or []
-        old_h = pred_data.get("hybrid_recommendation") or {}
-
-        c_details = rdetails.get("course_details", "") if isinstance(rdetails, dict) else ""
-        surf = 0
-        if "障" in c_details or "障害" in rname:
-            surf = 2
-        elif "ダ" in c_details:
-            surf = 1
-
-        honmei = next((h for h in horses if h.get("mark") == "◎"), None)
-        if not honmei and horses:
-            honmei = sorted(horses, key=lambda x: x.get("score", 0), reverse=True)[0]
-        u0 = int(honmei["umaban"]) if honmei else 0
-
-        # 既存の馬連オッズ情報（実オッズ含む）を復元
-        old_bets = old_h.get("hypothetical_umaren_bets") or old_h.get("umaren_bets") or []
-        odds_by_opp = {}
-        for ob in old_bets:
-            comb = ob.get("combination", [])
-            if len(comb) == 2:
-                opp_u = comb[1] if comb[0] == u0 else comb[0]
-                odds_by_opp[int(opp_u)] = (float(ob.get("odds") or 0.0), bool(ob.get("is_real_odds", True)))
-
-        opponents = []
-        for mark_sym in ["◯", "▲", "△"]:
-            h_opp = next((h for h in horses if h.get("mark") == mark_sym or (mark_sym == "◯" and h.get("mark") in ("〇", "○"))), None)
-            if h_opp:
-                ou = int(h_opp["umaban"])
-                if ou in odds_by_opp:
-                    o_val, o_real = odds_by_opp[ou]
-                else:
-                    oa = float(honmei.get("odds") or 0.0) if honmei else 0.0
-                    ob_val = float(h_opp.get("odds") or 0.0)
-                    o_val = round(max(2.5, 0.65 * oa * ob_val), 1) if (oa > 0 and ob_val > 0) else 0.0
-                    o_real = False
-                opponents.append((ou, o_val, o_real, mark_sym))
-
-        # 既存の三連複実オッズを復元
-        old_t_bets = old_h.get("trio_bets") or ([old_h.get("trio_bet")] if old_h.get("trio_bet") else [])
-        real_trio_map = {}
-        for tb in old_t_bets:
-            if isinstance(tb, dict):
-                c = tb.get("combination") or []
-                if len(c) == 3 and tb.get("is_real_odds"):
-                    real_trio_map[tuple(sorted(c))] = float(tb.get("odds") or 0.0)
-
-        new_h = compute_hybrid_rec_from_inputs(
-            race_name=rname,
-            race_details=rdetails,
-            horses=horses,
-            surface_type=surf,
-            prob_gachi=float(old_h.get("prob_gachi") or 0.0),
-            prob_himo=float(old_h.get("prob_himo") or 0.0),
-            opponents=opponents,
-            u0=u0,
-            honmei_horse=honmei,
-            race_date_str=rdate,
-            force_final_odds=bool(old_h.get("is_final_odds", True)),
-            real_trio_odds=real_trio_map
-        )
-
-        # 三連複対象レースで実オッズが未取得ならnetkeibaから取得して反映
-        if new_h.get("trio_bets") and not real_trio_map:
-            fetched_trio = fetch_real_odds(rid).get("trio", {})
-            if fetched_trio:
-                new_h = compute_hybrid_rec_from_inputs(
-                    race_name=rname,
-                    race_details=rdetails,
-                    horses=horses,
-                    surface_type=surf,
-                    prob_gachi=float(old_h.get("prob_gachi") or 0.0),
-                    prob_himo=float(old_h.get("prob_himo") or 0.0),
-                    opponents=opponents,
-                    u0=u0,
-                    honmei_horse=honmei,
-                    race_date_str=rdate,
-                    force_final_odds=bool(old_h.get("is_final_odds", True)),
-                    real_trio_odds=fetched_trio
-                )
-
-        pred_data["hybrid_recommendation"] = new_h
-
-        if ("新馬" in rname) or ("メイクデビュー" in rname) or surf == 2:
-            rec_obj = pred_data.get("recommendation") or {}
-            rec_obj["grade"] = "D"
-            rec_obj["confidence_label"] = "見送り推奨"
-            rec_obj["is_pass"] = True
-            rec_obj["tansho_amount"] = 0
-            rec_obj["fukusho_amount"] = 0
-            rec_obj["total_amount"] = 0
-            pred_data["recommendation"] = rec_obj
-
-        save_cached_prediction(rid, rdate, pred_data)
-        updated_preds += 1
-
-        res_json = res_map.get(rid)
-        if res_json:
-            st_res = process_settlement_calculation(
-                race_id=rid,
-                race_date=rdate,
-                race_name=rname,
-                pred_data=pred_data,
-                race_res=res_json,
-                from_cache=True
-            )
-            updated_settlements += 1
-            if not st_res.get("is_pass"):
-                participating_count += 1
-                total_bet_sum += st_res.get("total_bet", 0)
-                total_pay_sum += st_res.get("total_payout", 0)
-                if st_res.get("is_real_bet_target"):
-                    rb_count += 1
-                    rb_bet_sum += st_res.get("total_bet", 0)
-                    rb_pay_sum += st_res.get("total_payout", 0)
-            else:
-                total_pass_benefit += (st_res.get("pass_benefit") or 0)
-
-    _period_venues_cache.clear()
-    roi = round((total_pay_sum / total_bet_sum) * 100.0, 2) if total_bet_sum > 0 else 0.0
-    rb_roi = round((rb_pay_sum / rb_bet_sum) * 100.0, 2) if rb_bet_sum > 0 else 0.0
-    return {
-        "status": "ok",
-        "updated_predictions": updated_preds,
-        "updated_settlements": updated_settlements,
-        "participating_races": participating_count,
-        "total_bet": total_bet_sum,
-        "total_payout": total_pay_sum,
-        "profit": total_pay_sum - total_bet_sum,
-        "recovery_rate": roi,
-        "real_bet_races": rb_count,
-        "real_bet_bet": rb_bet_sum,
-        "real_bet_payout": rb_pay_sum,
-        "real_bet_profit": rb_pay_sum - rb_bet_sum,
-        "real_bet_recovery_rate": rb_roi,
-        "pass_benefit_total": total_pass_benefit
-    }
+# recalculate_period_records は app/maintenance/recalculator.py へ移管完了
+set_recalculator_dependencies(
+    today_jst_str=today_jst_str,
+    save_cached_prediction=save_cached_prediction,
+    period_venues_cache=_period_venues_cache,
+)
 
 set_batch_workers(run_batch_worker, recalculate_period_records)
 
@@ -1473,167 +1325,22 @@ set_scheduler_dependencies(
 
 
 
-def fix_mislabeled_20261011_races():
-    """10/11に誤登録された10/12(0405: 4回5日目)レースを10/12へ移行し、10/11当日の0404レースを再登録"""
-    if not supabase:
-        print("[Fix] Supabase未接続のため修正処理をスキップします。")
-        return {"status": "skipped", "message": "Supabase not connected"}
-
-    try:
-        print("[Fix] 10/11誤登録データの修正・移行処理を開始します...")
-
-        # 1. keiba_scheduled_races: 10/11に登録された0405レースを10/12に移行
-        res_sched = supabase.table("keiba_scheduled_races").select("*").eq("race_date", "2026-10-11").execute()
-        sched_rows = res_sched.data or []
-        migrated_sched = 0
-        for r in sched_rows:
-            r_id = r["race_id"]
-            if len(r_id) == 12 and r_id[6:10] == "0405":
-                new_post_dt = r["post_datetime"].replace("2026-10-11", "2026-10-12")
-                supabase.table("keiba_scheduled_races").update({
-                    "race_date": "2026-10-12",
-                    "post_datetime": new_post_dt,
-                    "is_settled": 0,
-                    "retry_count": 0,
-                    "is_predicted": 0
-                }).eq("race_id", r_id).execute()
-                migrated_sched += 1
-
-        # 2. keiba_predictions_cache: 0405レースのrace_dateを2026-10-12に移行
-        res_cache = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", "2026-10-11").execute()
-        cache_rows = res_cache.data or []
-        migrated_cache = 0
-        for c in cache_rows:
-            r_id = c["race_id"]
-            if len(r_id) == 12 and r_id[6:10] == "0405":
-                supabase.table("keiba_predictions_cache").update({
-                    "race_date": "2026-10-12"
-                }).eq("race_id", r_id).execute()
-                migrated_cache += 1
-
-        # 3. keiba_race_settlements: 0405レースが誤って保存されていれば削除
-        try:
-            supabase.table("keiba_race_settlements").delete().filter("race_date", "eq", "2026-10-11").like("race_id", "%0405%").execute()
-        except Exception:
-            pass
-
-        # 4. keiba_race_results_cache: 0405レースが誤って保存されていれば削除
-        try:
-            supabase.table("keiba_race_results_cache").delete().filter("race_date", "eq", "2026-10-11").like("race_id", "%0405%").execute()
-        except Exception:
-            pass
-
-        # 5. 正しい本日 (2026-10-11 / 0404) のレーススケジュールを即時取得・登録
-        today_info = get_today_races("20261011")
-        venues = today_info.get("venues", [])
-        synced_count = 0
-        for v in venues:
-            for r in v.get("races", []):
-                r_id = r["race_id"]
-                try:
-                    fetch_shutuba_table(r_id, race_date="2026-10-11")
-                    synced_count += 1
-                except Exception as fe:
-                    print(f"[Fix] 出馬表登録エラー ({r_id}): {fe}")
-
-        msg = f"修正完了: 10/12移行(スケジュール={migrated_sched}件, 予想キャッシュ={migrated_cache}件), 本日(10/11)登録={synced_count}件"
-        print(f"[Fix] {msg}")
-        return {"status": "ok", "message": msg}
-    except Exception as e:
-        err_msg = f"[Fix] 修正処理エラー: {e}"
-        print(err_msg)
-        return {"status": "error", "message": str(e)}
-
-
-# --- DB構成・スキーマバージョン管理 ---
-CURRENT_DB_VERSION = "v5_umaren_3point_strategy"
-
-def clear_all_database(sync_today: bool = False):
-    """Supabaseの全テーブル（メタ、キャッシュ、台帳、スケジュール）を完全クリア・初期化"""
-    if not supabase:
-        print("[ClearDB] Supabase未接続のためスキップします。")
-        return {"status": "skipped", "message": "Supabase not connected"}
-    try:
-        print("[ClearDB] Supabase全テーブルの初期化クリーンアップを開始します...")
-        for tbl in ["keiba_predictions_cache", "keiba_race_results_cache", "keiba_race_settlements", "keiba_scheduled_races"]:
-            try:
-                supabase.table(tbl).delete().neq("race_id", "0").execute()
-            except Exception as e:
-                print(f"[ClearDB] {tbl} clear warning: {e}")
-        try:
-            supabase.table("keiba_app_meta").delete().neq("key", "__keep__").neq("key", "stats_overlay").execute()
-        except Exception as e:
-            print(f"[ClearDB] app_meta clear warning: {e}")
-
-        invalidate_summary_caches()
-
-        synced = 0
-        if sync_today:
-            today_str = today_jst_str()
-            today_clean = today_str.replace("-", "")
-            today_info = get_today_races(today_clean)
-            venues = today_info.get("venues", [])
-            for v in venues:
-                for r in v.get("races", []):
-                    try:
-                        fetch_shutuba_table(r["race_id"], race_date=today_str)
-                        synced += 1
-                    except Exception:
-                        pass
-
-        msg = f"全DBテーブル初期化完了 (本日同期: {synced}レース)"
-        print(f"[ClearDB] {msg}")
-        return {"status": "ok", "message": msg, "synced_races": synced}
-    except Exception as e:
-        err_msg = f"[ClearDB] 初期化エラー: {e}"
-        print(err_msg)
-        return {"status": "error", "message": str(e)}
-
-
-def check_and_apply_db_migration():
-    """DB構成・スキーマバージョンが変更された場合のみ、旧データをまっさらにしてバージョンを更新"""
-    if not supabase:
-        return
-    try:
-        saved_version = None
-        try:
-            m_res = supabase.table("keiba_app_meta").select("value").eq("key", "schema_version").execute()
-            if m_res.data and len(m_res.data) > 0:
-                saved_version = m_res.data[0]["value"].get("version")
-        except Exception:
-            pass
-
-        if not saved_version:
-            try:
-                res = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", "SCHEMA_VERSION").execute()
-                if res.data and len(res.data) > 0:
-                    saved_version = res.data[0]["data_json"].get("version")
-            except Exception:
-                pass
-
-        if saved_version != CURRENT_DB_VERSION:
-            print(f"[DB Migration] DB構成変更検知 ({saved_version} -> {CURRENT_DB_VERSION}): DBを初期化します。")
-            clear_all_database()
-            try:
-                supabase.table("keiba_app_meta").upsert({
-                    "key": "schema_version",
-                    "value": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
-                }).execute()
-            except Exception:
-                pass
-            try:
-                supabase.table("keiba_predictions_cache").upsert({
-                    "race_id": "SCHEMA_VERSION",
-                    "race_date": "9999-12-31",
-                    "data_json": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
-                }).execute()
-            except Exception:
-                pass
-            print(f"[DB Migration] 新バージョン {CURRENT_DB_VERSION} を正常に保存しました。")
-        else:
-            print(f"[DB Migration] DBバージョン ({saved_version}) は最新です。データ初期化はスキップします。")
-    except Exception as e:
-        print(f"[DB Migration] バージョン確認エラー: {e}")
+# fix_mislabeled_20261011_races, clear_all_database, check_and_apply_db_migration は app/maintenance/healer.py へ移管完了
+set_healer_dependencies(
+    today_jst_str=today_jst_str,
+    now_jst_naive=now_jst_naive,
+    parse_post_datetime=parse_post_datetime,
+    get_today_races=get_today_races,
+    predict_race_core=predict_race_core,
+    verify_race_result=verify_race_result,
+    ensure_daily_single_real_bet=ensure_daily_single_real_bet,
+    infer_odds_stage_from_minutes=infer_odds_stage_from_minutes,
+    get_cached_prediction=get_cached_prediction,
+    get_cached_result=get_cached_result,
+    all_predictions_cache=_all_predictions_cache,
+    today_races_cache=_today_races_cache,
+    last_weight_check_ts=_last_weight_check_ts,
+)
 
 
 @app.post("/admin/clear-db")
@@ -1666,142 +1373,7 @@ def endpoint_fix_20261011():
 
 
 
-def normalize_mislabeled_dates():
-    """2026-10-13等のフォールバック日および新潟0401の誤認日(2026-10-03)を正規の開催日へ修正"""
-    if not supabase:
-        print("[NormalizeDates] Supabase未接続のためスキップします。")
-        return {"status": "skipped", "message": "Supabase not connected"}
-
-    migrated_settlements = 0
-    migrated_results = 0
-    migrated_predictions = 0
-
-    try:
-        # 1. 4回新潟1日目 (2026040401xx) が 2026-10-03 と誤保存されているものを 2026-10-17 へ修正
-        for tbl_name in ("keiba_race_settlements", "keiba_race_results_cache", "keiba_predictions_cache", "keiba_scheduled_races"):
-            try:
-                res_niigata = supabase.table(tbl_name).select("race_id, race_date").like("race_id", "2026040401%").neq("race_date", "2026-10-17").execute()
-                for nrow in (res_niigata.data or []):
-                    nrid = nrow.get("race_id")
-                    if nrid:
-                        supabase.table(tbl_name).update({"race_date": "2026-10-17"}).eq("race_id", nrid).execute()
-                        if tbl_name == "keiba_race_settlements":
-                            migrated_settlements += 1
-            except Exception as ne:
-                print(f"[NormalizeDates] Niigata 0401 fix warning ({tbl_name}): {ne}")
-
-        res_s = supabase.table("keiba_race_settlements").select("race_id, race_date").eq("race_date", "2026-10-13").execute()
-        rows_s = res_s.data or []
-        for row in rows_s:
-            r_id = row.get("race_id", "")
-            correct_date = resolve_race_date_for_id(r_id)
-
-            if correct_date and correct_date != "2026-10-13":
-                supabase.table("keiba_race_settlements").update({"race_date": correct_date}).eq("race_id", r_id).execute()
-                migrated_settlements += 1
-
-                try:
-                    supabase.table("keiba_race_results_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
-                    migrated_results += 1
-                except Exception:
-                    pass
-                try:
-                    supabase.table("keiba_predictions_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
-                    migrated_predictions += 1
-                except Exception:
-                    pass
-
-        # keiba_scheduled_races の 2026-10-13 レコードも更新・整理
-        try:
-            res_sc = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", "2026-10-13").execute()
-            for row_sc in (res_sc.data or []):
-                sc_id = row_sc.get("race_id", "")
-                c_date = resolve_race_date_for_id(sc_id)
-                if c_date and c_date != "2026-10-13":
-                    supabase.table("keiba_scheduled_races").update({"race_date": c_date}).eq("race_id", sc_id).execute()
-                else:
-                    supabase.table("keiba_scheduled_races").delete().eq("race_id", sc_id).execute()
-        except Exception as e:
-            print(f"[NormalizeDates] scheduled_races cleanup error: {e}")
-
-        if migrated_settlements > 0 or migrated_results > 0 or migrated_predictions > 0:
-            invalidate_summary_caches()
-
-        msg = f"日付正規化完了: settlements={migrated_settlements}件, results={migrated_results}件, predictions={migrated_predictions}件"
-        print(f"[NormalizeDates] {msg}")
-        return {"status": "ok", "message": msg}
-    except Exception as e:
-        err_msg = f"[NormalizeDates] 修正処理エラー: {e}"
-        print(err_msg)
-        return {"status": "error", "message": str(e)}
-
-
-def sync_and_process_target_dates(target_dates: List[str]):
-    """指定開催日（例: ['2026-09-26', '2026-09-27']）の全レースを keiba_scheduled_races に登録し、全レース予想＆結果検証を実行"""
-    if not supabase:
-        print("[Process Dates] Supabase未接続")
-        return {"status": "error", "message": "Supabase not connected"}
-
-    total_scheduled = 0
-    total_predicted = 0
-    total_settled = 0
-    all_races = []
-
-    for d_str in target_dates:
-        venues = fetch_venues_for_date_raw(d_str)
-        race_items = [r for v in venues for r in v.get("races", [])]
-        rows_to_upsert = []
-        for r in race_items:
-            r_id = r["race_id"]
-            r_info = r.get("race_info") or r.get("race_name") or ""
-            m = re.search(r"(\d{1,2}):(\d{2})", r_info)
-            hour, minute = (int(m.group(1)), int(m.group(2))) if m else (15, 0)
-            d_parts = [int(p) for p in d_str.split("-")]
-            post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
-            rows_to_upsert.append({
-                "race_id": r_id,
-                "race_date": d_str,
-                "race_name": r.get("race_name", r.get("race_no", "")),
-                "post_datetime": post_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "is_predicted": 0,
-                "is_settled": 0,
-                "retry_count": 0
-            })
-            all_races.append((d_str, r_id))
-        if rows_to_upsert:
-            try:
-                supabase.table("keiba_scheduled_races").upsert(rows_to_upsert, on_conflict="race_id").execute()
-                total_scheduled += len(rows_to_upsert)
-            except Exception as e:
-                print(f"[Schedule] upsert error for {d_str}: {e}")
-
-    # 全レースの予想 ＆ 結果検証を一括実行
-    for d_str, r_id in all_races:
-        try:
-            predict_race_core(r_id, force_refresh=True)
-            total_predicted += 1
-            if supabase:
-                supabase.table("keiba_scheduled_races").update({"is_predicted": 2}).eq("race_id", r_id).execute()
-        except Exception as pe:
-            print(f"[Predict Error] {r_id}: {pe}")
-
-        try:
-            verify_race_result(r_id, bypass_cache=True)
-            total_settled += 1
-            if supabase:
-                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", r_id).execute()
-        except Exception as se:
-            print(f"[Settle Error] {r_id}: {se}")
-
-    msg = f"{', '.join(target_dates)} 全レース処理完了: スケジュール登録={total_scheduled}R, 予想={total_predicted}R, 検証={total_settled}R"
-    print(f"[Batch Process] {msg}")
-    return {
-        "status": "ok",
-        "message": msg,
-        "scheduled_count": total_scheduled,
-        "predicted_count": total_predicted,
-        "settled_count": total_settled
-    }
+# normalize_mislabeled_dates, sync_and_process_target_dates は app/maintenance/healer.py へ移管完了
 
 
 def sync_and_process_1003_1004():
@@ -2170,192 +1742,13 @@ def endpoint_debug_track_bias(race_id: str):
     }
 
 
-def fix_duplicated_horses_cache_2026():
-    """出馬表パース時の重複取得（1番二重登録等）を含む予測キャッシュを自動検知してクリア（当日分のみ高速チェック）"""
-    if not supabase:
-        return
-    try:
-        res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", today_jst_str()).execute()
-        rids_to_clear = []
-        for row in (res.data or []):
-            rid = row.get("race_id")
-            dj = row.get("data_json") or {}
-            horses = dj.get("horses", [])
-            umaban_list = [h.get("umaban") for h in horses if "umaban" in h and h.get("umaban") is not None]
-            if len(umaban_list) != len(set(umaban_list)):
-                rids_to_clear.append(rid)
-        if rids_to_clear:
-            print(f"[FixDuplicates] 馬番重複を検知した {len(rids_to_clear)} レースのキャッシュをリセットします: {rids_to_clear}")
-            supabase.table("keiba_predictions_cache").delete().in_("race_id", rids_to_clear).execute()
-    except Exception as e:
-        print(f"[FixDuplicates] クリーンアップ例外: {e}")
-
-
-def heal_today_weights_and_results(target_date: Optional[str] = None, force_resettle: bool = False) -> dict:
-    """指定日(デフォルト本日)の馬体重未反映レースおよび結果未検証レースを一括補完・検証"""
-    if not supabase:
-        return {"status": "error", "message": "Supabase not connected"}
-
-    t_date = target_date or today_jst_str()
-    normalize_mislabeled_dates()
-    ensure_daily_single_real_bet(t_date)
-
-    now_dt = now_jst_naive()
-    sched_res = supabase.table("keiba_scheduled_races").select("*").eq("race_date", t_date).order("race_id").execute()
-    sched_rows = sched_res.data or []
-
-    pred_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", t_date).execute()
-    pred_map = {r["race_id"]: (r.get("data_json") or {}) for r in (pred_res.data or []) if r.get("race_id")}
-
-    settle_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass, target_umaban").eq("race_date", t_date).execute()
-    settle_rows = settle_res.data or []
-    settled_rids = {
-        r["race_id"] for r in settle_rows
-        if r.get("actual_order") is not None or r.get("is_pass") in (1, True)
-    }
-    settle_pass_map = {r["race_id"]: r.get("is_pass") for r in settle_rows if r.get("race_id")}
-    settle_target_map = {r["race_id"]: r.get("target_umaban") for r in settle_rows if r.get("race_id")}
-
-    healed_weights = []
-    settled_now = []
-    errors = []
-
-    for sr in sched_rows:
-        rid = sr["race_id"]
-        p_dt_str = sr.get("post_datetime", "")
-        post_dt = parse_post_datetime(p_dt_str, t_date) or now_dt
-
-        mins_to_post = (post_dt - now_dt).total_seconds() / 60.0 if t_date == today_jst_str() else -999.0
-        dj = pred_map.get(rid) or {}
-        horses = dj.get("horses", [])
-        has_weights = any(h.get("horse_weight") is not None for h in horses)
-
-        # 1. 馬体重の補完・最新化 (発走58分前以降の全レース)
-        if not has_weights and mins_to_post <= 58.0:
-            try:
-                _last_weight_check_ts.pop(rid, None)
-                if mins_to_post > 0:
-                    stg = infer_odds_stage_from_minutes(mins_to_post)
-                    updated_p = predict_race_core(rid, force_refresh=True, is_auto_final=(stg == "05m"), odds_stage=stg)
-                else:
-                    # 発走後は買い目を変えずに馬体重・性齢のみ補完
-                    updated_p = predict_race_core(rid, force_refresh=False, is_auto_final=False, odds_stage=None)
-                if any(h.get("horse_weight") is not None for h in (updated_p or {}).get("horses", [])):
-                    healed_weights.append(rid)
-            except Exception as we:
-                errors.append(f"weight({rid}): {we}")
-
-        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース または 仮想馬券でis_pass=1のままのレース または 本命馬番不整合レース)
-        is_real_target = bool((dj.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
-        is_virt_target = bool(
-            sr.get("is_virtual_bet_target")
-            or (dj.get("hybrid_recommendation") or {}).get("is_virtual_bet_target")
-            or sr.get("real_bet_level") == "virtual"
-            or (sr.get("real_bet_badge") and "仮想" in str(sr.get("real_bet_badge")))
-        ) and not is_real_target
-        pred_target_u = (dj.get("recommendation") or {}).get("target_umaban")
-        needs_target_resettle = pred_target_u is not None and (settle_target_map.get(rid) is not None) and (settle_target_map.get(rid) != pred_target_u)
-        needs_real_resettle = is_real_target and (settle_pass_map.get(rid) in (1, True))
-        needs_virt_resettle = is_virt_target and (settle_pass_map.get(rid) in (1, True))
-        if mins_to_post <= -8.0 and (force_resettle or rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle or needs_virt_resettle or needs_target_resettle):
-            try:
-                verify_race_result(rid, bypass_cache=True, is_19h_settle=False)
-                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", rid).execute()
-                settled_now.append(rid)
-            except Exception as se:
-                errors.append(f"settle({rid}): {se}")
-
-    _all_predictions_cache.pop(t_date, None)
-    _today_races_cache.pop(t_date, None)
-    invalidate_summary_caches()
-
-    return {
-        "status": "ok",
-        "date": t_date,
-        "healed_weights_count": len(healed_weights),
-        "healed_weights_races": healed_weights,
-        "settled_now_count": len(settled_now),
-        "settled_now_races": settled_now,
-        "errors": errors
-    }
+# fix_duplicated_horses_cache_2026, heal_today_weights_and_results は app/maintenance/healer.py へ移管完了
 
 
 @app.post("/admin/heal-settlement-marks")
 @app.get("/admin/heal-settlement-marks")
-def heal_settlement_marks(date: Optional[str] = Query(None, description="修復対象日付 (YYYY-MM-DD, 省略時は全期間)")):
-    """keiba_race_settlements の印・本命馬・確定着順を最新の predictions_cache と results_cache から走査して一括自己修復"""
-    if not supabase:
-        return {"status": "error", "message": "Supabase not connected"}
-
-    query = supabase.table("keiba_race_settlements").select("*")
-    if date:
-        query = query.eq("race_date", date)
-    res = query.order("race_id", desc=True).limit(200).execute()
-    rows = res.data or []
-
-    repaired = []
-    for r in rows:
-        rid = r["race_id"]
-        r_date = r.get("race_date")
-        pred = get_cached_prediction(rid)
-        result = get_cached_result(rid)
-        if pred and result:
-            pred_target = (pred.get("recommendation") or {}).get("target_umaban")
-            if pred_target is None:
-                for h in pred.get("horses", []):
-                    if h.get("mark") == "◎":
-                        pred_target = int(h.get("umaban"))
-                        break
-            orders = result.get("orders", {})
-            fresh_top3 = extract_top3_orders(pred, orders)
-            fresh_marks = extract_mark_orders(pred, orders)
-
-            needs_update = False
-            update_payload = {}
-
-            if pred_target is not None and r.get("target_umaban") != pred_target:
-                # 本命馬番が不一致 -> process_settlement_calculation で完全再計算
-                try:
-                    process_settlement_calculation(
-                        race_id=rid,
-                        race_date=r_date,
-                        race_name=r.get("race_name", f"Race {rid}"),
-                        pred_data=pred,
-                        race_res=result,
-                        from_cache=True
-                    )
-                    repaired.append({"race_id": rid, "type": "target_umaban_recalculated", "old_target": r.get("target_umaban"), "new_target": pred_target})
-                    continue
-                except Exception as e_recalc:
-                    print(f"[HealMarks Recalc Error] {rid}: {e_recalc}")
-
-            if fresh_top3 and fresh_top3 != r.get("top3_orders"):
-                update_payload["top3_orders"] = fresh_top3
-                needs_update = True
-
-            if fresh_marks and fresh_marks != (r.get("bet_details") or {}).get("real_bet_meta", {}).get("mark_orders"):
-                b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
-                rb_meta = b_det.get("real_bet_meta") if isinstance(b_det.get("real_bet_meta"), dict) else {}
-                rb_meta["mark_orders"] = fresh_marks
-                rb_meta["top3_orders"] = fresh_top3
-                b_det["real_bet_meta"] = rb_meta
-                update_payload["bet_details"] = b_det
-                needs_update = True
-
-            if needs_update:
-                try:
-                    supabase.table("keiba_race_settlements").update(update_payload).eq("race_id", rid).execute()
-                    repaired.append({"race_id": rid, "type": "marks_synchronized"})
-                except Exception as e_up:
-                    print(f"[HealMarks Update Error] {rid}: {e_up}")
-
-    invalidate_summary_caches()
-    return {
-        "status": "ok",
-        "scanned_count": len(rows),
-        "repaired_count": len(repaired),
-        "repaired_details": repaired
-    }
+def endpoint_heal_settlement_marks(date: Optional[str] = Query(None, description="修復対象日付 (YYYY-MM-DD, 省略時は全期間)")):
+    return heal_settlement_marks(date=date)
 
 
 @app.post("/admin/heal-today")
