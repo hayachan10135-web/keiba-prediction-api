@@ -2804,7 +2804,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         race_date_str=r_date_str,
         force_final_odds=force_final_flag,
         real_trio_odds=trio_real_map,
-        track_bias_data=track_bias_data
+        track_bias_data=track_bias_data,
+        is_daily_top_race=is_daily_top_race
     )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
@@ -2853,7 +2854,8 @@ def compute_hybrid_rec_from_inputs(
     race_date_str: str,
     force_final_odds: bool = False,
     real_trio_odds: Optional[dict] = None,
-    track_bias_data: Optional[dict] = None
+    track_bias_data: Optional[dict] = None,
+    is_daily_top_race: bool = False
 ) -> dict:
     """
     【B -> A -> C カスケード動的配分モデル × トラックバイアス・オッズ推移連動】
