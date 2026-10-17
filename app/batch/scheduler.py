@@ -238,10 +238,16 @@ async def background_maintenance_loop():
                                 print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
 
                                 h_rec = pred_res.get("hybrid_recommendation") or {}
-                                if h_rec.get("is_real_bet_target"):
-                                    badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
+                                is_special_test = (r_id in {"202604040201", "202608040701", "202605040702"} and today_str == "2026-10-18")
+                                if h_rec.get("is_real_bet_target") or is_special_test:
+                                    badge = ("🧪【実機投票テスト】特別対象枠" if is_special_test and not h_rec.get("is_real_bet_target") else h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)"))
                                     edge = h_rec.get("edge_ratio", 0.0)
                                     target_u = pred_res.get("recommendation", {}).get("target_umaban")
+                                    if not target_u:
+                                        for h in pred_res.get("horses", []):
+                                            if h.get("mark") == "◎":
+                                                target_u = int(h.get("umaban"))
+                                                break
                                     h_name = pred_res.get("recommendation", {}).get("horse_name", "")
                                     r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
 
@@ -253,8 +259,20 @@ async def background_maintenance_loop():
                                         + (h_rec.get("trio_bets") or [])
                                         + (h_rec.get("sanrentan_bets") or [])
                                     )
+                                    if not all_tickets and is_special_test and target_u:
+                                        all_tickets = [
+                                            {
+                                                "ticket_type": "単勝",
+                                                "combination": [target_u],
+                                                "combination_str": f"{target_u}",
+                                                "amount": 100
+                                            }
+                                        ]
+                                        tot_amt = 100
+                                    else:
+                                        tot_amt = h_rec.get("total_amount", 0)
+
                                     bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])
-                                    tot_amt = h_rec.get("total_amount", 0)
 
                                     body_text = f"◎{target_u}番 {h_name} (期待エッジ:{edge}倍)\n【推奨買い目】{bets_summary} 計{tot_amt:,}円"
                                     if _send_fcm_notification_fn:

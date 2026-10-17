@@ -358,6 +358,14 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
 
+            # 本日実機投票テスト対象レースの特別バッジ付与 (朝08:30以降)
+            if rid in {"202604040201", "202608040701", "202605040702"} and formatted_date == "2026-10-18" and not race.get("is_settled"):
+                if not race.get("is_real_bet_target"):
+                    race["is_real_bet_target"] = True
+                    race["real_bet_badge"] = "🧪【実機投票テスト】特別対象枠"
+                    race["real_bet_level"] = "standard"
+                    race["is_virtual_bet_target"] = False
+
         # 過去日（昨日以前）の場合は既にレース結果が確定しているため、動的な仮想枠再選考・上書きはスキップ！
         if formatted_date < today_jst_str():
             continue
