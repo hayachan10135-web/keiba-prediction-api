@@ -2343,6 +2343,11 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         top_dj["recommendation"] = top_rec
 
         supabase.table("keiba_predictions_cache").update({"data_json": top_dj}).eq("race_id", top_rid).execute()
+        # 厳選勝負レースの発走5分前自動推論＆即PAT発注が確実に作動するよう is_predicted を 1 にリセット
+        try:
+            supabase.table("keiba_scheduled_races").update({"is_predicted": 1}).eq("race_id", top_rid).execute()
+        except Exception:
+            pass
         print(f"[DailySingleRealBet] {target_date}: 厳選No.1勝負レースとして {top_rid} (◎{w0_u}番 {w0_name}) を選出・設定しました。")
 
         # 当日の他の全レース（発走済み含む）の is_real_bet_target を False にリセット
