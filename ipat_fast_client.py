@@ -20,13 +20,6 @@ from typing import Dict, Any, List, Optional
 import requests
 from bs4 import BeautifulSoup
 
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
 TICKET_TYPE_MAP = {
     "単勝": "1",
     "複勝": "2",
@@ -48,30 +41,6 @@ VENUE_CODE_MAP = {
     "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
 }
 
-
-def _load_fallback_env() -> Dict[str, str]:
-    """ローカル実行時など環境変数が未設定の場合に .env ファイルから読み込む"""
-    candidates = [
-        os.path.join(os.path.dirname(__file__), ".env"),
-        os.path.join(os.path.dirname(__file__), "..", "auto_betting", ".env"),
-    ]
-    env_map: Dict[str, str] = {}
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        k, v = line.split("=", 1)
-                        env_map[k.strip()] = v.strip().strip('"').strip("'")
-                break
-            except Exception:
-                pass
-    return env_map
-
-
 class IPATFastClient:
     """即PAT ガラケーWeb (g.ipat.jra.go.jp) 専用クライアント"""
 
@@ -83,79 +52,56 @@ class IPATFastClient:
         pin: Optional[str] = None,
         pars: Optional[str] = None,
     ):
-        fallback = _load_fallback_env()
-        self.user_num = (user_num or os.getenv("IPAT_USER_NUM") or fallback.get("IPAT_USER_NUM") or "").strip()
-        self.pin = (pin or os.getenv("IPAT_PIN") or fallback.get("IPAT_PIN") or "").strip()
-        self.pars = (pars or os.getenv("IPAT_PARS") or fallback.get("IPAT_PARS") or "").strip()
+        self.user_num = user_num or os.getenv("IPAT_USER_NUM", "")
+        self.pin = pin or os.getenv("IPAT_PIN", "")
+        self.pars = pars or os.getenv("IPAT_PARS", "")
 
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-            ),
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
             "Referer": "https://g.ipat.jra.go.jp/"
         })
-        self.emenu_data: Dict[str, str] = {}
+        self.session_data: Dict[str, str] = {}
         self.last_balance = 0
 
-    @staticmethod
-    def _decode_euc(resp: requests.Response) -> str:
-        try:
-            return resp.content.decode("euc-jp", errors="replace")
-        except Exception:
-            return resp.text
-
-    @staticmethod
-    def _extract_form_hidden_inputs(form_tag) -> Dict[str, str]:
-        if not form_tag:
-            return {}
-        data: Dict[str, str] = {}
-        for inp in form_tag.find_all("input"):
-            itype = (inp.get("type") or "").lower()
-            name = inp.get("name")
-            if name and itype not in ("submit", "reset", "button"):
-                data[name] = inp.get("value", "")
-        return data
-
     def login(self) -> Dict[str, Any]:
-        """即PATへログインし、購入限度額（残高）と選択入力フォーム(emenu)を取得"""
+        """即PATへログインし、購入限度額（残高）を取得"""
         if not self.user_num or not self.pin or not self.pars:
             return {
                 "success": False,
-                "error": "即PAT認証情報が未設定です。環境変数 (IPAT_USER_NUM, IPAT_PIN, IPAT_PARS) を設定してください。"
+                "error": "即PAT認証情報が未設定です。Renderの環境変数 (IPAT_USER_NUM, IPAT_PIN, IPAT_PARS) を設定してください。"
             }
         try:
             r1 = self.session.get(f"{self.BASE_URL}/", timeout=10)
-            html1 = self._decode_euc(r1)
-            soup1 = BeautifulSoup(html1, "html.parser")
+            r1.encoding = "euc-jp"
+            soup1 = BeautifulSoup(r1.text, "html.parser")
             form1 = soup1.find("form")
             if not form1:
                 return {"success": False, "error": "即PATログインページを取得できませんでした"}
 
             action = form1.get("action") or "kw_020.cgi"
-            post_data = self._extract_form_hidden_inputs(form1)
+            post_data = {inp.get("name"): inp.get("value", "") for inp in form1.find_all("input") if inp.get("name")}
             post_data["i"] = self.user_num
             post_data["p"] = self.pin
             post_data["r"] = self.pars
 
             r2 = self.session.post(f"{self.BASE_URL}/{action}", data=post_data, timeout=10)
-            page_text = self._decode_euc(r2)
+            r2.encoding = "euc-jp"
+            page_text = r2.text
 
             if "間違っています" in page_text or "エラー" in page_text or "ログイン画面から" in page_text:
                 return {"success": False, "error": "即PATログイン認証エラー (加入者番号・暗証番号・PARSをご確認ください)"}
 
+            # メニュー画面からセッションパラメータ（u, g, mli）を保存
             soup2 = BeautifulSoup(page_text, "html.parser")
-            emenu_form = soup2.find("form", {"name": "emenu"}) or soup2.find("form", {"action": "kw_150.cgi"})
-            if not emenu_form:
-                return {"success": False, "error": "即PAT投票メニュー(kw_150.cgi)が見つかりませんでした（受付時間外またはメンテナンス中）"}
-
-            self.emenu_data = self._extract_form_hidden_inputs(emenu_form)
-            if "pr" not in self.emenu_data:
-                self.emenu_data["pr"] = "new00"
+            for inp in soup2.find_all("input"):
+                name = inp.get("name")
+                val = inp.get("value")
+                if name and val is not None and name in ("u", "g", "mli", "nbs"):
+                    self.session_data[name] = val
 
             # 残高パース
-            m = re.search(r"購入限度額[\s\S]{0,60}?([\d,]+)\s*円", page_text)
+            m = re.search(r"購入限度額[\s\S]{0,40}?([\d,]+)\s*円", page_text)
             balance = int(m.group(1).replace(",", "")) if m else 0
             self.last_balance = balance
 
@@ -176,17 +122,17 @@ class IPATFastClient:
     ) -> Dict[str, Any]:
         """
         即PATへ指定された買い目を一括発注
-        items: [{"ticket_type": "単勝", "combination": [12], "amount": 700}, ...]
+        items: [{"ticket_type": "単勝", "combination": [7], "amount": 1000}, ...]
         """
         if not items:
             return {"status": "skipped", "reason": "買い目が空です"}
 
-        total_amount = sum(int(item.get("amount", 0)) for item in items)
+        total_amount = sum(int(item.get("amount", 0)) for item in items if int(item.get("amount", 0)) >= 100)
         print(f"[IPATFast] 発注開始: {venue_name}{race_no}R {len(items)}件 計{total_amount:,}円 (dry_run={dry_run})")
 
         # 1. ログイン
         l_res = self.login()
-        if not l_res.get("success"):
+        if not l_res["success"]:
             return {"status": "failed", "step": "login", "error": l_res.get("error")}
 
         current_balance = l_res.get("balance", 0)
@@ -195,136 +141,117 @@ class IPATFastClient:
             print(f"[IPATFast] ⚠️ {msg}")
             return {"status": "aborted", "step": "balance_check", "reason": msg}
 
+        if dry_run:
+            return {
+                "status": "dry_run_success",
+                "receipt_no": "DRY-RUN",
+                "total_amount": total_amount,
+                "items_count": len(items),
+                "balance": current_balance
+            }
+
         # 2. 順次買い目投入 (kw_150 ➔ kw_160 ➔ kw_170)
         added_count = 0
-        next_kw150_payload = dict(self.emenu_data)
-        last_soup_170 = None
-
+        added_amount = 0
         try:
+            # 選択入力メニュー (kw_150.cgi) を開く
+            kw150_data = dict(self.session_data)
+            kw150_data["pr"] = "new00"
+            r_sel = self.session.post(f"{self.BASE_URL}/kw_150.cgi", data=kw150_data, timeout=10)
+            r_sel.encoding = "euc-jp"
+            soup_sel = BeautifulSoup(r_sel.text, "html.parser")
+
+            # 競馬場選択肢の option value を取得
+            venue_val = None
+            j_select = soup_sel.find("select", {"name": "j"})
+            if j_select:
+                for opt in j_select.find_all("option"):
+                    if venue_name in opt.get_text():
+                        venue_val = opt.get("value")
+                        break
+            if not venue_val:
+                return {"status": "failed", "step": "select_venue", "error": f"競馬場 {venue_name} が選択肢に見つかりませんでした"}
+
+            # 各買い目を投入
             for idx, item in enumerate(items):
-                t_type = item.get("ticket_type", "単勝")
-                y_code = TICKET_TYPE_MAP.get(t_type, "1")
-                combo = item.get("combination") or []
+                t_type = str(item.get("ticket_type", "単勝")).strip()
+                y_code = TICKET_TYPE_MAP.get(t_type)
+                if not y_code:
+                    return {"status": "failed", "step": "validate_ticket", "error": f"未対応の式別です: {t_type}"}
+                raw_combo = item.get("combination") or []
                 amt = int(item.get("amount", 100))
-                if not combo or amt < 100:
+                if not raw_combo or amt < 100:
                     continue
+                combo = [int(x) for x in raw_combo]
+                # 順不同馬券（枠連・馬連・ワイド・3連複）は昇順ソート
+                if y_code in ("3", "4", "5", "7"):
+                    combo = sorted(combo)
                 amt_unit = str(max(1, amt // 100))
 
-                # (A) kw_150.cgi を開く (1件目は emenu_data、2件目以降は kw_170 の newXX フォーム)
-                r_150 = self.session.post(f"{self.BASE_URL}/kw_150.cgi", data=next_kw150_payload, timeout=10)
-                html_150 = self._decode_euc(r_150)
-                soup_150 = BeautifulSoup(html_150, "html.parser")
+                # kw_160.cgi へPOST (場・レース・式別指定)
+                form_data_160 = dict(self.session_data)
+                form_data_160["j"] = venue_val
+                form_data_160["m"] = str(race_no)
+                form_data_160["y"] = y_code
+                form_data_160["w"] = ""
 
-                form_150 = soup_150.find("form", {"action": "kw_160.cgi"}) or soup_150.find("form", {"name": "next"})
-                if not form_150:
-                    return {"status": "failed", "step": "kw_150", "error": "選択入力画面(kw_150)のフォーム取得に失敗しました"}
+                r_160 = self.session.post(f"{self.BASE_URL}/kw_160.cgi", data=form_data_160, timeout=10)
+                r_160.encoding = "euc-jp"
 
-                # 競馬場選択肢の option value を取得 (当日分を優先)
-                venue_val = None
-                j_select = form_150.find("select", {"name": "j"}) or soup_150.find("select", {"name": "j"})
-                if j_select:
-                    for opt in j_select.find_all("option"):
-                        if venue_name in opt.get_text():
-                            venue_val = opt.get("value")
-                            break
-                if not venue_val:
-                    return {"status": "failed", "step": "select_venue", "error": f"競馬場 {venue_name} が選択肢に見つかりませんでした"}
-
-                # (B) kw_160.cgi へPOST (場・レース・式別指定)
-                payload_160 = self._extract_form_hidden_inputs(form_150)
-                payload_160["j"] = venue_val
-                payload_160["m"] = str(race_no)
-                payload_160["y"] = y_code
-                payload_160["w"] = ""
-
-                r_160 = self.session.post(f"{self.BASE_URL}/kw_160.cgi", data=payload_160, timeout=10)
-                html_160 = self._decode_euc(r_160)
-                if "締切" in html_160 or "受付を終了" in html_160:
-                    return {"status": "failed", "step": "kw_160", "error": f"{venue_name}{race_no}R は既に投票締切です"}
-
-                soup_160 = BeautifulSoup(html_160, "html.parser")
-                form_160 = soup_160.find("form", {"action": "kw_170.cgi"}) or soup_160.find("form", {"name": "smenu"})
-                if not form_160:
-                    return {"status": "failed", "step": "kw_160_form", "error": f"馬番入力画面(kw_160)への遷移に失敗しました"}
-
-                # (C) kw_170.cgi へPOST (馬番・金額投入)
-                payload_170 = self._extract_form_hidden_inputs(form_160)
+                # kw_170.cgi へPOST (馬番・金額投入)
+                form_data_170 = dict(self.session_data)
                 if len(combo) >= 1:
-                    payload_170["h1"] = f"{int(combo[0]):02d}"
+                    form_data_170["h1"] = f"{int(combo[0]):02d}"
                 if len(combo) >= 2:
-                    payload_170["h2"] = f"{int(combo[1]):02d}"
+                    form_data_170["h2"] = f"{int(combo[1]):02d}"
                 if len(combo) >= 3:
-                    payload_170["h3"] = f"{int(combo[2]):02d}"
-                payload_170["un"] = amt_unit
+                    form_data_170["h3"] = f"{int(combo[2]):02d}"
+                form_data_170["un"] = amt_unit
 
-                r_170 = self.session.post(f"{self.BASE_URL}/kw_170.cgi", data=payload_170, timeout=10)
-                html_170 = self._decode_euc(r_170)
-                if "正しくありません" in html_170 or "エラー" in html_170:
-                    return {"status": "failed", "step": "kw_170", "error": f"買い目入力エラー: {t_type} {combo}"}
+                r_170 = self.session.post(f"{self.BASE_URL}/kw_170.cgi", data=form_data_170, timeout=10)
+                r_170.encoding = "euc-jp"
+                if "正しくありません" not in r_170.text and "エラー" not in r_170.text:
+                    added_count += 1
+                    added_amount += (int(amt_unit) * 100)
+                    # セッションパラメータ更新
+                    soup_170 = BeautifulSoup(r_170.text, "html.parser")
+                    for inp in soup_170.find_all("input"):
+                        n, v = inp.get("name"), inp.get("value")
+                        if n in ("u", "g", "mli", "nbs") and v:
+                            self.session_data[n] = v
 
-                soup_170 = BeautifulSoup(html_170, "html.parser")
-                last_soup_170 = soup_170
-                added_count += 1
-
-                # 次の買い目がある場合は「N件目入力」フォーム (action="kw_150.cgi") のパラメータを準備
-                form_add_more = soup_170.find("form", {"action": "kw_150.cgi"})
-                if form_add_more:
-                    next_kw150_payload = self._extract_form_hidden_inputs(form_add_more)
-                    new_btn = form_add_more.find("input", {"name": re.compile(r"^new\d+")})
-                    if new_btn and new_btn.get("name"):
-                        next_kw150_payload[new_btn.get("name")] = new_btn.get("value", "次件入力")
-
-            if added_count == 0 or not last_soup_170:
+            if added_count == 0:
                 return {"status": "failed", "step": "add_tickets", "error": "買い目が1件も投入できませんでした"}
 
-            # 3. 確認画面フォーム (action="kw_180.cgi") の検証
-            form_180 = last_soup_170.find("form", {"action": "kw_180.cgi"})
-            if not form_180:
-                return {"status": "failed", "step": "confirm_170", "error": "最終投票フォーム(kw_180.cgi)が見つかりませんでした"}
-
-            confirm_data = self._extract_form_hidden_inputs(form_180)
-            expected_l = int(confirm_data.get("l") or total_amount)
-
-            if dry_run:
-                print(f"[IPATFast] 🛡️ DRY-RUN 成功: 投票内容一覧(kw_170.cgi)にて {added_count}件 (合計 l={expected_l:,}円) の受理を確認しました。")
-                return {
-                    "status": "dry_run_success",
-                    "receipt_no": "DRY-RUN",
-                    "total_amount": expected_l,
-                    "items_count": added_count,
-                    "balance": current_balance
-                }
-
-            # 4. 最終購入確定 (kw_170 ➔ kw_180 投票ボタン押下)
-            confirm_data["s"] = str(expected_l)
+            # 3. 最終購入確定 (kw_170 ➔ kw_180 投票ボタン押下)
+            confirm_data = dict(self.session_data)
+            confirm_data["s"] = str(added_amount)
             confirm_data["tou"] = "投票"
 
             r_final = self.session.post(f"{self.BASE_URL}/kw_180.cgi", data=confirm_data, timeout=15)
-            f_text = self._decode_euc(r_final)
+            r_final.encoding = "euc-jp"
+            f_text = r_final.text
 
             # 暗証番号再確認が求められた場合
-            soup_final = BeautifulSoup(f_text, "html.parser")
-            if "暗証番号" in f_text and soup_final.find("input", {"name": "p"}):
-                f_pin = soup_final.find("form")
-                pin_data = self._extract_form_hidden_inputs(f_pin)
+            if "暗証番号" in f_text and "p" in [inp.get("name") for inp in BeautifulSoup(f_text, "html.parser").find_all("input")]:
+                pin_data = dict(self.session_data)
                 pin_data["p"] = self.pin
                 r_final = self.session.post(f"{self.BASE_URL}/kw_180.cgi", data=pin_data, timeout=15)
-                f_text = self._decode_euc(r_final)
-
-            if ("エラー" in f_text or "正しくありません" in f_text) and "受付番号" not in f_text and "受け付けました" not in f_text:
-                return {"status": "failed", "step": "submit_180", "error": "最終投票送信時にエラーが返されました"}
+                r_final.encoding = "euc-jp"
+                f_text = r_final.text
 
             m_rcpt = re.search(r"受付番号[^\d\n]*(\d+)", f_text)
             receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
-            print(f"[IPATFast] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {expected_l:,}円)")
+            balance_after = max(0, current_balance - added_amount)
+            self.last_balance = balance_after
+            print(f"[IPATFast] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
 
             return {
                 "status": "success",
-                "platform": "ipat",
                 "receipt_no": receipt_no,
-                "total_amount": expected_l,
+                "total_amount": added_amount,
                 "items_count": added_count,
-                "balance": max(0, current_balance - expected_l),
+                "balance": balance_after,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
         except Exception as e:

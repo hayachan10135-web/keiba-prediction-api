@@ -349,16 +349,19 @@ class UMACAFastClient:
                 return {"status": "failed", "step": "form_s", "error": "投票フォーム(s)の取得に失敗しました"}
 
             encoded_count = 0
-            for idx, item in enumerate(items):
+            encoded_amount = 0
+            for item in items:
                 t_type = item.get("ticket_type", "単勝")
                 combo = item.get("combination") or []
                 amt = int(item.get("amount", 100))
                 if not combo or amt < 100:
                     continue
-                code27 = self.encode_ticket_code(idx, jyo_hex, race_no, day_hex, t_type, combo, amt)
-                key = f"{idx + 1:03d}"
+                unit_amt = max(1, amt // 100) * 100
+                code27 = self.encode_ticket_code(encoded_count, jyo_hex, race_no, day_hex, t_type, combo, unit_amt)
+                key = f"{encoded_count + 1:03d}"
                 form_s[key] = code27
                 encoded_count += 1
+                encoded_amount += unit_amt
 
             if encoded_count == 0:
                 return {"status": "failed", "step": "encode_tickets", "error": "有効な買い目がありません"}
@@ -384,28 +387,27 @@ class UMACAFastClient:
                 return {"status": "failed", "step": "confirm_form", "error": "確認画面フォーム(FORM0)が見つかりませんでした"}
 
             if dry_run:
-                print(f"[UMACAFast] 🛡️ DRY-RUN 成功: 確認画面 (pw_741_i.cgi) にて {encoded_count}件 (計{total_amount:,}円) の受理を確認しました。")
+                print(f"[UMACAFast] 🛡️ DRY-RUN 成功: 確認画面 (pw_741_i.cgi) にて {encoded_count}件 (計{encoded_amount:,}円) の受理を確認しました。")
                 return {
                     "status": "dry_run_success",
                     "receipt_no": "DRY-RUN",
-                    "total_amount": total_amount,
+                    "total_amount": encoded_amount,
                     "items_count": encoded_count,
                     "balance": current_balance,
                     "validated_codes": active_nbs,
                 }
 
             # 4. 最終投票確定 (pw_742_i.cgi) へPOST
-            # SendNB() と ToSend() の処理を完全再現 (001〜255 の全スロットに Nb[0..254] をセット)
-            for slot_idx in range(255):
-                key = f"{slot_idx + 1:03d}"
-                form_741[key] = active_nbs[slot_idx] if slot_idx < len(active_nbs) else "0"
-            form_741["l"] = str(total_amount)
-            form_741["s"] = str(total_amount)
+            # SendNB() と ToSend() の処理を再現
+            for i, nb_val in enumerate(active_nbs):
+                form_741[f"{i + 1:03d}"] = nb_val
+            form_741["l"] = str(encoded_amount)
+            form_741["s"] = str(encoded_amount)
 
             r_742 = self.session.post(f"{self.BASE_URL}/pw_742_i.cgi", data=form_741, timeout=15)
             html_742 = self._decode_euc(r_742)
 
-            if ("エラー" in html_742 or "正しくありません" in html_742) and ("受付番号" not in html_742 and "受け付けました" not in html_742):
+            if "エラー" in html_742 and "受け付けました" not in html_742:
                 return {"status": "failed", "step": "submit_742", "error": "最終投票送信時にエラーが返されました"}
 
             # 受付番号の抽出
@@ -415,10 +417,10 @@ class UMACAFastClient:
             receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
 
             form_742 = self._extract_form_inputs(html_742, "FORM0")
-            balance_after = self._parse_balance(html_742, form_742) or (current_balance - total_amount)
+            balance_after = self._parse_balance(html_742, form_742) or (current_balance - encoded_amount)
             self.last_balance = balance_after
 
-            print(f"[UMACAFast] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {total_amount:,}円 / 投票後残高: {balance_after:,}円)")
+            print(f"[UMACAFast] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {encoded_amount:,}円 / 投票後残高: {balance_after:,}円)")
             return {
                 "status": "success",
                 "platform": "umaca",

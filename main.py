@@ -77,6 +77,33 @@ def today_jst_str() -> str:
     """日本時間の当日日付 (YYYY-MM-DD)"""
     return now_jst().strftime("%Y-%m-%d")
 
+def parse_post_datetime(p_dt_str: Optional[str], fallback_date_str: Optional[str] = None) -> Optional[datetime.datetime]:
+    """Supabase等から返る発走日時文字列 ('YYYY-MM-DD HH:MM:SS', ISO形式 'T'/'Z'/'+09:00', 'HH:MM') を安全にnaive JST datetimeへ変換"""
+    if not p_dt_str or not isinstance(p_dt_str, str):
+        return None
+    s = p_dt_str.strip()
+    m_full = re.search(r"(\d{4})-(\d{2})-(\d{2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+    if m_full:
+        try:
+            return datetime.datetime(
+                int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)),
+                int(m_full.group(4)), int(m_full.group(5)), int(m_full.group(6) or 0)
+            )
+        except Exception:
+            pass
+    if fallback_date_str:
+        m_hm = re.search(r"(\d{1,2}):(\d{2})", s)
+        m_d = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", fallback_date_str.strip())
+        if m_hm and m_d:
+            try:
+                return datetime.datetime(
+                    int(m_d.group(1)), int(m_d.group(2)), int(m_d.group(3)),
+                    int(m_hm.group(1)), int(m_hm.group(2)), 0
+                )
+            except Exception:
+                pass
+    return None
+
 
 # --- 堅牢なスクレイピング用 HTTP クライアント基盤 (Step 1 冗長化) ---
 USER_AGENTS = [
@@ -852,13 +879,9 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
         for r in active_races:
             p_str = r.get("post_datetime")
             is_unrun = True
-            if p_str:
-                try:
-                    p_dt = datetime.datetime.strptime(p_str, "%Y-%m-%d %H:%M:%S")
-                    if now_d > p_dt + datetime.timedelta(minutes=10):
-                        is_unrun = False
-                except Exception:
-                    pass
+            p_dt = parse_post_datetime(p_str, active_date)
+            if p_dt and now_d > p_dt + datetime.timedelta(minutes=10):
+                is_unrun = False
             if is_unrun:
                 unrun_races.append(r)
 
@@ -1304,23 +1327,31 @@ def ensure_schedules_registered_for_venues(formatted_date: str, venues: List[dic
                     })
 
         if supabase and updates_for_schedule:
-            existing_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", formatted_date).execute()
-            existing_rids = {str(x.get("race_id")) for x in (existing_res.data or [])}
-            new_inserts = [
-                {
-                    "race_id": row["race_id"],
-                    "race_date": row["race_date"],
-                    "race_name": row["race_name"],
-                    "post_datetime": row["post_datetime"],
-                    "is_predicted": 1,
-                    "is_settled": 0
-                }
-                for row in updates_for_schedule
-                if row["race_id"] not in existing_rids
-            ]
-            if new_inserts:
+            rids_list = [row["race_id"] for row in updates_for_schedule]
+            existing_rids = set()
+            try:
+                ex_res = supabase.table("keiba_scheduled_races").select("race_id").in_("race_id", rids_list).execute()
+                existing_rids = {er["race_id"] for er in (ex_res.data or []) if "race_id" in er}
+            except Exception:
+                pass
+            for row in updates_for_schedule:
                 try:
-                    supabase.table("keiba_scheduled_races").upsert(new_inserts, on_conflict="race_id").execute()
+                    if row["race_id"] in existing_rids:
+                        supabase.table("keiba_scheduled_races").update({
+                            "race_date": row["race_date"],
+                            "post_datetime": row["post_datetime"],
+                            "race_name": row["race_name"]
+                        }).eq("race_id", row["race_id"]).execute()
+                    else:
+                        supabase.table("keiba_scheduled_races").insert({
+                            "race_id": row["race_id"],
+                            "race_date": row["race_date"],
+                            "race_name": row["race_name"],
+                            "post_datetime": row["post_datetime"],
+                            "is_predicted": 0,
+                            "is_settled": 0,
+                            "retry_count": 0
+                        }).execute()
                 except Exception:
                     pass
     except Exception as e:
@@ -1654,9 +1685,11 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_pass"] = 0
 
         # 各会場ごとに確信度上位3レースを「仮想馬券枠 (各場3R)」として保証
-        # （平地・新馬戦・障害戦除くレースの中で確信度が高い順）
+        # （予想済み かつ 平地・新馬戦・障害戦除くレースの中で確信度が高い順）
         eligible_for_virtual = []
         for r in races_in_venue:
+            if float(r.get("confidence_score") or 0.0) <= 0.0:
+                continue
             r_nm = r.get("race_name", "")
             r_info = r.get("race_info", "")
             is_shinba = ("新馬" in r_nm) or ("メイクデビュー" in r_nm)
@@ -2193,18 +2226,25 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
             return None
 
         # 自然条件（戦略B / A / C / A-2）を満たすレースが1つでもあれば、昇格枠は不要
+        existing_daily_top_rid = None
         for r in rows:
+            rid = str(r.get("race_id") or "")
             dj = r.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             if h_rec.get("strategy_type") in NATURAL_REAL_STRATEGIES:
                 _daily_top_race_id_cache.pop(target_date, None)
                 return None
+            if h_rec.get("strategy_type") == "daily_top" and h_rec.get("is_real_bet_target"):
+                existing_daily_top_rid = rid
+
+        # 既に daily_top に昇格済みのレースがあれば、再推論・発走後もそのレースを維持する
+        if existing_daily_top_rid:
+            _daily_top_race_id_cache[target_date] = existing_daily_top_rid
+            return existing_daily_top_rid
 
         candidates = []
         for r in rows:
             rid = str(r.get("race_id") or "")
-            if rid in ("202604040112", "202605040612"):
-                continue
             dj = r.get("data_json") or {}
             r_name = str(dj.get("race_name") or "")
             c_det = str((dj.get("race_details") or {}).get("course_details") or "")
@@ -2218,13 +2258,9 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
             is_unrun = True
             if is_today:
                 p_time_str = (dj.get("race_details") or {}).get("post_time", "")
-                m_t = re.search(r"(\d{1,2}):(\d{2})", p_time_str)
-                if m_t:
-                    hh, mm = int(m_t.group(1)), int(m_t.group(2))
-                    r_parts = [int(p) for p in target_date.split("-")]
-                    post_dt = datetime.datetime(r_parts[0], r_parts[1], r_parts[2], hh, mm)
-                    if now_t >= post_dt:
-                        is_unrun = False
+                post_dt = parse_post_datetime(p_time_str, target_date)
+                if post_dt and now_t >= post_dt:
+                    is_unrun = False
 
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
@@ -2272,6 +2308,7 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
             return None
 
         natural_real_rids = []
+        existing_daily_top_rid = None
         # Step 1: 過去に「参考推奨」へ格下げされていた自然合致レース（戦略B/A/C/A-2）があれば全て実馬券に復元
         for r in rows:
             rid = str(r.get("race_id") or "")
@@ -2293,6 +2330,8 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
                     h_rec["real_bet_badge"] = badge_map.get(st_type, "⭐【実馬券推奨】")
                     dj["hybrid_recommendation"] = h_rec
                     supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
+            elif st_type == "daily_top" and h_rec.get("is_real_bet_target"):
+                existing_daily_top_rid = rid
 
         # Step 2: 自然合致レースが1レース以上存在する場合は、不要な daily_top 昇格枠を解除して終了
         if natural_real_rids:
@@ -2309,8 +2348,19 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
                     h_rec["strategy_name"] = "見送り推奨 (資金保全)"
                     h_rec["tansho_bets"] = []
                     h_rec["fukusho_bets"] = []
+                    h_rec["tansho_amount"] = 0
+                    h_rec["fukusho_amount"] = 0
                     h_rec["total_amount"] = 0
                     dj["hybrid_recommendation"] = h_rec
+                    rec_obj = dj.get("recommendation") or {}
+                    rec_obj["is_pass"] = True
+                    rec_obj["grade"] = "D"
+                    rec_obj["confidence_label"] = "見送り推奨"
+                    rec_obj["tansho_amount"] = 0
+                    rec_obj["fukusho_amount"] = 0
+                    rec_obj["total_amount"] = 0
+                    rec_obj["summary"] = "見送り推奨 (資金保全)"
+                    dj["recommendation"] = rec_obj
                     supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
             _daily_top_race_id_cache.pop(target_date, None)
             _all_predictions_cache.pop(target_date, None)
@@ -2333,13 +2383,9 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
             is_unrun = True
             if is_today:
                 p_time_str = (dj.get("race_details") or {}).get("post_time", "")
-                m_t = re.search(r"(\d{1,2}):(\d{2})", p_time_str)
-                if m_t:
-                    hh, mm = int(m_t.group(1)), int(m_t.group(2))
-                    r_parts = [int(p) for p in target_date.split("-")]
-                    post_dt = datetime.datetime(r_parts[0], r_parts[1], r_parts[2], hh, mm)
-                    if now_t >= post_dt:
-                        is_unrun = False
+                post_dt = parse_post_datetime(p_time_str, target_date)
+                if post_dt and now_t >= post_dt:
+                    is_unrun = False
 
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
@@ -2357,15 +2403,20 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         if not candidates:
             return None
 
-        unrun_candidates = [c for c in candidates if c["is_unrun"] and c["race_id"] not in ("202604040112", "202605040612")]
-        pool = unrun_candidates if unrun_candidates else [c for c in candidates if c["race_id"] not in ("202604040112", "202605040612")]
-        if not pool:
-            pool = candidates
-        pool.sort(key=lambda x: (x["score"], x["confidence_score"]), reverse=True)
-        top_race = pool[0]
+        # 既に daily_top に設定済みのレースがあれば、勝手に他レースへ移らないよう維持
+        existing_cand = next((c for c in candidates if c["race_id"] == existing_daily_top_rid), None) if existing_daily_top_rid else None
+        if existing_cand:
+            top_race = existing_cand
+        else:
+            unrun_candidates = [c for c in candidates if c["is_unrun"]]
+            pool = unrun_candidates if unrun_candidates else candidates
+            pool.sort(key=lambda x: (x["score"], x["confidence_score"]), reverse=True)
+            top_race = pool[0]
+
         top_rid = top_race["race_id"]
         top_dj = top_race["data_json"]
 
+        # 本命馬（◎ または prob_win 最大馬）を特定
         horses = top_dj.get("horses") or []
         honmei_horse = next((h for h in horses if h.get("mark") == "◎"), None)
         if not honmei_horse:
@@ -2427,8 +2478,16 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
 
         h_rec["tansho_bets"] = tansho_bets
         h_rec["fukusho_bets"] = fukusho_bets
+        h_rec["tansho_amount"] = d_tan
+        h_rec["fukusho_amount"] = d_fuku
+        h_rec["umatan_amount"] = 0
         h_rec["total_amount"] = d_tan + d_fuku
         h_rec["summary"] = f"{h_rec['strategy_name']}：単勝{d_tan}円＋複勝{d_fuku}円 計{d_tan+d_fuku}円"
+        h_rec["is_virtual_bet_target"] = True
+        h_rec["virtual_bets"] = tansho_bets + fukusho_bets
+        h_rec["virtual_total_amount"] = d_tan + d_fuku
+        h_rec["virtual_strategy_name"] = h_rec["strategy_name"]
+        h_rec["virtual_badge"] = h_rec["real_bet_badge"]
         top_dj["hybrid_recommendation"] = h_rec
 
         top_rec = top_dj.get("recommendation") or {}
@@ -2444,9 +2503,13 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         top_dj["recommendation"] = top_rec
 
         supabase.table("keiba_predictions_cache").update({"data_json": top_dj}).eq("race_id", top_rid).execute()
+        try:
+            supabase.table("keiba_scheduled_races").update({"is_predicted": 1}).eq("race_id", top_rid).eq("is_predicted", 0).execute()
+        except Exception:
+            pass
         print(f"[DailySingleRealBet] {target_date}: 自然合致0Rのため厳選No.1レースとして {top_rid} (◎{w0_u}番 {w0_name}) を昇格しました。")
 
-        # 他の daily_top 昇格レースがあれば解除 (見送り状態へ完全復元)
+        # 他の daily_top 昇格レースがあれば解除
         for r in rows:
             r_rid = str(r.get("race_id") or "")
             if r_rid != top_rid:
@@ -2458,21 +2521,12 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
                     r_h["real_bet_level"] = "none"
                     r_h["real_bet_badge"] = None
                     r_h["strategy_type"] = "skip"
-                    r_h["strategy_name"] = "見送り推奨 (資金保全)"
                     r_h["tansho_bets"] = []
                     r_h["fukusho_bets"] = []
+                    r_h["tansho_amount"] = 0
+                    r_h["fukusho_amount"] = 0
                     r_h["total_amount"] = 0
-                    r_h["summary"] = "波乱リスクおよびオッズ妙味の観点から見送り推奨"
                     r_dj["hybrid_recommendation"] = r_h
-                    r_rec = r_dj.get("recommendation") or {}
-                    r_rec["is_pass"] = True
-                    r_rec["grade"] = "D"
-                    r_rec["confidence_label"] = "見送り推奨"
-                    r_rec["tansho_amount"] = 0
-                    r_rec["fukusho_amount"] = 0
-                    r_rec["total_amount"] = 0
-                    r_rec["summary"] = "推奨馬なし (見送り)"
-                    r_dj["recommendation"] = r_rec
                     supabase.table("keiba_predictions_cache").update({"data_json": r_dj}).eq("race_id", r_rid).execute()
 
         _daily_top_race_id_cache[target_date] = top_rid
@@ -2546,6 +2600,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     is_female_only = 1 if (course_meta.get("is_female_only_text") or all_female) else 0
 
     today_date = now_jst().date()
+    r_date_meta = course_meta.get("race_date")
+    if r_date_meta and isinstance(r_date_meta, str):
+        try:
+            today_date = datetime.date.fromisoformat(r_date_meta[:10])
+        except Exception:
+            pass
 
     horse_feature_data = []
     jc_rates = []
@@ -4194,16 +4254,16 @@ def predict_race_core(
 
         if sched_race_date == today_jst_str() and sched_post_dt_raw:
             try:
-                post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
-                now_dt_obj = now_jst_naive()
-                mins_to_post = (post_dt_obj - now_dt_obj).total_seconds() / 60.0
-                if 0.0 < mins_to_post <= 65.0:
-                    target_stage = odds_stage or infer_odds_stage_from_minutes(mins_to_post)
-                    target_rank = ODDS_STAGE_RANK.get(target_stage, 1)
-                    cooldown_sec = 60.0 if target_stage == "05m" else 180.0
-                    # 新しいステージ（60m/30m/15m/05m）に到達したか、馬体重がまだ未取得の場合に自動再推論
-                    if target_rank > cached_stage_rank or (not has_cached_weights and now_ts - _last_weight_check_ts.get(race_id, 0.0) >= cooldown_sec):
-                        if target_rank > cached_stage_rank or (now_ts - _last_weight_check_ts.get(race_id, 0.0) >= cooldown_sec):
+                post_dt_obj = parse_post_datetime(sched_post_dt_raw, sched_race_date)
+                if post_dt_obj:
+                    now_dt_obj = now_jst_naive()
+                    mins_to_post = (post_dt_obj - now_dt_obj).total_seconds() / 60.0
+                    if 0.0 < mins_to_post <= 65.0:
+                        target_stage = odds_stage or infer_odds_stage_from_minutes(mins_to_post)
+                        target_rank = ODDS_STAGE_RANK.get(target_stage, 1)
+                        cooldown_sec = 60.0 if target_stage == "05m" else 180.0
+                        # 新しいステージ（60m/30m/15m/05m）に到達したか、馬体重がまだ未取得の場合に自動再推論
+                        if target_rank > cached_stage_rank or (not has_cached_weights and now_ts - _last_weight_check_ts.get(race_id, 0.0) >= cooldown_sec):
                             _last_weight_check_ts[race_id] = now_ts
                             should_auto_refresh = True
                             odds_stage = target_stage
@@ -4220,12 +4280,9 @@ def predict_race_core(
                 if sched_race_date and sched_race_date < today_jst_str():
                     is_past_or_post = True
                 elif sched_race_date == today_jst_str() and sched_post_dt_raw:
-                    try:
-                        post_dt_obj = datetime.datetime.strptime(sched_post_dt_raw, "%Y-%m-%d %H:%M:%S")
-                        if now_jst_naive() >= post_dt_obj:
-                            is_past_or_post = True
-                    except Exception:
-                        pass
+                    post_dt_obj = parse_post_datetime(sched_post_dt_raw, sched_race_date)
+                    if post_dt_obj and now_jst_naive() >= post_dt_obj:
+                        is_past_or_post = True
                 elif not sched_race_date:
                     is_past_or_post = True
 
@@ -4269,10 +4326,7 @@ def predict_race_core(
                     target_race_date = s_res.data[0].get("race_date")
                     p_dt_str = s_res.data[0].get("post_datetime")
                     if p_dt_str:
-                        try:
-                            scheduled_post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            pass
+                        scheduled_post_dt = parse_post_datetime(p_dt_str, target_race_date)
             except Exception:
                 pass
 
@@ -4283,12 +4337,9 @@ def predict_race_core(
                 raise HTTPException(status_code=400, detail="出走時刻を過ぎているため、手動での予想のし直しはできません。")
             if not scheduled_post_dt and target_race_date:
                 p_str = (cached_pred.get("race_details") or {}).get("post_time", "")
-                m_t = re.search(r"(\d{1,2}):(\d{2})", p_str)
-                if m_t:
-                    d_parts = [int(p) for p in target_race_date.split("-")]
-                    est_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], int(m_t.group(1)), int(m_t.group(2)))
-                    if now_dt >= est_dt:
-                        raise HTTPException(status_code=400, detail="出走時刻を過ぎているため、手動での予想のし直しはできません。")
+                est_dt = parse_post_datetime(p_str, target_race_date)
+                if est_dt and now_dt >= est_dt:
+                    raise HTTPException(status_code=400, detail="出走時刻を過ぎているため、手動での予想のし直しはできません。")
 
         if not target_race_date:
             # キャッシュ中の開催期間から日付を逆引き
@@ -4302,7 +4353,7 @@ def predict_race_core(
                     break
         known_schedule_date = target_race_date
         if not target_race_date:
-            target_race_date = today_jst_str()
+            target_race_date = resolve_race_date_for_id(race_id) or today_jst_str()
 
         race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id, race_date=known_schedule_date)
         if not horses:
@@ -4316,10 +4367,7 @@ def predict_race_core(
                 est_post_dt = scheduled_post_dt
                 if not est_post_dt:
                     p_str = (race_details or {}).get("post_time", "")
-                    m_t = re.search(r"(\d{1,2}):(\d{2})", p_str)
-                    if m_t:
-                        d_parts = [int(p) for p in target_race_date.split("-")]
-                        est_post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], int(m_t.group(1)), int(m_t.group(2)))
+                    est_post_dt = parse_post_datetime(p_str, target_race_date)
                 if est_post_dt:
                     mins_left = (est_post_dt - now_jst_naive()).total_seconds() / 60.0
                     odds_stage = infer_odds_stage_from_minutes(mins_left)
@@ -4331,12 +4379,9 @@ def predict_race_core(
         # 手動再予想時に出走表側の発走時刻でも発走後と判明した場合はブロック
         if force_refresh and not is_auto_final and cached_pred is not None:
             p_str = (race_details or {}).get("post_time", "")
-            m_t = re.search(r"(\d{1,2}):(\d{2})", p_str)
-            if m_t:
-                d_parts = [int(p) for p in target_race_date.split("-")]
-                est_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], int(m_t.group(1)), int(m_t.group(2)))
-                if now_jst_naive() >= est_dt:
-                    raise HTTPException(status_code=400, detail="出走時刻を過ぎているため、手動での予想のし直しはできません。")
+            est_dt = parse_post_datetime(p_str, target_race_date)
+            if est_dt and now_jst_naive() >= est_dt:
+                raise HTTPException(status_code=400, detail="出走時刻を過ぎているため、手動での予想のし直しはできません。")
 
         if course_meta is None:
             course_meta = {}
@@ -4348,7 +4393,12 @@ def predict_race_core(
             course_meta["force_final_odds"] = True
 
         top_rid = get_or_select_daily_top_race_id(target_race_date)
-        course_meta["is_daily_top_race"] = bool(top_rid and race_id == top_rid and race_id not in ("202604040112", "202605040612"))
+        prev_was_daily_top = bool(
+            isinstance(cached_pred, dict)
+            and (cached_pred.get("hybrid_recommendation") or {}).get("strategy_type") == "daily_top"
+            and (cached_pred.get("hybrid_recommendation") or {}).get("is_real_bet_target")
+        )
+        course_meta["is_daily_top_race"] = bool((top_rid and race_id == top_rid) or (prev_was_daily_top and top_rid is not None))
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
         apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list, odds_stage=odds_stage)
@@ -4365,6 +4415,16 @@ def predict_race_core(
         }
 
         save_cached_prediction(race_id, target_race_date, resp_data)
+
+        # 自然合致レースの増減に応じた当日最低1R実馬券保証（daily_top昇格・解除）を即時同期
+        try:
+            promoted_rid = ensure_daily_single_real_bet(target_race_date)
+            if promoted_rid == race_id and not (resp_data.get("hybrid_recommendation") or {}).get("is_real_bet_target"):
+                reloaded = get_cached_prediction(race_id)
+                if reloaded:
+                    resp_data = reloaded
+        except Exception as de:
+            print(f"[predict_race_core] daily_top同期警告 ({race_id}): {de}")
 
         if supabase:
             try:
@@ -4796,16 +4856,34 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
 
 
             b_breakdown = d.get("bet_breakdown")
+            tan_bet = d.get("tansho_bet") or 0
+            fuku_bet = d.get("fukusho_bet") or 0
+            utan_bet = d.get("umatan_bet") or (b_breakdown.get("馬単", 0) if isinstance(b_breakdown, dict) else 0) or 0
             if not b_breakdown or not isinstance(b_breakdown, dict):
                 b_breakdown = {}
+                if tan_bet > 0:
+                    b_breakdown["単勝"] = tan_bet
+                if fuku_bet > 0:
+                    b_breakdown["複勝"] = fuku_bet
+                if utan_bet > 0:
+                    b_breakdown["馬単"] = utan_bet
                 if u_bet > 0:
                     b_breakdown["馬連"] = u_bet
                 if t_bet > 0:
                     b_breakdown["三連複"] = t_bet
 
             p_breakdown = d.get("payout_breakdown")
+            tan_pay = d.get("tansho_payout") or 0
+            fuku_pay = d.get("fukusho_payout") or 0
+            utan_pay = d.get("umatan_payout") or (p_breakdown.get("馬単", 0) if isinstance(p_breakdown, dict) else 0) or 0
             if not p_breakdown or not isinstance(p_breakdown, dict):
                 p_breakdown = {}
+                if tan_pay > 0:
+                    p_breakdown["単勝"] = tan_pay
+                if fuku_pay > 0:
+                    p_breakdown["複勝"] = fuku_pay
+                if utan_pay > 0:
+                    p_breakdown["馬単"] = utan_pay
                 if u_pay > 0:
                     p_breakdown["馬連"] = u_pay
                 if t_pay > 0:
@@ -4839,6 +4917,13 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 "trio_bet": t_bet,
                 "umaren_payout": u_pay,
                 "trio_payout": t_pay,
+                "tansho_bet": tan_bet,
+                "fukusho_bet": fuku_bet,
+                "umatan_bet": utan_bet,
+                "tansho_payout": tan_pay,
+                "fukusho_payout": fuku_pay,
+                "umatan_payout": utan_pay,
+                "target_popularity": rb_meta.get("target_popularity"),
                 "mark_orders": mark_orders,
                 "top3_orders": top3_orders
             }
@@ -5823,7 +5908,12 @@ def verify_race_result(
 
     if not bypass_cache:
         cached_settlement = get_cached_settlement(race_id)
-        if cached_settlement and (cached_settlement.get("actual_order") is not None or cached_settlement.get("is_pass")):
+        if cached_settlement and (
+            cached_settlement.get("actual_order") is not None
+            or cached_settlement.get("is_pass")
+            or cached_settlement.get("hit_type") == "中止"
+            or cached_settlement.get("top3_orders")
+        ):
             return cached_settlement
 
     race_date = resolve_race_date_for_id(race_id)
@@ -5835,9 +5925,9 @@ def verify_race_result(
         c_orders = cached_data.get("orders", {}) if isinstance(cached_data, dict) else {}
         c_payouts = cached_data.get("payouts", {}) if isinstance(cached_data, dict) else {}
         c_order_vals = [int(v) for v in c_orders.values() if str(v).isdigit()]
-        c_has_top3 = (1 in c_order_vals) and (sum(1 for v in c_order_vals if v in (1, 2, 3)) >= 3)
+        c_has_top3 = (1 in c_order_vals) and (2 in c_order_vals) and (3 in c_order_vals)
         c_has_pay = bool(c_payouts.get("tansho") or c_payouts.get("umaren") or c_payouts.get("fukusho"))
-        if c_has_top3 and c_has_pay:
+        if (c_has_top3 and c_has_pay) or (isinstance(cached_data, dict) and cached_data.get("is_cancelled")):
             from_cache = True
             race_res = cached_data
         else:
@@ -5860,15 +5950,14 @@ def verify_race_result(
     if actual_order is None and target_u is not None:
         actual_order = orders.get(str(target_u))
 
-    # ★ 着順および払戻金が実数値で確認できるかの厳格チェック（同着考慮）
-    order_vals = [int(v) for v in orders.values() if str(v).isdigit()]
-    has_top3 = (1 in order_vals) and (sum(1 for v in order_vals if v in (1, 2, 3)) >= 3)
+    # ★ 着順および払戻金が実数値で確認できるかの厳格チェック
+    has_top3 = (1 in orders.values()) and (2 in orders.values()) and (3 in orders.values())
     has_payouts = (len(payouts.get("tansho", {})) > 0) or (len(payouts.get("umaren", {})) > 0) or (len(payouts.get("fukusho", {})) > 0)
-    has_target_order = (actual_order is not None and isinstance(actual_order, int) and 1 <= actual_order <= 30)
+    is_cancelled = bool(race_res.get("is_cancelled"))
 
-    # 1〜3着確定および払戻金確定があれば、JRA公式結果としてレース全体が確定している
+    # 1〜3着確定および払戻金確定（または開催中止確定）があれば、JRA公式結果としてレース全体が確定している
     # （◎馬が競走中止・除外・取消・大敗等の場合でも、レース照合は正常完了させる）
-    is_fully_confirmed = has_top3 and has_payouts
+    is_fully_confirmed = (has_top3 and has_payouts) or is_cancelled
     if not is_19h_settle and not is_fully_confirmed:
         raise HTTPException(
             status_code=400,
@@ -6652,13 +6741,6 @@ def recalculate_period_records():
 
     for row in preds_list:
         rid = row["race_id"]
-        if valid_rids and rid not in valid_rids:
-            try:
-                supabase.table("keiba_predictions_cache").delete().eq("race_id", rid).execute()
-                supabase.table("keiba_scheduled_races").delete().eq("race_id", rid).execute()
-            except Exception:
-                pass
-            continue
         rdate = row.get("race_date") or today_jst_str()
         pred_data = row.get("data_json") or {}
         if not pred_data:
@@ -6836,7 +6918,6 @@ async def sync_daily_schedules_if_needed(today_str: str):
 
 async def background_maintenance_loop():
     print("[Scheduler] リアルタイム・メンテナンススケジューラー (JST同期・1開催期間サイクル版) を開始しました。")
-    await asyncio.sleep(5)
     last_friday_cleaned_period = None
     last_17h_settle_date = None
     last_19h_settle_date = None
@@ -6863,23 +6944,25 @@ async def background_maintenance_loop():
 
             # --- ② JST朝 8:30 以降、当日の未予想レース事前予想（朝オッズによる暫定判定）を一括実行 ---
             if (now_dt.hour > 8 or (now_dt.hour == 8 and now_dt.minute >= 30)) and last_830_predict_date != today_str:
-                already_predicted_count = 0
-                if supabase:
-                    try:
-                        chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
-                        already_predicted_count = len(chk_p.data or [])
-                    except Exception:
-                        pass
-                if already_predicted_count >= 24:
-                    print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
-                    last_830_predict_date = today_str
-                else:
-                    period_dates = discover_period_kaisai_dates(now_dt)
-                    if today_str in period_dates:
-                        if not batch_status["is_running"]:
-                            print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
-                            run_batch_worker(today_str, "predict", False, False)
-                            last_830_predict_date = today_str
+                period_dates = discover_period_kaisai_dates(now_dt)
+                if today_str in period_dates:
+                    already_predicted_count = 0
+                    if supabase:
+                        try:
+                            chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
+                            already_predicted_count = len(chk_p.data or [])
+                        except Exception:
+                            pass
+                    if already_predicted_count >= 24:
+                        print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
+                        await asyncio.to_thread(ensure_daily_single_real_bet, today_str)
+                        last_830_predict_date = today_str
+                    elif not batch_status["is_running"]:
+                        print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "predict", False, False))
+                        await asyncio.to_thread(ensure_daily_single_real_bet, today_str)
+                        last_830_predict_date = today_str
 
                         # 朝の実戦推奨候補を走査してダイジェスト通知
                         try:
@@ -6907,9 +6990,9 @@ async def background_maintenance_loop():
                                     check_and_notify_balance_shortfall()
                         except Exception as fe:
                             print(f"[Scheduler] 朝通知エラー: {fe}")
-                    else:
-                        # 本日が非開催日（平日等）の場合はチェック済みとしてマーク
-                        last_830_predict_date = today_str
+                else:
+                    # 本日が非開催日（平日等）の場合はチェック済みとしてマーク
+                    last_830_predict_date = today_str
 
             if supabase:
                 # --- ③ 各レース【発走 60分前 / 30分前 / 15分前 / 5分前】のマルチステージ自動推論 ＆ 最終確定通知 ---
@@ -6923,11 +7006,10 @@ async def background_maintenance_loop():
 
                     for r in unpredicted_races:
                         r_id = r["race_id"]
-                        p_dt_str = str(r.get("post_datetime") or "").replace("T", " ")[:19]
+                        p_dt_str = r.get("post_datetime")
                         cur_stage = int(r.get("is_predicted") or 0)
-                        try:
-                            post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
-                        except Exception:
+                        post_dt = parse_post_datetime(p_dt_str, today_str)
+                        if not post_dt:
                             continue
 
                         mins_to_post = (post_dt - now_dt).total_seconds() / 60.0
@@ -6938,7 +7020,7 @@ async def background_maintenance_loop():
                         if mins_to_post <= 6.5 and cur_stage < 5:
                             print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
                             try:
-                                pred_res = predict_race_core(r_id, True, True, "05m")
+                                pred_res = await asyncio.to_thread(predict_race_core, r_id, True, True, "05m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 5})\
                                     .eq("race_id", r_id)\
@@ -6953,7 +7035,14 @@ async def background_maintenance_loop():
                                     h_name = pred_res.get("recommendation", {}).get("horse_name", "")
                                     r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
 
-                                    all_tickets = (h_rec.get("tansho_bets") or []) + (h_rec.get("fukusho_bets") or []) + (h_rec.get("umatan_bets") or [])
+                                    all_tickets = (
+                                        (h_rec.get("tansho_bets") or [])
+                                        + (h_rec.get("fukusho_bets") or [])
+                                        + (h_rec.get("umatan_bets") or [])
+                                        + (h_rec.get("umaren_bets") or [])
+                                        + (h_rec.get("trio_bets") or [])
+                                        + (h_rec.get("sanrentan_bets") or [])
+                                    )
                                     bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])
                                     tot_amt = h_rec.get("total_amount", 0)
 
@@ -7017,6 +7106,9 @@ async def background_maintenance_loop():
                                                         })
                                                         b_dict[today_str] = b_list
                                                         cur_s["betted_races_by_date"] = b_dict
+                                                        if bet_res.get("balance") is not None:
+                                                            cur_s["last_balance"] = bet_res.get("balance")
+                                                            cur_s["last_balance_updated_at"] = now_jst().strftime("%Y-%m-%d %H:%M:%S")
                                                         save_betting_settings_to_supabase(cur_s)
                                                     except Exception as me:
                                                         print(f"[AutoBet Meta Save Error] {me}")
@@ -7059,38 +7151,35 @@ async def background_maintenance_loop():
                                                 )
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
-                            await asyncio.sleep(0.5)
 
                         # Stage 4: 発走 15分前 (6.5 < mins <= 17.0) -> 本馬場入場後オッズ更新
                         elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
                             print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
                             try:
-                                predict_race_core(r_id, True, False, "15m")
+                                await asyncio.to_thread(predict_race_core, r_id, True, False, "15m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 4})\
                                     .eq("race_id", r_id)\
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage4] 更新失敗 ({r_id}): {pe}")
-                            await asyncio.sleep(0.5)
 
                         # Stage 3: 発走 30分前 (17.0 < mins <= 33.0) -> パドック後オッズ更新
                         elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
                             print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
                             try:
-                                predict_race_core(r_id, True, False, "30m")
+                                await asyncio.to_thread(predict_race_core, r_id, True, False, "30m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 3})\
                                     .eq("race_id", r_id)\
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage3] 更新失敗 ({r_id}): {pe}")
-                            await asyncio.sleep(0.5)
 
                         # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重取得成功時のみstage=2へ進める)
                         elif 33.0 < mins_to_post <= 58.0 and cur_stage < 2:
                             try:
-                                pred_s2 = predict_race_core(r_id, True, False, "60m")
+                                pred_s2 = await asyncio.to_thread(predict_race_core, r_id, True, False, "60m")
                                 has_w = any(h.get("horse_weight") is not None for h in (pred_s2 or {}).get("horses", []))
                                 if has_w:
                                     supabase.table("keiba_scheduled_races")\
@@ -7100,14 +7189,36 @@ async def background_maintenance_loop():
                                     print(f"[Auto-Predict Stage2] {r_id}: 馬体重反映完了")
                             except Exception as we:
                                 print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
-                            await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
 
-                # 予想更新時に残高不足の恐れがあればアラート通知
+                # --- ③-B 発走後レースで馬体重が未取得のまま残っている場合の自動バックグラウンド補完 ---
+                try:
+                    res_all_sched = supabase.table("keiba_scheduled_races").select("race_id, post_datetime").eq("race_date", today_str).execute()
+                    past_rids_today = []
+                    for sr in (res_all_sched.data or []):
+                        p_dt = parse_post_datetime(sr.get("post_datetime"), today_str)
+                        if p_dt and now_dt >= p_dt:
+                            past_rids_today.append(sr["race_id"])
+                    if past_rids_today:
+                        p_chk = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", past_rids_today).execute()
+                        healed_cnt = 0
+                        for prow in (p_chk.data or []):
+                            if healed_cnt >= 4:
+                                break
+                            prid = prow.get("race_id")
+                            pdj = prow.get("data_json") or {}
+                            phorses = pdj.get("horses", [])
+                            if phorses and not any(h.get("horse_weight") is not None for h in phorses):
+                                await asyncio.to_thread(predict_race_core, prid, False, False, None)
+                                healed_cnt += 1
+                except Exception as he_loop:
+                    print(f"[Scheduler] 発走後馬体重補完チェック警告: {he_loop}")
+
+                # 予想更新時に即PAT残高不足の恐れがあればアラート通知
                 check_and_notify_balance_shortfall()
 
-                # --- ④ 各レース【発走 10分後】の個別自動照合（未確定時は3分おきにリトライ、1ループ最大3件でブロック防止） ---
+                # --- ④ 各レース【発走 10分後】の個別自動照合（未確定時は3分おきにリトライ） ---
                 try:
                     res_settle = supabase.table("keiba_scheduled_races")\
                         .select("*")\
@@ -7116,24 +7227,19 @@ async def background_maintenance_loop():
                         .execute()
                     unsettled_races = res_settle.data or []
 
-                    settled_in_tick = 0
                     for r in unsettled_races:
-                        if settled_in_tick >= 3:
-                            break
                         r_id = r["race_id"]
-                        p_dt_str = str(r.get("post_datetime") or "").replace("T", " ")[:19]
+                        p_dt_str = r.get("post_datetime")
                         retries = r.get("retry_count", 0) or 0
-                        try:
-                            post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
-                        except Exception:
+                        post_dt = parse_post_datetime(p_dt_str, today_str)
+                        if not post_dt:
                             continue
 
                         # 初回は発走10分後、以降は3分間隔でリトライ
                         trigger_settle_time = post_dt + datetime.timedelta(minutes=10 + 3 * retries)
                         if now_dt >= trigger_settle_time:
-                            settled_in_tick += 1
                             try:
-                                verify_race_result(r_id, True, False)
+                                await asyncio.to_thread(verify_race_result, r_id, True, False)
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_settled": 1})\
                                     .eq("race_id", r_id)\
@@ -7151,16 +7257,29 @@ async def background_maintenance_loop():
                                         .update({"retry_count": retries + 1})\
                                         .eq("race_id", r_id)\
                                         .execute()
-                            await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"[Scheduler] 照合ループエラー: {e}")
 
             # --- ⑤ JST 17:00 および 19:00 の当日最終未確定一括照合 ---
             if now_dt.hour == 17 and last_17h_settle_date != today_str:
-                last_17h_settle_date = today_str
+                if today_str in discover_period_kaisai_dates(now_dt):
+                    if not batch_status["is_running"]:
+                        print(f"[Scheduler] 17:00 当日レースの最終結果照合を実行します...")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
+                        last_17h_settle_date = today_str
+                else:
+                    last_17h_settle_date = today_str
 
             if now_dt.hour == 19 and last_19h_settle_date != today_str:
-                last_19h_settle_date = today_str
+                if today_str in discover_period_kaisai_dates(now_dt):
+                    if not batch_status["is_running"]:
+                        print(f"[Scheduler] 19:00 当日レースの予備最終結果照合を実行します...")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
+                        last_19h_settle_date = today_str
+                else:
+                    last_19h_settle_date = today_str
 
         except Exception as e:
             print(f"[Scheduler] 全体ループエラー: {e}")
@@ -7603,12 +7722,11 @@ class BatchUpsertPayload(BaseModel):
     predictions: Optional[List[dict]] = None
     settlements: Optional[List[dict]] = None
     scheduled: Optional[List[dict]] = None
-    results: Optional[List[dict]] = None
 
 
 @app.post("/admin/upsert-verified-data")
 def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
-    """検証済みの予想・収支結果・スケジュール・レース結果キャッシュをSupabaseに一括アップサート"""
+    """検証済みの予想・収支結果・スケジュールデータをSupabaseに一括アップサート"""
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase未接続")
 
@@ -7636,14 +7754,10 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
     pred_count = 0
     settle_count = 0
     sched_count = 0
-    res_count = 0
     try:
         if payload.predictions:
             supabase.table("keiba_predictions_cache").upsert(payload.predictions, on_conflict="race_id").execute()
             pred_count = len(payload.predictions)
-        if payload.results:
-            supabase.table("keiba_race_results_cache").upsert(payload.results, on_conflict="race_id").execute()
-            res_count = len(payload.results)
         if payload.settlements:
             supabase.table("keiba_race_settlements").upsert(payload.settlements, on_conflict="race_id").execute()
             settle_count = len(payload.settlements)
@@ -7654,7 +7768,6 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
         return {
             "status": "ok",
             "predictions_count": pred_count,
-            "results_count": res_count,
             "settlements_count": settle_count,
             "scheduled_count": sched_count
         }
@@ -8032,6 +8145,7 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
 
     t_date = target_date or today_jst_str()
     normalize_mislabeled_dates()
+    ensure_daily_single_real_bet(t_date)
 
     now_dt = now_jst_naive()
     sched_res = supabase.table("keiba_scheduled_races").select("*").eq("race_date", t_date).order("race_id").execute()
@@ -8041,10 +8155,12 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
     pred_map = {r["race_id"]: (r.get("data_json") or {}) for r in (pred_res.data or []) if r.get("race_id")}
 
     settle_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass").eq("race_date", t_date).execute()
+    settle_rows = settle_res.data or []
     settled_rids = {
-        r["race_id"] for r in (settle_res.data or [])
+        r["race_id"] for r in settle_rows
         if r.get("actual_order") is not None or r.get("is_pass") in (1, True)
     }
+    settle_pass_map = {r["race_id"]: r.get("is_pass") for r in settle_rows if r.get("race_id")}
 
     healed_weights = []
     settled_now = []
@@ -8053,10 +8169,7 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
     for sr in sched_rows:
         rid = sr["race_id"]
         p_dt_str = sr.get("post_datetime", "")
-        try:
-            post_dt = datetime.datetime.strptime(p_dt_str, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            post_dt = now_dt
+        post_dt = parse_post_datetime(p_dt_str, t_date) or now_dt
 
         mins_to_post = (post_dt - now_dt).total_seconds() / 60.0 if t_date == today_jst_str() else -999.0
         dj = pred_map.get(rid) or {}
@@ -8078,8 +8191,10 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
             except Exception as we:
                 errors.append(f"weight({rid}): {we}")
 
-        # 2. 結果検証の補完 (発走8分後以降の未検証レース)
-        if mins_to_post <= -8.0 and (rid not in settled_rids or int(sr.get("is_settled") or 0) == 0):
+        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース)
+        is_real_target = bool((dj.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
+        needs_real_resettle = is_real_target and (settle_pass_map.get(rid) in (1, True))
+        if mins_to_post <= -8.0 and (rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle):
             try:
                 verify_race_result(rid, bypass_cache=True, is_19h_settle=False)
                 supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", rid).execute()
@@ -8124,49 +8239,24 @@ def endpoint_reselect_daily_real_bet(target_date: Optional[str] = Query(None)):
     }
 
 
-def apply_verified_20261017_12r_on_startup():
-    """新潟12R・東京12Rの見送り復元および京都12R・全36レースの確定データを起動時に一括反映"""
-    if not supabase:
-        return
+def _startup_background_init():
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        json_path = os.path.join(base_dir, "verified_20261017_12r.json")
-        if not os.path.exists(json_path):
-            return
-        with open(json_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if payload.get("predictions"):
-            supabase.table("keiba_predictions_cache").upsert(payload["predictions"], on_conflict="race_id").execute()
-        if payload.get("results"):
-            supabase.table("keiba_race_results_cache").upsert(payload["results"], on_conflict="race_id").execute()
-        if payload.get("settlements"):
-            supabase.table("keiba_race_settlements").upsert(payload["settlements"], on_conflict="race_id").execute()
-        if payload.get("scheduled"):
-            supabase.table("keiba_scheduled_races").upsert(payload["scheduled"], on_conflict="race_id").execute()
-        try:
-            b_settings = load_betting_settings_from_supabase()
-            b_dict = b_settings.get("betted_races_by_date", {})
-            if "2026-10-17" in b_dict and isinstance(b_dict["2026-10-17"], list):
-                b_dict["2026-10-17"] = [
-                    x for x in b_dict["2026-10-17"]
-                    if isinstance(x, dict) and x.get("race_id") not in ("202604040112", "202605040612")
-                ]
-                b_settings["betted_races_by_date"] = b_dict
-                save_betting_settings_to_supabase(b_settings)
-        except Exception:
-            pass
-        invalidate_summary_caches()
-        print("[Startup] 2026-10-17 新潟12R・東京12R 見送り復元＆12R確定データをDBへ即時反映しました。")
+        normalize_mislabeled_dates()
+        fix_duplicated_horses_cache_2026()
+        ensure_daily_single_real_bet(today_jst_str())
+        endpoint_sync_active_post_times(today_jst_str())
+        heal_today_weights_and_results(today_jst_str())
     except Exception as e:
-        print(f"[Startup] verified_20261017_12r 反映エラー: {e}")
+        print(f"[Startup Bg Init Warning] {e}")
 
 
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
-    apply_verified_20261017_12r_on_startup()
     load_stats_overlay_from_supabase()
     load_betting_settings_from_supabase()
     asyncio.create_task(background_maintenance_loop())
+    # 起動時の整合性チェック・馬体重/結果補完は非同期スレッドで実行し、API応答をブロックしない
+    asyncio.create_task(asyncio.to_thread(_startup_background_init))
 
