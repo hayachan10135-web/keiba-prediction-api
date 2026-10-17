@@ -152,23 +152,11 @@ async def background_maintenance_loop():
             if (now_dt.hour > 8 or (now_dt.hour == 8 and now_dt.minute >= 30)) and last_830_predict_date != today_str:
                 period_dates = _discover_period_kaisai_dates_fn(now_dt) if _discover_period_kaisai_dates_fn else []
                 if today_str in period_dates:
-                    already_predicted_count = 0
-                    if supabase:
-                        try:
-                            chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
-                            already_predicted_count = len(chk_p.data or [])
-                        except Exception:
-                            pass
-                    if already_predicted_count >= 24:
-                        print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
-                        if _ensure_daily_single_real_bet_fn:
-                            await asyncio.to_thread(_ensure_daily_single_real_bet_fn, today_str)
-                        last_830_predict_date = today_str
-                    elif not batch_status["is_running"]:
-                        print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
+                    if not batch_status["is_running"]:
+                        print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（朝オッズ反映・暫定判定）を実行します...")
                         loop = asyncio.get_event_loop()
                         if _run_batch_worker_fn:
-                            await loop.run_in_executor(None, lambda: _run_batch_worker_fn(today_str, "predict", False, False))
+                            await loop.run_in_executor(None, lambda: _run_batch_worker_fn(today_str, "predict", True, False))
                         if _ensure_daily_single_real_bet_fn:
                             await asyncio.to_thread(_ensure_daily_single_real_bet_fn, today_str)
                         last_830_predict_date = today_str

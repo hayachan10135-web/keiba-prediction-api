@@ -70,6 +70,11 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
     t_date = target_date or today_jst_str()
     now_d = now_jst_naive()
 
+    # 【重要ガード】朝08:30の一括事前予想前は、当日・未来日の投票予定額は未定（0円・0レース）とする
+    from app.core.timezone import is_before_morning_prediction
+    if is_before_morning_prediction(t_date):
+        return 0, 0, []
+
     try:
         s_res = supabase.table("keiba_scheduled_races")\
             .select("race_id, race_date, race_name, post_datetime, is_predicted")\
@@ -83,6 +88,8 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             return 0, 0, []
 
         active_date = rows[0]["race_date"]
+        if is_before_morning_prediction(active_date):
+            return 0, 0, []
         active_races = [r for r in rows if r["race_date"] == active_date]
 
         unrun_races = []
@@ -111,15 +118,20 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
         for p_row in (p_res.data or []):
             dj = p_row.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
-            if h_rec.get("is_real_bet_target"):
+            rid = p_row.get("race_id")
+            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and active_date == "2026-10-18")
+            if h_rec.get("is_real_bet_target") or is_special:
                 amt = int(h_rec.get("total_amount") or 0)
+                if amt == 0 and is_special:
+                    amt = 100
                 if amt > 0:
                     total_remaining_amount += amt
+                    badge = ("🧪【実機投票テスト】特別対象枠" if is_special and not h_rec.get("is_real_bet_target") else h_rec.get("real_bet_badge", "実戦推奨"))
                     real_target_races.append({
                         "race_id": p_row["race_id"],
                         "race_name": dj.get("race_name", p_row["race_id"]),
                         "amount": amt,
-                        "badge": h_rec.get("real_bet_badge", "実戦推奨")
+                        "badge": badge
                     })
 
         return total_remaining_amount, len(real_target_races), real_target_races
