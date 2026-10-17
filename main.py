@@ -54,6 +54,11 @@ from app.routers.batch import (
     BatchStartResponse,
     BatchStatusResponse
 )
+from app.routers.settlement import (
+    router as settlement_router,
+    set_settlement_handler,
+    VerificationResult
+)
 
 _strategy_arbiter = StrategyArbiter()
 
@@ -63,6 +68,7 @@ app.include_router(betting_router)
 app.include_router(admin_router)
 app.include_router(summary_router)
 app.include_router(batch_router)
+app.include_router(settlement_router)
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -661,43 +667,7 @@ def calc_trio_odds(o1: float, o2: float, o3: float) -> float:
 
 
 
-class VerificationResult(BaseModel):
-    race_id: str
-    race_name: str
-    is_pass: bool
-    grade: str
-    target_umaban: Optional[int]
-    horse_name: Optional[str]
-    actual_order: Optional[int]
-    is_hit: bool
-    total_bet: int
-    total_payout: int
-    profit: int
-    recovery_rate: float
-    from_cache: bool
-    message: str
-    hypothetical_bet: Optional[int] = None
-    hypothetical_payout: Optional[int] = None
-    pass_benefit: Optional[int] = None
-    strategy_type: Optional[str] = "hybrid"
-    hit_type: Optional[str] = None
-    bet_breakdown: Optional[Dict[str, int]] = {}
-    payout_breakdown: Optional[Dict[str, int]] = {}
-    bet_details: Optional[Any] = None
-    payout_details: Optional[Any] = None
-    umaren_bet: Optional[int] = 0
-    trio_bet: Optional[int] = 0
-    tansho_bet: Optional[int] = 0
-    fukusho_bet: Optional[int] = 0
-    umatan_bet: Optional[int] = 0
-    umaren_payout: Optional[int] = 0
-    trio_payout: Optional[int] = 0
-    tansho_payout: Optional[int] = 0
-    fukusho_payout: Optional[int] = 0
-    umatan_payout: Optional[int] = 0
-    mark_orders: Optional[List[dict]] = None
-    top3_orders: Optional[List[dict]] = None
-    target_popularity: Optional[int] = None
+
 
 
 
@@ -5319,7 +5289,6 @@ def resolve_race_date_for_id(race_id: str) -> str:
     return today_jst_str()
 
 
-@app.get("/result/{race_id}", response_model=VerificationResult)
 def verify_race_result(
     race_id: str,
     bypass_cache: bool = Query(False, description="キャッシュをバイパスして最新結果を取得"),
@@ -5396,6 +5365,8 @@ def verify_race_result(
         race_res=race_res,
         from_cache=from_cache
     )
+
+set_settlement_handler(verify_race_result)
 
 
 # =========================================================================

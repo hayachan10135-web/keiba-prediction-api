@@ -103,3 +103,4 @@ def recalculate_period_records_endpoint():
     if not _recalculate_period_fn:
         raise HTTPException(status_code=500, detail="再計算ワーカーが未初期化です。")
     return _recalculate_period_fn()
+
