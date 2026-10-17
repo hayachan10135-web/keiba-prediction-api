@@ -296,3 +296,4 @@ def get_summary_dates_list(force_refresh: bool = False) -> List[str]:
     except Exception as e:
         print(f"日付一覧取得エラー: {e}")
         return [today_str]
+

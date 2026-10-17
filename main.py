@@ -47,6 +47,13 @@ from app.settlement.summary_calculator import (
     invalidate_summary_caches
 )
 from app.routers.summary import router as summary_router
+from app.routers.batch import (
+    router as batch_router,
+    set_batch_workers,
+    batch_status,
+    BatchStartResponse,
+    BatchStatusResponse
+)
 
 _strategy_arbiter = StrategyArbiter()
 
@@ -55,6 +62,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.include_router(betting_router)
 app.include_router(admin_router)
 app.include_router(summary_router)
+app.include_router(batch_router)
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -691,26 +699,7 @@ class VerificationResult(BaseModel):
     top3_orders: Optional[List[dict]] = None
     target_popularity: Optional[int] = None
 
-class BatchStartResponse(BaseModel):
-    status: str
-    message: str
 
-class BatchStatusResponse(BaseModel):
-    is_running: bool
-    total: int
-    current: int
-    predicted: int
-    settled: int
-    message: str
-
-batch_status = {
-    "is_running": False,
-    "total": 0,
-    "current": 0,
-    "predicted": 0,
-    "settled": 0,
-    "message": "待機中"
-}
 
 @app.get("/")
 @app.get("/health")
@@ -5549,50 +5538,6 @@ def run_batch_worker(
         invalidate_summary_caches()
 
 
-def start_batch_thread(target_date: Optional[str] = None, mode: str = "all", force_predict: bool = False) -> BatchStartResponse:
-    global batch_status
-    if batch_status["is_running"]:
-        return {
-            "status": "already_running",
-            "message": f"現在処理中です ({batch_status['current']}/{batch_status['total']}レース進行中)"
-        }
-
-    thread = threading.Thread(
-        target=run_batch_worker,
-        args=(target_date, mode, force_predict),
-        daemon=True
-    )
-    thread.start()
-
-    return {
-        "status": "started",
-        "message": f"バックグラウンドで今開催期間の未処理レース一括処理を開始しました (モード: {mode})。"
-    }
-
-
-@app.post("/batch/today", response_model=BatchStartResponse)
-def run_today_batch(
-    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD、未指定時は開催期間全体)"),
-    mode: str = Query("all", description="処理モード: all (予想＆照合), predict (予想のみ), settle (照合のみ)"),
-    force: bool = Query(False, description="強制再予想フラグ")
-):
-    return start_batch_thread(date, mode=mode, force_predict=force)
-
-
-@app.post("/batch/predict", response_model=BatchStartResponse)
-def run_predict_batch(
-    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)"),
-    force: bool = Query(False, description="強制再予想フラグ")
-):
-    return start_batch_thread(date, mode="predict", force_predict=force)
-
-
-@app.get("/batch/status", response_model=BatchStatusResponse)
-def get_batch_status():
-    return batch_status
-
-
-@app.post("/batch/recalculate-period")
 def recalculate_period_records():
     """今開催期間のキャッシュ済み予想・確定成績に最新の買い目・実戦推奨ロジックを再適用して一括更新"""
     if not supabase:
@@ -5761,6 +5706,8 @@ def recalculate_period_records():
         "real_bet_recovery_rate": rb_roi,
         "pass_benefit_total": total_pass_benefit
     }
+
+set_batch_workers(run_batch_worker, recalculate_period_records)
 
 
 # =========================================================================

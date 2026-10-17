@@ -382,3 +382,4 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="é›
         cumulative_real_bet_profit=0,
         cumulative_real_bet_recovery_rate=0.0
     )
+
