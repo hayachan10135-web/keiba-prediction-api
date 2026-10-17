@@ -22,3 +22,4 @@ WHERE is_manual_bet IS NULL;
 
 -- 完了メッセージ
 COMMENT ON COLUMN keiba_real_bets.is_manual_bet IS '手動・実機テスト投票フラグ (TRUEの場合、AI公式収支サマリーから完全除外)';
+
