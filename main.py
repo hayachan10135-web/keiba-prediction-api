@@ -1672,39 +1672,49 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 if vr_id and vr_id in raw_preds_cache:
                     c_d = raw_preds_cache[vr_id]
                     c_hrec = c_d.get("hybrid_recommendation")
-                    if c_hrec and (c_hrec.get("real_bet_level") != "virtual" or c_hrec.get("real_bet_badge") != v_race["real_bet_badge"]):
+                    if c_hrec and (
+                        c_hrec.get("real_bet_level") != "virtual"
+                        or c_hrec.get("real_bet_badge") != v_race["real_bet_badge"]
+                        or c_hrec.get("virtual_badge") != v_race["real_bet_badge"]
+                    ):
                         c_hrec["is_virtual_bet_target"] = True
                         c_hrec["virtual_bet_slot"] = slot_idx
                         c_hrec["real_bet_level"] = "virtual"
                         c_hrec["real_bet_badge"] = v_race["real_bet_badge"]
+                        c_hrec["virtual_badge"] = v_race["real_bet_badge"]
                         if supabase:
                             try:
                                 supabase.table("keiba_predictions_cache").update({"data_json": c_d}).eq("race_id", vr_id).execute()
                             except Exception as ue:
                                 print(f"仮想枠キャッシュ同期エラー ({vr_id}): {ue}")
 
-        # 会場内でトップ3から漏れた平地レースの仮想枠ステータスを整合
-        for other_r in eligible_for_virtual[3:]:
+        # 会場内でトップ3から漏れた全レース（新馬・障害含む）の仮想枠ステータスを「見送り(none)」に完全整合
+        for other_r in races_in_venue:
             or_id = other_r.get("race_id")
             if or_id and or_id not in top3_virtual_ids and not other_r.get("is_real_bet_target"):
-                if other_r.get("real_bet_level") == "virtual":
-                    other_r["is_virtual_bet_target"] = False
-                    other_r["virtual_bet_slot"] = None
-                    other_r["real_bet_level"] = "none"
-                    other_r["real_bet_badge"] = None
-                    if or_id in raw_preds_cache:
-                        c_d = raw_preds_cache[or_id]
-                        c_hrec = c_d.get("hybrid_recommendation")
-                        if c_hrec and c_hrec.get("real_bet_level") == "virtual":
-                            c_hrec["is_virtual_bet_target"] = False
-                            c_hrec["virtual_bet_slot"] = None
-                            c_hrec["real_bet_level"] = "none"
-                            c_hrec["real_bet_badge"] = None
-                            if supabase:
-                                try:
-                                    supabase.table("keiba_predictions_cache").update({"data_json": c_d}).eq("race_id", or_id).execute()
-                                except Exception:
-                                    pass
+                other_r["is_virtual_bet_target"] = False
+                other_r["virtual_bet_slot"] = None
+                other_r["real_bet_level"] = "none"
+                other_r["real_bet_badge"] = None
+                if or_id in raw_preds_cache:
+                    c_d = raw_preds_cache[or_id]
+                    c_hrec = c_d.get("hybrid_recommendation")
+                    if c_hrec and (
+                        c_hrec.get("real_bet_level") == "virtual"
+                        or c_hrec.get("is_virtual_bet_target")
+                        or c_hrec.get("virtual_badge") is not None
+                        or c_hrec.get("real_bet_badge") is not None
+                    ):
+                        c_hrec["is_virtual_bet_target"] = False
+                        c_hrec["virtual_bet_slot"] = None
+                        c_hrec["real_bet_level"] = "none"
+                        c_hrec["real_bet_badge"] = None
+                        c_hrec["virtual_badge"] = None
+                        if supabase:
+                            try:
+                                supabase.table("keiba_predictions_cache").update({"data_json": c_d}).eq("race_id", or_id).execute()
+                            except Exception:
+                                pass
 
     return venues
 
@@ -3452,7 +3462,7 @@ def compute_hybrid_rec_from_inputs(
     elif w0_u > 0:
         est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
         virtual_strategy_name = "🎮 仮想観戦枠: 安定単複 (単100円＋複100円)"
-        virtual_badge = "🎮【仮想観戦】単複ミニマム"
+        virtual_badge = None
         virtual_bets = [
             {
                 "ticket_type": "単勝",
@@ -4035,7 +4045,7 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
 
 
 def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: Optional[str] = None) -> dict:
-    """レース一覧側で選定された確信度上位3枠（仮想観戦枠）情報をhybrid_recommendationにも反映"""
+    """レース一覧側で選定された確信度上位3枠（仮想観戦枠）情報をhybrid_recommendationにも反映（対象外は見送りに整合）"""
     if not pred_data or not isinstance(pred_data, dict):
         return pred_data
     h_rec = pred_data.get("hybrid_recommendation")
@@ -4046,6 +4056,21 @@ def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: O
         return pred_data
 
     target_d = race_date or today_jst_str()
+
+    def _apply_venue_race_sync(r_item: dict):
+        if r_item.get("is_virtual_bet_target"):
+            h_rec["is_virtual_bet_target"] = True
+            h_rec["virtual_bet_slot"] = r_item.get("virtual_bet_slot")
+            h_rec["real_bet_level"] = r_item.get("real_bet_level", "virtual")
+            h_rec["real_bet_badge"] = r_item.get("real_bet_badge")
+            h_rec["virtual_badge"] = r_item.get("real_bet_badge")
+        else:
+            h_rec["is_virtual_bet_target"] = False
+            h_rec["virtual_bet_slot"] = None
+            h_rec["real_bet_level"] = "none"
+            h_rec["real_bet_badge"] = None
+            h_rec["virtual_badge"] = None
+
     # 1. _today_races_cache から検索
     cached_venues_entry = _today_races_cache.get(target_d)
     if cached_venues_entry:
@@ -4054,11 +4079,7 @@ def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: O
         for venue in venues_list:
             for r in venue.get("races", []):
                 if r.get("race_id") == race_id:
-                    if r.get("is_virtual_bet_target"):
-                        h_rec["is_virtual_bet_target"] = True
-                        h_rec["virtual_bet_slot"] = r.get("virtual_bet_slot")
-                        h_rec["real_bet_level"] = r.get("real_bet_level", "virtual")
-                        h_rec["real_bet_badge"] = r.get("real_bet_badge")
+                    _apply_venue_race_sync(r)
                     return pred_data
 
     # 2. _today_races_cache に無ければ会場一覧から付与して解決
@@ -4069,11 +4090,7 @@ def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: O
             for venue in attached_venues:
                 for r in venue.get("races", []):
                     if r.get("race_id") == race_id:
-                        if r.get("is_virtual_bet_target"):
-                            h_rec["is_virtual_bet_target"] = True
-                            h_rec["virtual_bet_slot"] = r.get("virtual_bet_slot")
-                            h_rec["real_bet_level"] = r.get("real_bet_level", "virtual")
-                            h_rec["real_bet_badge"] = r.get("real_bet_badge")
+                        _apply_venue_race_sync(r)
                         return pred_data
     except Exception as e:
         print(f"仮想枠バッジ同期エラー ({race_id}): {e}")
@@ -4419,21 +4436,48 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
             for row in (fresh_res.data or []):
                 if row.get("race_id") and row.get("data_json"):
                     preds[row["race_id"]] = row["data_json"]
-        # 各会場確信度上位3枠（仮想観戦枠）バッジを予測データにも同期反映
+        # 各会場確信度上位3枠（仮想観戦枠）バッジを予測データにも同期反映（対象外は見送りに完全整合）
         cached_venues_entry = _today_races_cache.get(target_date)
+        venues_list = []
         if cached_venues_entry:
             v_data = cached_venues_entry[1]
             venues_list = v_data.get("venues", []) if isinstance(v_data, dict) else (v_data if isinstance(v_data, list) else [])
+        else:
+            try:
+                raw_v = fetch_venues_for_date_raw(target_date)
+                if raw_v:
+                    venues_list = attach_prediction_badges_to_venues(target_date, raw_v)
+            except Exception:
+                venues_list = []
+
+        if venues_list:
             for venue in venues_list:
                 for r in venue.get("races", []):
                     rid = r.get("race_id")
-                    if rid in preds and r.get("is_virtual_bet_target"):
+                    if rid in preds:
                         hr = preds[rid].get("hybrid_recommendation")
                         if hr and not hr.get("is_real_bet_target"):
-                            hr["is_virtual_bet_target"] = True
-                            hr["virtual_bet_slot"] = r.get("virtual_bet_slot")
-                            hr["real_bet_level"] = r.get("real_bet_level", "virtual")
-                            hr["real_bet_badge"] = r.get("real_bet_badge")
+                            if r.get("is_virtual_bet_target"):
+                                hr["is_virtual_bet_target"] = True
+                                hr["virtual_bet_slot"] = r.get("virtual_bet_slot")
+                                hr["real_bet_level"] = r.get("real_bet_level", "virtual")
+                                hr["real_bet_badge"] = r.get("real_bet_badge")
+                                hr["virtual_badge"] = r.get("real_bet_badge")
+                            else:
+                                hr["is_virtual_bet_target"] = False
+                                hr["virtual_bet_slot"] = None
+                                hr["real_bet_level"] = "none"
+                                hr["real_bet_badge"] = None
+                                hr["virtual_badge"] = None
+        else:
+            for rid, p_obj in preds.items():
+                hr = p_obj.get("hybrid_recommendation")
+                if hr and not hr.get("is_real_bet_target") and hr.get("real_bet_level") != "virtual":
+                    hr["is_virtual_bet_target"] = False
+                    hr["virtual_bet_slot"] = None
+                    hr["real_bet_level"] = "none"
+                    hr["real_bet_badge"] = None
+                    hr["virtual_badge"] = None
 
         result_payload = {
             "date": target_date,
