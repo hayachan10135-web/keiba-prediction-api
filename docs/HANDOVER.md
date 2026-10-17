@@ -35,33 +35,22 @@
 
 ## 2. 現在の実装状況（Status: 2026年10月17日 22:45 現在）
 
-### ① バックエンドの物理モジュール分割（✅ 本番デプロイ・安定稼働完了）
-肥大化していた単一 `main.py` をドメイン別に完全物理分割し、責務分離・テスト容易性・保守性を確立しました：
-- **`app/core/`**:
-  - `config.py`: 環境変数・定数・モデルパス
-  - `database.py`: Supabaseクライアントシングルトン（エラーハンドリング強化）
-  - `timezone.py`: JSTタイムゾーン安全パース・ISO変換
-- **`app/strategies/`**:
-  - `base.py`: 戦略基底抽象クラス（`BaseStrategy`）
-  - `strategy_b.py`: モデルB・高回収率単勝＋複勝（芝外枠先行・ダート）
-  - `strategy_a.py`: モデルA・標準券種（馬連・馬単・3連複・ワイド）
-  - `strategy_a_hole.py`: 穴馬特化・中穴狙い
-  - `strategy_c.py`: トラックバイアス順張り
-  - `daily_promotion.py`: デイリー1レース保証（`ensure_daily_single_real_bet`）
-  - `trigami_pruner.py`: トリガミ抑止・オッズ期待値プルーニング
-  - `arbiter.py`: 戦略調停エンジン（`StrategyArbiter`）
-- **`app/betting/`**:
-  - `base_client.py`: 投票クライアント基底インターフェース
-  - `ipat_client.py`: 即PAT pure-requests 超高速クラウドアダプタ（セッション遷移堅牢化済）
-  - `umaca_client.py`: UMACAスマート照会・発注アダプタ
-  - `factory.py`: モード別クライアント生成ファクトリ
-  - `manual_service.py`: マニュアル実機テスト投票サービス（`is_manual_bet=true` 永続化）
-- **`app/scrapers/`**:
-  - `netkeiba_client.py`: 指数バックオフ3回リトライ（1s -> 2s -> 4s）スクレイパー
-- **`app/settlement/`**:
-  - `payout_verifier.py`: 全券種払戻金・確定着順照合エンジン
-- **`app/ml/`**:
-  - `track_bias.py`: リアルタイムトラックバイアス判定エンジン
+### ① バックエンドの物理モジュール分割状況（⚠️ 段階移行中・main.py をエントリーポイントとして稼働中）
+Render本番環境は依然として **`main.py`（約8,400行）をエントリーポイント（`uvicorn main:app`）として稼働**しています。
+一部機能のモジュール化（`app/` ディレクトリ）は完了しており、`main.py` からインポートして使用されていますが、**完全な物理分割（main.py のスリム化・ルーター分割）は未完了**です：
+- **`app/` に切り出され `main.py` からインポート利用されているモジュール**:
+  - `app/core/timezone.py`: JSTタイムゾーン安全パース・ISO変換（`now_jst`, `today_jst_str`, `parse_post_datetime` 等）
+  - `app/strategies/arbiter.py`: 戦略調停エンジン（`StrategyArbiter`）
+  - `app/betting/factory.py`: 投票クライアント生成ファクトリ（`BettingClientFactory`）
+  - `app/betting/manual_service.py`: マニュアル実機テスト投票サービス（`execute_manual_bet`）
+- **`app/` 内にコードは存在するが、本番の `main.py` 内に同等コードが残存し直接実行されている機能**:
+  - スクレイピング（`netkeiba` からのレース情報・結果取得）
+  - AI推論エンジン（LightGBM モデルロード、特徴量計算、オッズ取得、印付け）
+  - バックグラウンド定期メンテナンスタスク（発走前自動予想、直前オッズ更新、結果自動確定）
+  - 成績確定・サマリー計算（`verify_race_result`, `get_daily_summary`, `get_aggregate_summary` 等）
+  - APIエンドポイント群（全ルーティング定義）
+- **現状の理由**:
+  週末のレース開催時の本番運用（リアルタイム自動投票・AI予想）を最優先で安定稼働させるため、8,000行の一括解体に伴う循環インポートやデプロイ破損リスクを回避し、新設機能（マニュアルテスト投票、投票ファクトリ、タイムゾーン正規化等）から安全に段階的移行を進めている状態です。
 
 ### ② 新要件 `FR-BET-07` マニュアル実機テスト投票機能（✅ 実装・実機疎通確認完了）
 - **APIエンドポイント**: `POST /betting/manual`
@@ -114,6 +103,20 @@
   AIエージェントが開発、デバッグ、テスト、保守作業中に、スクリプト実行やAPI呼び出しを通じて **実際の資金が引き落とされる実機発注（即PAT / UMACAスマートの購入確定・実投票）を執行する際は、必ず事前にユーザーへ明示的な確認（場・R・式別・馬番・金額・理由）を行い、ユーザーの承諾・許可を得てから実行すること**。
 - **検証作業の標準**:
   疎通・UI動作・パラメータ検証は `dry_run=True`（模擬発注）を最優先とし、実資金テストを行う前には必ずユーザーへ都度確認を行う。
+
+### ⑦ 予想印と確定結果着順印の二重同期・セルフヒーリング保証（✅ 2026/10/17 23:25 完了）
+予想カード（上段）と確定結果カード（下段）において、印（◎、◯等）や本命馬が食い違う問題を根本的に解消：
+1. **問題の根本原因**:
+   - レース確定直後に `verify_race_result` が実行された後、直前オッズ変動等で `predictions_cache` 側の印（◎昇格等）が更新された際、DB（`keiba_race_settlements`）の `top3_orders` や `target_umaban` が古い予想時点のまま固定化され、更新されない不具合が存在した。
+   - Androidアプリ側でも `verificationsCache` に旧結果が存在する場合、プルリフレッシュ時も再フェッチを行わず、カード描画時も画面上部の `horses` を見ずに結果レコード単体の古い印を表示していた。
+2. **バックエンドの根本改修 & 自己修復（セルフヒーリング）**:
+   - `get_cached_settlement` / `get_daily_summary` において、`pred_cache` の本命馬番（`target_umaban`）と DB の `target_umaban` に不一致が検知された場合、自動で `process_settlement_calculation` を再実行して DB を最新予想基準で完全修復。
+   - `extract_top3_orders` および新設 `sync_orders_marks` により、確定着順（`top3_orders`）や印馬着順（`mark_orders`）の印を常に最新の予想データ（`pred_cache`）の印で強制同期して返却。
+   - `save_settlement` で `top3_orders` カラムへの永続化を保証。
+   - `/admin/heal-settlement-marks` エンドポイントを新設し、DB内の全レコードを一括走査・修復可能に。
+3. **Androidアプリ側の二重防御**:
+   - `MainScreen.kt`（`RaceSettlementResultCard`）において、画面上に表示されている `horses` の印を最優先で参照（`horses?.firstOrNull { it.umaban == t.umaban }?.mark ?: t.mark`）し、同一画面内の上下の印を100%完全一致化。
+   - `MainViewModel.kt` において、発走後のプルリフレッシュ（`refreshPrediction`）時に確定キャッシュをクリアして再取得を保証。レース選択時も確定済みレースであればサイレントに最新確定データをフェッチしてキャッシュを更新。
 
 ---
 
