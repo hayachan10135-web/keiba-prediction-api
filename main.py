@@ -30,6 +30,7 @@ from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_
 from app.strategies.arbiter import StrategyArbiter
 from app.betting.factory import BettingClientFactory
 from app.betting.manual_service import execute_manual_bet
+from app.settlement.payout_verifier import PayoutVerifier
 
 _strategy_arbiter = StrategyArbiter()
 
@@ -944,7 +945,7 @@ def check_and_notify_balance_shortfall():
     cur_balance = b_settings.get("last_balance")
     if cur_balance is None:
         try:
-            client = UMACAFastClient() if cur_mode == "umaca" else IPATFastClient()
+            client = BettingClientFactory.get_client(cur_mode)
             l_res = client.login()
             if l_res.get("success"):
                 cur_balance = l_res.get("balance", 0)
@@ -5460,166 +5461,61 @@ def process_settlement_calculation(
                 "top3_orders": top3_orders
             }
 
-    # 参戦レースの場合
-    tansho_bets = hybrid_rec.get("tansho_bets") or []
-    fukusho_bets = hybrid_rec.get("fukusho_bets") or []
-    umatan_bets = hybrid_rec.get("umatan_bets") or []
-    umaren_bets = hybrid_rec.get("umaren_bets") or []
-    sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
+    # 参戦レースの場合: PayoutVerifier で全券種（単勝・複勝・馬単・馬連・三連複・3連単）を一括照合
+    all_tickets = []
+    for b in (hybrid_rec.get("tansho_bets") or []):
+        all_tickets.append({"ticket_type": "単勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
+    for b in (hybrid_rec.get("fukusho_bets") or []):
+        all_tickets.append({"ticket_type": "複勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
+    for b in (hybrid_rec.get("umatan_bets") or []):
+        all_tickets.append({"ticket_type": "馬単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+    for b in (hybrid_rec.get("umaren_bets") or []):
+        all_tickets.append({"ticket_type": "馬連", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+    for b in (hybrid_rec.get("sanrentan_bets") or []):
+        all_tickets.append({"ticket_type": "3連単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
     trio_bets = hybrid_rec.get("trio_bets") or []
     trio_bet = hybrid_rec.get("trio_bet")
     if not trio_bets and trio_bet and isinstance(trio_bet, dict) and trio_bet.get("combination"):
         trio_bets = [trio_bet]
+    for b in trio_bets:
+        all_tickets.append({"ticket_type": "三連複", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
 
     payouts_data = race_res.get("payouts", {})
-    all_hits = []
+    total_payout, all_hits, bet_breakdown, payout_breakdown = PayoutVerifier.verify_all_tickets(all_tickets, payouts_data)
 
-    # 1. 単勝照合
-    tansho_payout = 0
-    tansho_hits = []
-    tan_map = payouts_data.get("tansho", {})
-    for tb in tansho_bets:
-        comb = tb.get("combination", [])
-        u = comb[0] if comb else None
-        if u is not None:
-            unit_p = tan_map.get(u, 0) or tan_map.get(str(u), 0)
-            if unit_p > 0:
-                pay = int((tb.get("amount", 100) / 100.0) * unit_p)
-                tansho_payout += pay
-                tansho_hits.append({
-                    "type": "単勝",
-                    "comb": f"{u}",
-                    "amount": tb.get("amount"),
-                    "unit_payout": unit_p,
-                    "payout": pay
-                })
+    tan_bet_tot = bet_breakdown.get("単勝", 0)
+    fuku_bet_tot = bet_breakdown.get("複勝", 0)
+    utan_bet_tot = bet_breakdown.get("馬単", 0)
+    u_bet_tot = bet_breakdown.get("馬連", 0)
+    s_bet_tot = bet_breakdown.get("3連単", 0)
+    t_bet_tot = bet_breakdown.get("三連複", 0)
 
-    # 2. 複勝照合
-    fukusho_payout = 0
-    fukusho_hits = []
-    fuku_map = payouts_data.get("fukusho", {})
-    for fb in fukusho_bets:
-        comb = fb.get("combination", [])
-        u = comb[0] if comb else None
-        if u is not None:
-            unit_p = fuku_map.get(u, 0) or fuku_map.get(str(u), 0)
-            if unit_p > 0:
-                pay = int((fb.get("amount", 100) / 100.0) * unit_p)
-                fukusho_payout += pay
-                fukusho_hits.append({
-                    "type": "複勝",
-                    "comb": f"{u}",
-                    "amount": fb.get("amount"),
-                    "unit_payout": unit_p,
-                    "payout": pay
-                })
+    tansho_payout = payout_breakdown.get("単勝", 0)
+    fukusho_payout = payout_breakdown.get("複勝", 0)
+    umatan_payout = payout_breakdown.get("馬単", 0)
+    umaren_payout = payout_breakdown.get("馬連", 0)
+    sanrentan_payout = payout_breakdown.get("3連単", 0)
+    trio_payout = payout_breakdown.get("三連複", 0)
 
-    # 3. 馬単照合
-    umatan_payout = 0
-    umatan_hits = []
-    utan_map = payouts_data.get("umatan", {})
-    for ub in umatan_bets:
-        comb = ub.get("combination", [])
-        if len(comb) == 2:
-            comb_key1 = f"{comb[0]}-{comb[1]}"
-            comb_key2 = f"{comb[0]}→{comb[1]}"
-            unit_p = utan_map.get(comb_key1, 0) or utan_map.get(comb_key2, 0)
-            if unit_p > 0:
-                pay = int((ub.get("amount", 100) / 100.0) * unit_p)
-                umatan_payout += pay
-                umatan_hits.append({
-                    "type": "馬単",
-                    "comb": f"{comb[0]}→{comb[1]}",
-                    "amount": ub.get("amount"),
-                    "unit_payout": unit_p,
-                    "payout": pay
-                })
-
-    # 4. 馬連照合
-    umaren_payout = 0
-    umaren_hits = []
-    for ub in umaren_bets:
-        comb = ub.get("combination", [])
-        if len(comb) == 2:
-            comb_key = f"{min(comb[0], comb[1])}-{max(comb[0], comb[1])}"
-            unit_p = payouts_data.get("umaren", {}).get(comb_key, 0)
-            if unit_p > 0:
-                pay = int((ub.get("amount", 100) / 100.0) * unit_p)
-                umaren_payout += pay
-                umaren_hits.append({
-                    "type": "馬連",
-                    "comb": comb_key,
-                    "amount": ub.get("amount"),
-                    "unit_payout": unit_p,
-                    "payout": pay
-                })
-
-    # 5. 3連単照合
-    sanrentan_payout = 0
-    sanrentan_hits = []
-    for sb in sanrentan_bets:
-        comb = sb.get("combination", [])
-        if len(comb) == 3:
-            comb_key = f"{comb[0]}-{comb[1]}-{comb[2]}"
-            unit_p = payouts_data.get("tierce", {}).get(comb_key, 0)
-            if unit_p > 0:
-                pay = int((sb.get("amount", 100) / 100.0) * unit_p)
-                sanrentan_payout += pay
-                sanrentan_hits.append({
-                    "type": "3連単",
-                    "comb": f"{comb[0]}→{comb[1]}→{comb[2]}",
-                    "amount": sb.get("amount"),
-                    "unit_payout": unit_p,
-                    "payout": pay
-                })
-
-    # 6. 三連複照合
-    trio_payout = 0
-    trio_hits = []
-    for tb in trio_bets:
-        if tb and tb.get("combination"):
-            comb = sorted(tb.get("combination", []))
-            if len(comb) == 3:
-                comb_key = f"{comb[0]}-{comb[1]}-{comb[2]}"
-                unit_p = payouts_data.get("trio", {}).get(comb_key, 0)
-                if unit_p > 0:
-                    pay = int((tb.get("amount", 100) / 100.0) * unit_p)
-                    trio_payout += pay
-                    trio_hits.append({
-                        "type": "三連複",
-                        "comb": comb_key,
-                        "amount": tb.get("amount"),
-                        "unit_payout": unit_p,
-                        "payout": pay
-                    })
-
-    tan_bet_tot = sum(b.get("amount", 0) for b in tansho_bets)
-    fuku_bet_tot = sum(b.get("amount", 0) for b in fukusho_bets)
-    utan_bet_tot = sum(b.get("amount", 0) for b in umatan_bets)
-    u_bet_tot = sum(b.get("amount", 0) for b in umaren_bets)
-    s_bet_tot = sum(b.get("amount", 0) for b in sanrentan_bets)
-    t_bet_tot = sum(b.get("amount", 0) for b in trio_bets)
-
-    total_bet = tan_bet_tot + fuku_bet_tot + utan_bet_tot + u_bet_tot + s_bet_tot + t_bet_tot
-    total_payout = tansho_payout + fukusho_payout + umatan_payout + umaren_payout + sanrentan_payout + trio_payout
+    total_bet = sum(bet_breakdown.values())
     profit = total_payout - total_bet
     recovery_rate = round((total_payout / total_bet) * 100.0, 2) if total_bet > 0 else 0.0
     is_hit = total_payout > 0
 
-    all_hits = tansho_hits + fukusho_hits + umatan_hits + umaren_hits + sanrentan_hits + trio_hits
+    hit_types_found = [h["type"] for h in all_hits]
     if len(all_hits) >= 2:
         hit_type = "W的中🔥"
-    elif len(umatan_hits) > 0:
+    elif "馬単" in hit_types_found:
         hit_type = "馬単的中🎯"
-    elif len(tansho_hits) > 0:
+    elif "単勝" in hit_types_found:
         hit_type = "単勝的中🎯"
-    elif len(fukusho_hits) > 0:
+    elif "複勝" in hit_types_found:
         hit_type = "複勝的中🎯"
-    elif len(sanrentan_hits) > 0:
+    elif "3連単" in hit_types_found:
         hit_type = "3連単的中🎯"
-    elif len(trio_hits) > 0:
+    elif "三連複" in hit_types_found:
         hit_type = "三連複的中🎯"
-    elif len(umaren_hits) > 0:
+    elif "馬連" in hit_types_found:
         hit_type = "馬連的中🎯"
     else:
         hit_type = "不的中"
@@ -7138,7 +7034,7 @@ async def background_maintenance_loop():
                                                         "amount": b.get("amount", 100)
                                                     })
 
-                                                client = UMACAFastClient() if cur_bet_mode == "umaca" else IPATFastClient()
+                                                client = BettingClientFactory.get_client(cur_bet_mode)
                                                 bet_res = await asyncio.to_thread(client.execute_bets, v_name, r_no, bet_items, False)
 
                                                 if bet_res.get("status") == "success":
