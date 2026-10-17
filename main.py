@@ -26,6 +26,13 @@ from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
 from umaca_fast_client import UMACAFastClient
 
+from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_post_datetime
+from app.strategies.arbiter import StrategyArbiter
+from app.betting.factory import BettingClientFactory
+from app.betting.manual_service import execute_manual_bet
+
+_strategy_arbiter = StrategyArbiter()
+
 app = FastAPI(title="Keiba Prediction & Verification API")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -1102,6 +1109,41 @@ def test_ipat_endpoint(mode: Optional[str] = Query(None, description="テスト�
             "platform": target_mode,
             "error": f"接続テスト例外エラー: {e}"
         }
+
+class ManualBetItem(BaseModel):
+    ticket_type: str
+    combination: List[int]
+    amount: int
+
+class ManualBetRequest(BaseModel):
+    race_id: str
+    venue_name: str
+    race_no: int
+    items: List[ManualBetItem]
+    mode: Optional[str] = None
+    dry_run: bool = False
+
+@app.post("/betting/manual")
+def manual_bet_endpoint(req: ManualBetRequest):
+    """
+    新要件 FR-BET-07: マニュアル（手動・実機テスト）投票API
+    ★【厳格な集計除外規定】: is_manual_bet=True で記録され、AI収支集計から完全に除外されます。
+    """
+    settings = load_betting_settings_from_supabase()
+    target_mode = (req.mode or settings.get("betting_mode") or "ipat").lower().strip()
+    if target_mode == "off":
+        raise HTTPException(status_code=400, detail="投票モードがOFFになっています。設定画面からipatまたはumacaを選択してください。")
+
+    items_dicts = [item.dict() for item in req.items]
+    res = execute_manual_bet(
+        race_id=req.race_id,
+        venue_name=req.venue_name,
+        race_no=req.race_no,
+        items=items_dicts,
+        mode=target_mode,
+        dry_run=req.dry_run
+    )
+    return res
 
 @app.get("/notify/test")
 @app.post("/notify/test")
@@ -3137,478 +3179,25 @@ def compute_hybrid_rec_from_inputs(
     is_daily_top_race: bool = False
 ) -> dict:
     """
-    【B -> A -> C カスケード動的配分モデル × トラックバイアス・オッズ推移連動】
-    ・本命馬(w0):
-      - トラックバイアス合致(追い風: 絶好/有利/合致)時は、投資比率を1.5倍に資金ブースト（厚張り）！
-      - トラックバイアス逆風(外枠逆風/内枠逆風)時も、ThreeTierの能力・オッズ妙味で激走可能なため見送り(PASS)せず基準投資(1.0倍)を継続。
-    ・相手馬(ヒモ):
-      - 過剰人気馬(overbet)のヒモ除外
-      - 逆風馬(adverse)のヒモ除外
-      - 妙味穴(value_gap)、連続急落穴、絶好バイアス穴(4.0〜50倍)のヒモ優先昇格！
+    【モジュール分離アーキテクチャ】
+    買い目戦略・調停・トリガミ防止・スリッページ停止判定を app/strategies/arbiter.py へ委任
     """
-    course_details_str = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
-    if "障害" in race_name or "障" in course_details_str:
-        surface_type = 2
-    is_shinba = ("新馬" in race_name) or ("メイクデビュー" in race_name)
-
-    has_enough_horses = len(horses) >= 6
-    is_valid_race_type = (surface_type != 2) and (not is_shinba) and has_enough_horses
-
-    # AI勝率順ソート (Model B)
-    s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
-    w0 = s_win[0] if s_win else {}
-    w1 = s_win[1] if len(s_win) > 1 else w0
-
-    # AI複勝率順ソート (Model B)
-    s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
-    t0 = s_top3[0] if s_top3 else {}
-    t1 = s_top3[1] if len(s_top3) > 1 else t0
-    t2 = s_top3[2] if len(s_top3) > 2 else t1
-
-    w0_prob = float(w0.get("prob_win", 0.0))
-    w1_prob = float(w1.get("prob_win", 0.0))
-    w0_odds = float(w0.get("odds") or 50.0)
-    w0_u = int(w0.get("umaban", 0))
-    w0_name = str(w0.get("horse_name", f"馬{w0_u}"))
-
-    t0_prob = float(t0.get("prob_top3", 0.0))
-    t1_prob = float(t1.get("prob_top3", 0.0))
-    t2_prob = float(t2.get("prob_top3", 0.0))
-
-    win_margin = w0_prob - w1_prob
-    win_edge = w0_prob * w0_odds
-    top3_margin_0_1 = t0_prob - t1_prob
-    top3_margin_1_2 = t1_prob - t2_prob
-
-    confidence_score = round(
-        win_margin * 2.0 +
-        top3_margin_0_1 +
-        top3_margin_1_2 +
-        float(np.clip(win_edge - 1.0, -0.5, 0.5)),
-        4
+    return _strategy_arbiter.evaluate_race(
+        race_name=race_name,
+        race_details=race_details,
+        horses=horses,
+        surface_type=surface_type,
+        prob_gachi=prob_gachi,
+        prob_himo=prob_himo,
+        opponents=opponents,
+        u0=u0,
+        honmei_horse=honmei_horse,
+        race_date_str=race_date_str,
+        force_final_odds=force_final_odds,
+        real_trio_odds=real_trio_odds,
+        track_bias_data=track_bias_data,
+        is_daily_top_race=is_daily_top_race
     )
-    edge_ratio = round(win_edge, 2)
-
-    # トラックバイアス判定 (本命馬)
-    w0_bias = str(w0.get("bias_match") or "")
-    is_bias_favorable = any(fav in w0_bias for fav in ("絶好バイアス", "有利", "合致"))
-    is_bias_adverse = "逆風" in w0_bias
-    bias_boost_mult = 1.5 if is_bias_favorable else 1.0
-    bias_tag = " [⚡バイアス追い風×1.5倍]" if is_bias_favorable else (" [⚠️逆風激走期待]" if is_bias_adverse else "")
-
-    # 確定オッズ・発走前判定 (Stage 5: 発走7分前〜5分前以降は確定オッズ扱い)
-    is_final_odds = force_final_odds
-    if not is_final_odds:
-        post_time_str = race_details.get("post_time", "") if race_details else ""
-        m_time = re.search(r"(\d{1,2}):(\d{2})", post_time_str)
-        if m_time:
-            try:
-                hh, mm = int(m_time.group(1)), int(m_time.group(2))
-                now_dt = now_jst_naive()
-                r_date_str = race_date_str or today_jst_str()
-                d_parts = [int(p) for p in r_date_str.split("-")]
-                post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hh, mm)
-                if now_dt >= post_dt - datetime.timedelta(minutes=7):
-                    is_final_odds = True
-            except Exception:
-                pass
-
-    suffix = " (確定)" if is_final_odds else " (暫定)"
-
-    # 季節判定 (夏競馬: 6〜9月)
-    try:
-        month_num = int(race_date_str[5:7]) if (race_date_str and len(race_date_str) >= 7 and race_date_str[5:7].isdigit()) else now_jst().month
-    except Exception:
-        month_num = now_jst().month
-    is_summer = 1 if 6 <= month_num <= 9 else 0
-
-    assigned_tier = None
-    tansho_bets = []
-    fukusho_bets = []
-    umatan_bets = []
-    skip_reason = None
-
-    if is_valid_race_type:
-        # -------------------------------------------------------------
-        # 優先度 1: 戦略B (超高確信度馬単レバレッジ)
-        # -------------------------------------------------------------
-        if confidence_score >= 0.78 and (2.5 <= w0_odds <= 10.0):
-            assigned_tier = "B"
-            strategy_type = "strategy_b"
-            b_tan_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
-            b_utan_amt = int(round(200 * bias_boost_mult / 100.0) * 100)
-            strategy_name = f"🔥 戦略B: 超高確信度馬単レバレッジ (単{b_tan_amt}円＋馬単各{b_utan_amt}円)"
-            real_bet_badge = f"🔥【超勝負R】単勝＋馬単レバレッジ{bias_tag}{suffix}"
-            real_bet_level = "high"
-            is_participate = True
-            is_real_bet_target = True
-
-            # 単勝
-            tansho_bets.append({
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": b_tan_amt,
-                "odds": w0_odds,
-                "expected_payout": int(round(b_tan_amt * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝 {w0_u}番 ({w0_name}){bias_tag} {b_tan_amt}円"
-            })
-
-            # 馬単 相手3頭
-            # 1. 過剰人気馬(overbet)の排除
-            # 2. 逆風馬(adverse)のヒモ除外 (候補が3頭以上残る場合)
-            # 3. 妙味穴(value_gap)、連続急落穴、絶好バイアス穴(4.0〜50倍)のヒモ優先昇格
-            candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
-            non_overbet_opps = [h for h in candidate_opps if h.get("odds_trend") != "overbet"]
-            base_pool = non_overbet_opps if len(non_overbet_opps) >= 3 else candidate_opps
-
-            # 逆風馬除外フィルタ
-            non_adverse_opps = [h for h in base_pool if "逆風" not in str(h.get("bias_match") or "")]
-            candidate_pool = non_adverse_opps if len(non_adverse_opps) >= 3 else base_pool
-
-            boosted_opps = []
-            normal_opps = []
-            for h in candidate_pool:
-                o_val = float(h.get("odds") or 0.0)
-                is_val_gap = (h.get("odds_trend") == "value_gap")
-                alert_txt = str(h.get("odds_alert") or "")
-                b_match = str(h.get("bias_match") or "")
-                is_cont_plunge = ("連続急落" in alert_txt) and (3.5 <= o_val <= 35.0)
-                is_bias_sweet = ("絶好バイアス" in b_match) and (4.0 <= o_val <= 50.0)
-
-                if is_val_gap or is_cont_plunge or is_bias_sweet:
-                    if is_val_gap:
-                        tag_reason = "💎妙味穴"
-                    elif is_bias_sweet:
-                        tag_reason = "🎯絶好穴"
-                    else:
-                        tag_reason = "🔥連続急落"
-                    boosted_opps.append((h, tag_reason))
-                else:
-                    normal_opps.append(h)
-
-            # 優先穴馬（最大2頭まで）＋ 残りはAI勝率順で選定（計3頭）
-            selected_opps = []
-            selected_u_set = set()
-            for h, reason in boosted_opps[:2]:
-                u_n = int(h["umaban"])
-                selected_opps.append((h, reason))
-                selected_u_set.add(u_n)
-
-            for h in normal_opps:
-                u_n = int(h["umaban"])
-                if u_n not in selected_u_set:
-                    selected_opps.append((h, "AI本線"))
-                    selected_u_set.add(u_n)
-                if len(selected_opps) >= 3:
-                    break
-
-            for h in candidate_pool:
-                u_n = int(h["umaban"])
-                if u_n not in selected_u_set:
-                    selected_opps.append((h, "AI本線"))
-                    selected_u_set.add(u_n)
-                if len(selected_opps) >= 3:
-                    break
-
-            for h_opp, tag in selected_opps[:3]:
-                opp = int(h_opp["umaban"])
-                opp_name = str(h_opp.get("horse_name", f"馬{opp}"))
-                opp_odds = float(h_opp.get("odds") or 10.0)
-                est_utan_odds = round(max(3.0, w0_odds * opp_odds * 0.8), 1)
-                tag_str = f" [{tag}]" if tag != "AI本線" else ""
-                umatan_bets.append({
-                    "ticket_type": "馬単",
-                    "combination": [w0_u, opp],
-                    "combination_str": f"{w0_u}→{opp}",
-                    "amount": b_utan_amt,
-                    "odds": est_utan_odds,
-                    "expected_payout": int(round(b_utan_amt * est_utan_odds)),
-                    "is_real_odds": False,
-                    "memo": f"馬単 軸{w0_u}→{opp}番 ({opp_name}){tag_str} {b_utan_amt}円"
-                })
-
-        # -------------------------------------------------------------
-        # 優先度 2: 戦略A (芝厳選エッジ比例ケリー傾斜)
-        # -------------------------------------------------------------
-        elif surface_type == 0 and confidence_score >= 0.72:
-            assigned_tier = "A"
-            strategy_type = "strategy_a"
-            strategy_name = "⭐ 戦略A: 芝厳選エッジ投資 (単複ケリー傾斜配分)"
-            real_bet_badge = f"⭐【芝厳選】単複ケリー傾斜{bias_tag}{suffix}"
-            real_bet_level = "standard"
-            is_participate = True
-            is_real_bet_target = True
-
-            mult = float(np.clip(win_edge, 0.7, 1.8)) * bias_boost_mult
-            bt = int(round(1000.0 * mult * 0.75 / 100.0) * 100)
-            bf = int(round(1000.0 * mult * 0.25 / 100.0) * 100)
-
-            if bt > 0:
-                tansho_bets.append({
-                    "ticket_type": "単勝",
-                    "combination": [w0_u],
-                    "combination_str": f"{w0_u}",
-                    "amount": bt,
-                    "odds": w0_odds,
-                    "expected_payout": int(round(bt * w0_odds)),
-                    "is_real_odds": True,
-                    "memo": f"単勝(ケリー傾斜) {w0_u}番 ({w0_name}){bias_tag} {bt}円"
-                })
-            if bf > 0:
-                est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-                fukusho_bets.append({
-                    "ticket_type": "複勝",
-                    "combination": [w0_u],
-                    "combination_str": f"{w0_u}",
-                    "amount": bf,
-                    "odds": est_fuku_odds,
-                    "expected_payout": int(round(bf * est_fuku_odds)),
-                    "is_real_odds": False,
-                    "memo": f"複勝(ケリー傾斜) {w0_u}番 ({w0_name}){bias_tag} {bf}円"
-                })
-
-        # -------------------------------------------------------------
-        # 優先度 3: 戦略C (ダート手堅い本命単複)
-        # -------------------------------------------------------------
-        elif surface_type == 1 and is_summer == 0 and confidence_score >= 0.72 and (2.2 <= w0_odds <= 6.0):
-            assigned_tier = "C"
-            strategy_type = "strategy_c"
-            c_tan_amt = int(round(700 * bias_boost_mult / 100.0) * 100)
-            c_fuku_amt = int(round(300 * bias_boost_mult / 100.0) * 100)
-            strategy_name = f"🛡️ 戦略C: ダート手堅い本命 (単{c_tan_amt}円＋複{c_fuku_amt}円)"
-            real_bet_badge = f"🛡️【ダート本命】手堅い単複防衛{bias_tag}{suffix}"
-            real_bet_level = "standard"
-            is_participate = True
-            is_real_bet_target = True
-
-            tansho_bets.append({
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": c_tan_amt,
-                "odds": w0_odds,
-                "expected_payout": int(round(c_tan_amt * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝(本命厚め) {w0_u}番 ({w0_name}){bias_tag} {c_tan_amt}円"
-            })
-            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-            fukusho_bets.append({
-                "ticket_type": "複勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": c_fuku_amt,
-                "odds": est_fuku_odds,
-                "expected_payout": int(round(c_fuku_amt * est_fuku_odds)),
-                "is_real_odds": False,
-                "memo": f"複勝(防衛) {w0_u}番 ({w0_name}){bias_tag} {c_fuku_amt}円"
-            })
-
-        # -------------------------------------------------------------
-        # 優先度 4: 戦略A-2 (芝波乱妙味拾い上げ: 単500円＋複500円)
-        # 条件: 芝 かつ confidence_score >= 0.70 かつ w0_odds >= 6.0 かつ prob_gachi <= 0.10
-        # -------------------------------------------------------------
-        elif surface_type == 0 and confidence_score >= 0.70 and w0_odds >= 6.0 and prob_gachi <= 0.10:
-            assigned_tier = "A_hole"
-            strategy_type = "strategy_a_hole"
-            h_tan_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
-            h_fuku_amt = int(round(500 * bias_boost_mult / 100.0) * 100)
-            strategy_name = f"⚡ 戦略A-2: 芝波乱妙味 (単{h_tan_amt}円＋複{h_fuku_amt}円)"
-            real_bet_badge = f"⚡【芝波乱妙味】単複好配当狙い{bias_tag}{suffix}"
-            real_bet_level = "standard"
-            is_participate = True
-            is_real_bet_target = True
-
-            tansho_bets.append({
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": h_tan_amt,
-                "odds": w0_odds,
-                "expected_payout": int(round(h_tan_amt * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝(妙味狙い) {w0_u}番 ({w0_name}){bias_tag} {h_tan_amt}円"
-            })
-            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-            fukusho_bets.append({
-                "ticket_type": "複勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": h_fuku_amt,
-                "odds": est_fuku_odds,
-                "expected_payout": int(round(h_fuku_amt * est_fuku_odds)),
-                "is_real_odds": False,
-                "memo": f"複勝(妙味狙い) {w0_u}番 ({w0_name}){bias_tag} {h_fuku_amt}円"
-            })
-
-        elif is_daily_top_race:
-            assigned_tier = "Daily_No1"
-            strategy_type = "daily_top"
-            is_participate = True
-            is_real_bet_target = True
-            real_bet_level = "standard"
-
-            # 適性に応じた買い目配分 (ダート本命防衛 or 芝妙味 or 芝本命)
-            if surface_type == 1:
-                d_tan = 700
-                d_fuku = 300
-                strategy_name = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                real_bet_badge = f"⭐【本日厳選No.1】ダート適性単複{bias_tag}{suffix}"
-            elif w0_odds >= 5.0 or prob_gachi <= 0.15:
-                d_tan = 500
-                d_fuku = 500
-                strategy_name = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                real_bet_badge = f"⭐【本日厳選No.1】芝妙味単複{bias_tag}{suffix}"
-            else:
-                d_tan = 700
-                d_fuku = 300
-                strategy_name = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                real_bet_badge = f"⭐【本日厳選No.1】芝本命単複{bias_tag}{suffix}"
-
-            tansho_bets.append({
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": d_tan,
-                "odds": w0_odds,
-                "expected_payout": int(round(d_tan * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝(デイリー厳選) {w0_u}番 ({w0_name}){bias_tag} {d_tan}円"
-            })
-            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-            fukusho_bets.append({
-                "ticket_type": "複勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": d_fuku,
-                "odds": est_fuku_odds,
-                "expected_payout": int(round(d_fuku * est_fuku_odds)),
-                "is_real_odds": False,
-                "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}){bias_tag} {d_fuku}円"
-            })
-
-        else:
-            # カスケード全条件不一致 -> 見送り
-            is_participate = False
-            is_real_bet_target = False
-            real_bet_level = "none"
-            real_bet_badge = None
-            strategy_name = "見送り推奨 (資金保全)"
-            strategy_type = "skip"
-            skip_reason = "カスケード条件不一致 (資金保全のため見送り)"
-    else:
-        # 頭数不足 / 障害戦 / 新馬戦 -> 見送り
-        is_participate = False
-        is_real_bet_target = False
-        real_bet_level = "none"
-        real_bet_badge = None
-        strategy_name = "見送り推奨 (資金保全)"
-        strategy_type = "skip"
-        if not has_enough_horses:
-            skip_reason = f"出走頭数不足 ({len(horses)}頭 < 6頭のため見送り)"
-        elif surface_type == 2:
-            skip_reason = "障害戦除外 (不確実性高のため見送り)"
-        elif is_shinba:
-            skip_reason = "新馬戦除外 (過去走データなしのため見送り)"
-        else:
-            skip_reason = "見送り推奨"
-
-    tan_amt = sum(b["amount"] for b in tansho_bets)
-    fuku_amt = sum(b["amount"] for b in fukusho_bets)
-    utan_amt = sum(b["amount"] for b in umatan_bets)
-    total_amount = tan_amt + fuku_amt + utan_amt
-
-    if is_participate:
-        if assigned_tier == "B":
-            summary_str = f"{strategy_name} [単勝{w0_u} 500円 ＋ 馬単{len(umatan_bets)}点 各200円 / 計{total_amount:,}円]"
-        elif assigned_tier in ("A", "A_hole"):
-            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u} {w0_name}) / 計{total_amount:,}円]"
-        elif assigned_tier in ("C", "Daily_No1"):
-            summary_str = f"{strategy_name} [単勝{tan_amt:,}円 ＋ 複勝{fuku_amt:,}円 (軸{w0_u} {w0_name}) / 計{total_amount:,}円]"
-        reason_str = f"戦略{assigned_tier}採択"
-    else:
-        summary_str = f"見送り推奨 ({skip_reason})"
-        reason_str = skip_reason
-
-    # 仮想馬券 (Tier 2 観戦枠 / 単100円 + 複100円)
-    virtual_bets = []
-    virtual_total_amount = 0
-    virtual_strategy_name = None
-    virtual_badge = None
-
-    if is_real_bet_target:
-        virtual_bets = tansho_bets + fukusho_bets + umatan_bets
-        virtual_total_amount = total_amount
-        virtual_strategy_name = strategy_name
-        virtual_badge = real_bet_badge
-    elif w0_u > 0:
-        est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-        virtual_strategy_name = "🎮 仮想観戦枠: 安定単複 (単100円＋複100円)"
-        virtual_badge = None
-        virtual_bets = [
-            {
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": 100,
-                "odds": w0_odds,
-                "expected_payout": int(round(100 * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝 {w0_u} ({w0_name}) 100円"
-            },
-            {
-                "ticket_type": "複勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": 100,
-                "odds": est_fuku_odds,
-                "expected_payout": int(round(100 * est_fuku_odds)),
-                "is_real_odds": False,
-                "memo": f"複勝 {w0_u} ({w0_name}) 100円"
-            }
-        ]
-        virtual_total_amount = 200
-
-    hybrid_rec = {
-        "is_participate": is_participate,
-        "strategy_name": strategy_name,
-        "strategy_type": strategy_type,
-        "total_amount": total_amount,
-        "summary": summary_str,
-        "tansho_bets": tansho_bets,
-        "fukusho_bets": fukusho_bets,
-        "umatan_bets": umatan_bets,
-        "tansho_amount": tan_amt,
-        "fukusho_amount": fuku_amt,
-        "umatan_amount": utan_amt,
-        "umaren_bets": [],
-        "sanrentan_bets": [],
-        "hypothetical_umaren_bets": [],
-        "trio_bets": [],
-        "trio_bet": None,
-        "reason": reason_str,
-        "is_real_odds_applied": any(b.get("is_real_odds", False) for b in (tansho_bets + fukusho_bets + umatan_bets)),
-        "total_expected_payout": sum(b.get("expected_payout", 0) for b in (tansho_bets + fukusho_bets + umatan_bets)),
-        "prob_gachi": prob_gachi,
-        "prob_himo": prob_himo,
-        "edge_ratio": edge_ratio,
-        "synth_odds": round(w0_odds, 1),
-        "confidence_score": confidence_score,
-        "is_real_bet_target": is_real_bet_target,
-        "real_bet_badge": real_bet_badge,
-        "real_bet_level": real_bet_level,
-        "is_final_odds": is_final_odds,
-        # 仮想馬券フィールド
-        "is_virtual_bet_target": is_real_bet_target, # リアル対象は仮想枠にも自動認定
-        "virtual_bet_slot": None,
-        "virtual_strategy_name": virtual_strategy_name,
-        "virtual_badge": virtual_badge,
-        "virtual_bets": virtual_bets,
-        "virtual_total_amount": virtual_total_amount
-    }
-
-    return hybrid_rec
 
 
 # =========================================================================

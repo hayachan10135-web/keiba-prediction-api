@@ -1,0 +1,267 @@
+# -*- coding: utf-8 -*-
+"""
+app/betting/ipat_client.py
+
+即PAT (g.ipat.jra.go.jp) 高速HTTPクライアント (BaseBettingClient 実装)
+"""
+
+import os
+import re
+import time
+from typing import Dict, Any, List, Optional
+import requests
+from bs4 import BeautifulSoup
+from app.core.config import settings
+from app.betting.base_client import BaseBettingClient
+
+TICKET_TYPE_MAP = {
+    "単勝": "1",
+    "複勝": "2",
+    "枠連": "3",
+    "馬連": "4",
+    "ワイド": "5",
+    "ﾜｲﾄﾞ": "5",
+    "馬単": "6",
+    "3連複": "7",
+    "３連複": "7",
+    "三連複": "7",
+    "3連単": "8",
+    "３連単": "8",
+    "三連単": "8",
+}
+
+VENUE_CODE_MAP = {
+    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
+}
+
+
+class IPATClient(BaseBettingClient):
+    """即PAT ガラケーWeb (g.ipat.jra.go.jp) 専用クライアント"""
+
+    BASE_URL = "https://g.ipat.jra.go.jp"
+
+    def __init__(
+        self,
+        user_num: Optional[str] = None,
+        pin: Optional[str] = None,
+        pars: Optional[str] = None,
+    ):
+        self.user_num = user_num or settings.IPAT_USER_NUM
+        self.pin = pin or settings.IPAT_PIN
+        self.pars = pars or settings.IPAT_PARS
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+            "Referer": "https://g.ipat.jra.go.jp/"
+        })
+        self.session_data: Dict[str, str] = {}
+        self.last_balance = 0
+
+    @property
+    def platform_name(self) -> str:
+        return "ipat"
+
+    def is_configured(self) -> bool:
+        return bool(self.user_num and self.pin and self.pars)
+
+    def login(self) -> Dict[str, Any]:
+        """即PATへログインし、購入限度額（残高）を取得"""
+        if not self.is_configured():
+            return {
+                "success": False,
+                "error": "即PAT認証情報が未設定です。環境変数 (IPAT_USER_NUM, IPAT_PIN, IPAT_PARS) を設定してください。"
+            }
+        try:
+            r1 = self.session.get(f"{self.BASE_URL}/", timeout=10)
+            r1.encoding = "euc-jp"
+            top_text = r1.text
+
+            # 確定仕様: 受付時間外・メンテナンス検知時は即座にスキップ
+            if "受付時間外" in top_text or "メンテナンス中" in top_text or "投票受付時間外" in top_text:
+                return {"success": False, "error": "ただいま即PAT投票受付時間外またはメンテナンス中です。"}
+
+            soup1 = BeautifulSoup(top_text, "html.parser")
+            form1 = soup1.find("form")
+            if not form1:
+                return {"success": False, "error": "即PATログインページを取得できませんでした"}
+
+            action = form1.get("action") or "kw_020.cgi"
+            post_data = {inp.get("name"): inp.get("value", "") for inp in form1.find_all("input") if inp.get("name")}
+            post_data["i"] = self.user_num
+            post_data["p"] = self.pin
+            post_data["r"] = self.pars
+
+            r2 = self.session.post(f"{self.BASE_URL}/{action}", data=post_data, timeout=10)
+            r2.encoding = "euc-jp"
+            page_text = r2.text
+
+            if "間違っています" in page_text or "エラー" in page_text or "ログイン画面から" in page_text:
+                return {"success": False, "error": "即PATログイン認証エラー (加入者番号・暗証番号・PARSをご確認ください)"}
+
+            # メニュー画面からセッションパラメータ（u, g, mli）を保存
+            soup2 = BeautifulSoup(page_text, "html.parser")
+            for inp in soup2.find_all("input"):
+                name = inp.get("name")
+                val = inp.get("value")
+                if name and val is not None and name in ("u", "g", "mli", "nbs"):
+                    self.session_data[name] = val
+
+            # 残高パース
+            m = re.search(r"購入限度額[\s\S]{0,40}?([\d,]+)\s*円", page_text)
+            balance = int(m.group(1).replace(",", "")) if m else 0
+            self.last_balance = balance
+
+            return {
+                "success": True,
+                "balance": balance,
+                "message": f"ログイン成功 (購入限度額: {balance:,}円)"
+            }
+        except Exception as e:
+            return {"success": False, "error": f"ログイン通信例外: {e}"}
+
+    def execute_bets(
+        self,
+        venue_name: str,
+        race_no: int,
+        items: List[Dict[str, Any]],
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """
+        即PATへ指定された買い目を一括発注
+        """
+        if not items:
+            return {"status": "skipped", "reason": "買い目が空です"}
+
+        total_amount = sum(int(item.get("amount", 0)) for item in items if int(item.get("amount", 0)) >= 100)
+        print(f"[IPATClient] 発注開始: {venue_name}{race_no}R {len(items)}件 計{total_amount:,}円 (dry_run={dry_run})")
+
+        # 1. ログイン
+        l_res = self.login()
+        if not l_res["success"]:
+            return {"status": "failed", "step": "login", "error": l_res.get("error")}
+
+        current_balance = l_res.get("balance", 0)
+        if current_balance < total_amount:
+            msg = f"即PAT残高不足です (必要: {total_amount:,}円 / 現在残高: {current_balance:,}円)。"
+            print(f"[IPATClient] ⚠️ {msg}")
+            return {"status": "aborted", "step": "balance_check", "reason": msg}
+
+        if dry_run:
+            return {
+                "status": "dry_run_success",
+                "receipt_no": "DRY-RUN",
+                "total_amount": total_amount,
+                "items_count": len(items),
+                "balance": current_balance
+            }
+
+        # 2. 順次買い目投入 (kw_150 ➔ kw_160 ➔ kw_170)
+        added_count = 0
+        added_amount = 0
+        try:
+            # 選択入力メニュー (kw_150.cgi) を開く
+            kw150_data = dict(self.session_data)
+            kw150_data["pr"] = "new00"
+            r_sel = self.session.post(f"{self.BASE_URL}/kw_150.cgi", data=kw150_data, timeout=10)
+            r_sel.encoding = "euc-jp"
+            soup_sel = BeautifulSoup(r_sel.text, "html.parser")
+
+            venue_val = None
+            j_select = soup_sel.find("select", {"name": "j"})
+            if j_select:
+                for opt in j_select.find_all("option"):
+                    if venue_name in opt.get_text():
+                        venue_val = opt.get("value")
+                        break
+            if not venue_val:
+                return {"status": "failed", "step": "select_venue", "error": f"競馬場 {venue_name} が選択肢に見つかりませんでした"}
+
+            # 各買い目を投入
+            for idx, item in enumerate(items):
+                t_type = str(item.get("ticket_type", "単勝")).strip()
+                y_code = TICKET_TYPE_MAP.get(t_type)
+                if not y_code:
+                    return {"status": "failed", "step": "validate_ticket", "error": f"未対応の式別です: {t_type}"}
+                raw_combo = item.get("combination") or []
+                amt = int(item.get("amount", 100))
+                if not raw_combo or amt < 100:
+                    continue
+                combo = [int(x) for x in raw_combo]
+                if y_code in ("3", "4", "5", "7"):
+                    combo = sorted(combo)
+                amt_unit = str(max(1, amt // 100))
+
+                form_data_160 = dict(self.session_data)
+                form_data_160["j"] = venue_val
+                form_data_160["m"] = str(race_no)
+                form_data_160["y"] = y_code
+                form_data_160["w"] = ""
+
+                r_160 = self.session.post(f"{self.BASE_URL}/kw_160.cgi", data=form_data_160, timeout=10)
+                r_160.encoding = "euc-jp"
+
+                form_data_170 = dict(self.session_data)
+                if len(combo) >= 1:
+                    form_data_170["h1"] = f"{int(combo[0]):02d}"
+                if len(combo) >= 2:
+                    form_data_170["h2"] = f"{int(combo[1]):02d}"
+                if len(combo) >= 3:
+                    form_data_170["h3"] = f"{int(combo[2]):02d}"
+                form_data_170["un"] = amt_unit
+
+                r_170 = self.session.post(f"{self.BASE_URL}/kw_170.cgi", data=form_data_170, timeout=10)
+                r_170.encoding = "euc-jp"
+
+                # 確定仕様: 完全一致原則（1点でも投入エラーが出たら確定せずに全破棄）
+                if "正しくありません" in r_170.text or "エラー" in r_170.text:
+                    print(f"[IPATClient] ❌ 買い目投入エラー検知: {t_type}{combo} -> セッション即時破棄（全破棄）")
+                    return {"status": "failed", "step": "add_ticket_failed", "error": f"買い目投入エラー: {t_type}{combo}"}
+
+                added_count += 1
+                added_amount += (int(amt_unit) * 100)
+                soup_170 = BeautifulSoup(r_170.text, "html.parser")
+                for inp in soup_170.find_all("input"):
+                    n, v = inp.get("name"), inp.get("value")
+                    if n in ("u", "g", "mli", "nbs") and v:
+                        self.session_data[n] = v
+
+            if added_count == 0 or added_count != len(items):
+                return {"status": "failed", "step": "add_tickets", "error": "買い目が完全投入できませんでした（全破棄原則）"}
+
+            # 3. 最終購入確定 (kw_180 投票ボタン押下)
+            confirm_data = dict(self.session_data)
+            confirm_data["s"] = str(added_amount)
+            confirm_data["tou"] = "投票"
+
+            r_final = self.session.post(f"{self.BASE_URL}/kw_180.cgi", data=confirm_data, timeout=15)
+            r_final.encoding = "euc-jp"
+            f_text = r_final.text
+
+            if "暗証番号" in f_text and "p" in [inp.get("name") for inp in BeautifulSoup(f_text, "html.parser").find_all("input")]:
+                pin_data = dict(self.session_data)
+                pin_data["p"] = self.pin
+                r_final = self.session.post(f"{self.BASE_URL}/kw_180.cgi", data=pin_data, timeout=15)
+                r_final.encoding = "euc-jp"
+                f_text = r_final.text
+
+            m_rcpt = re.search(r"受付番号[^\d\n]*(\d+)", f_text)
+            receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
+            balance_after = max(0, current_balance - added_amount)
+            self.last_balance = balance_after
+            print(f"[IPATClient] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
+
+            return {
+                "status": "success",
+                "platform": "ipat",
+                "receipt_no": receipt_no,
+                "total_amount": added_amount,
+                "items_count": added_count,
+                "balance": balance_after,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        except Exception as e:
+            # 確定仕様: 確定POST送信後のタイムアウト等は二重買い付け防止のため再試行禁止（Fail-Closed）
+            return {"status": "failed", "step": "submit", "error": str(e)}
+
