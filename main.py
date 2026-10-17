@@ -31,11 +31,19 @@ from app.strategies.arbiter import StrategyArbiter
 from app.betting.factory import BettingClientFactory
 from app.betting.manual_service import execute_manual_bet
 from app.settlement.payout_verifier import PayoutVerifier
+from app.betting.settings import (
+    load_betting_settings_from_supabase,
+    save_betting_settings_to_supabase,
+    calculate_remaining_real_bet_amount,
+    _betting_settings
+)
+from app.routers.betting import router as betting_router
 
 _strategy_arbiter = StrategyArbiter()
 
 app = FastAPI(title="Keiba Prediction & Verification API")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.include_router(betting_router)
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -351,47 +359,7 @@ if os.path.exists(DICT_PATH):
     except Exception as e:
         print(f"統計辞書ロード失敗: {e}")
 
-# --- 自動投票（即PAT / UMACA / OFF）設定管理機構 ---
-_betting_settings: Dict[str, Any] = {
-    "betting_mode": "off",       # "off" | "ipat" | "umaca" (umacaは未テストのため無効)
-    "auto_bet_real_only": True,  # 実馬券・勝負馬券に該当するレースのみ自動投票
-    "updated_at": None
-}
 _auto_betted_races = set()       # 二重投票防止用メモリセット (race_id)
-
-def load_betting_settings_from_supabase() -> dict:
-    """Supabase keiba_app_meta から投票モード設定を取得"""
-    global _betting_settings
-    if not supabase:
-        return _betting_settings
-    try:
-        res = supabase.table("keiba_app_meta").select("value").eq("key", "betting_settings").execute()
-        if res.data and len(res.data) > 0 and res.data[0].get("value"):
-            val = res.data[0]["value"]
-            if isinstance(val, dict):
-                _betting_settings.update(val)
-                print(f"[BettingSettings] Supabaseから設定ロード完了: {_betting_settings}")
-    except Exception as e:
-        print(f"[BettingSettings] ロードエラー: {e}")
-    return _betting_settings
-
-def save_betting_settings_to_supabase(new_settings: dict) -> bool:
-    """Supabase keiba_app_meta に投票モード設定を永続化"""
-    global _betting_settings
-    _betting_settings.update(new_settings)
-    _betting_settings["updated_at"] = f"{today_jst_str()} {now_jst().strftime('%H:%M:%S')}"
-    if not supabase:
-        return True
-    try:
-        supabase.table("keiba_app_meta").upsert({
-            "key": "betting_settings",
-            "value": _betting_settings
-        }).execute()
-        print(f"[BettingSettings] Supabaseへ設定保存完了: {_betting_settings}")
-        return True
-    except Exception as e:
-        print(f"[BettingSettings] 保存エラー: {e}")
-        return False
 
 # --- 統計辞書（stats_dict）オンライン最新化＆Supabase永続化機構 ---
 _stats_overlay: Dict[str, Any] = {
@@ -832,100 +800,7 @@ def health_check():
         "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# --- 設定API (自動投票プラットフォーム切替 / 即PATテスト) ---
 
-class BettingModeItem(BaseModel):
-    id: str
-    name: str
-    enabled: bool
-    description: str
-
-class BettingSettingsResponse(BaseModel):
-    betting_mode: str
-    auto_bet_real_only: bool
-    available_modes: List[BettingModeItem]
-    ipat_configured: bool
-    umaca_configured: Optional[bool] = False
-    last_balance: Optional[int] = None
-    balance_status: Optional[str] = "ok"
-    balance_message: Optional[str] = None
-    remaining_bet_amount: int = 0
-    remaining_real_races_count: int = 0
-    balance_shortfall: int = 0
-    updated_at: Optional[str] = None
-
-class UpdateBettingModeRequest(BaseModel):
-    betting_mode: str
-
-def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tuple[int, int, List[dict]]:
-    """
-    指定日（または本日/次回開催日）の未発走・未確定レースのうち、
-    実馬券・勝負馬券に該当するレースの残り投票予定合計金額を計算する。
-    戻り値: (残り合計金額, 該当レース数, 該当レース詳細リスト)
-    """
-    if not supabase:
-        return 0, 0, []
-
-    t_date = target_date or today_jst_str()
-    now_d = now_jst_naive()
-
-    try:
-        # スケジュールテーブルから当日または直近対象日の未確定レースを取得
-        s_res = supabase.table("keiba_scheduled_races")\
-            .select("race_id, race_date, race_name, post_datetime, is_predicted")\
-            .gte("race_date", t_date)\
-            .order("race_date")\
-            .order("race_id")\
-            .execute()
-
-        rows = s_res.data or []
-        if not rows:
-            return 0, 0, []
-
-        active_date = rows[0]["race_date"]
-        active_races = [r for r in rows if r["race_date"] == active_date]
-
-        unrun_races = []
-        for r in active_races:
-            p_str = r.get("post_datetime")
-            is_unrun = True
-            p_dt = parse_post_datetime(p_str, active_date)
-            if p_dt and now_d > p_dt + datetime.timedelta(minutes=10):
-                is_unrun = False
-            if is_unrun:
-                unrun_races.append(r)
-
-        if not unrun_races:
-            return 0, 0, []
-
-        unrun_rids = [r["race_id"] for r in unrun_races]
-
-        p_res = supabase.table("keiba_predictions_cache")\
-            .select("race_id, data_json")\
-            .in_("race_id", unrun_rids)\
-            .execute()
-
-        total_remaining_amount = 0
-        real_target_races = []
-
-        for p_row in (p_res.data or []):
-            dj = p_row.get("data_json") or {}
-            h_rec = dj.get("hybrid_recommendation") or {}
-            if h_rec.get("is_real_bet_target"):
-                amt = int(h_rec.get("total_amount") or 0)
-                if amt > 0:
-                    total_remaining_amount += amt
-                    real_target_races.append({
-                        "race_id": p_row["race_id"],
-                        "race_name": dj.get("race_name", p_row["race_id"]),
-                        "amount": amt,
-                        "badge": h_rec.get("real_bet_badge", "実戦推奨")
-                    })
-
-        return total_remaining_amount, len(real_target_races), real_target_races
-    except Exception as e:
-        print(f"[RemainingBetAmount] 計算エラー: {e}")
-        return 0, 0, []
 
 _last_balance_warning_date: Optional[str] = None
 _last_warned_shortfall: int = 0
@@ -989,195 +864,7 @@ def check_and_notify_balance_shortfall():
             }
         )
 
-@app.get("/settings/betting-mode", response_model=BettingSettingsResponse)
-def get_betting_settings_endpoint():
-    """現在の自動投票設定を取得"""
-    settings = load_betting_settings_from_supabase()
-    cur_mode = settings.get("betting_mode", "off")
-    has_ipat_env = bool(os.getenv("IPAT_USER_NUM") and os.getenv("IPAT_PIN") and os.getenv("IPAT_PARS"))
-    has_umaca_env = UMACAFastClient().is_configured()
-    
-    modes = [
-        BettingModeItem(
-            id="off",
-            name="自動投票なし (OFF)",
-            enabled=True,
-            description="予想・買い目表示および通知のみ行い、自動投票は実行しません。"
-        ),
-        BettingModeItem(
-            id="ipat",
-            name="即PAT (IPAT)",
-            enabled=True,
-            description="発走5分前に「実馬券・勝負馬券」に該当した場合、即PATへ自動で買い目を投入します（事前手動入金残高内）。"
-        ),
-        BettingModeItem(
-            id="umaca",
-            name="UMACAスマート",
-            enabled=True,
-            description="発走5分前に「実馬券・勝負馬券」に該当した場合、UMACAスマートへ自動で買い目を投入します（投票用残高内）。"
-        )
-    ]
-    
-    rem_amt, rem_count, _ = calculate_remaining_real_bet_amount()
-    last_bal = settings.get("last_balance") or 0
-    shortfall = max(0, rem_amt - last_bal) if (cur_mode in ("ipat", "umaca") and last_bal is not None) else 0
 
-    return BettingSettingsResponse(
-        betting_mode=cur_mode,
-        auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
-        available_modes=modes,
-        ipat_configured=(has_umaca_env if cur_mode == "umaca" else has_ipat_env),
-        umaca_configured=has_umaca_env,
-        last_balance=settings.get("last_balance"),
-        balance_status=settings.get("balance_status", "ok" if settings.get("last_balance") is not None else "unavailable"),
-        balance_message=settings.get("balance_message"),
-        remaining_bet_amount=rem_amt,
-        remaining_real_races_count=rem_count,
-        balance_shortfall=shortfall,
-        updated_at=settings.get("updated_at")
-    )
-
-@app.post("/settings/betting-mode")
-def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
-    """自動投票モードを変更 (off / ipat / umaca)"""
-    new_mode = req.betting_mode.lower().strip()
-    if new_mode not in ("off", "ipat", "umaca"):
-        raise HTTPException(status_code=400, detail=f"無効な投票モードです: {new_mode}")
-    
-    settings = load_betting_settings_from_supabase()
-    settings["betting_mode"] = new_mode
-
-    # モード切替時に選択したプラットフォームの最新残高を自動照会
-    if new_mode in ("ipat", "umaca"):
-        try:
-            client = BettingClientFactory.get_client(new_mode)
-            l_res = client.login()
-            if l_res.get("success"):
-                settings["last_balance"] = l_res.get("balance", 0)
-                settings["balance_status"] = "ok"
-                settings["balance_message"] = None
-            else:
-                # 取得できなかった場合は前回の古い残高をクリアして明示
-                settings["last_balance"] = None
-                settings["balance_status"] = "unavailable"
-                err_text = l_res.get("error", "残高を取得できませんでした")
-                if "時間外" in err_text:
-                    settings["balance_message"] = "ただいま投票受付時間外です"
-                else:
-                    settings["balance_message"] = err_text
-        except Exception as e:
-            settings["last_balance"] = None
-            settings["balance_status"] = "unavailable"
-            settings["balance_message"] = f"照会例外: {e}"
-            print(f"[BettingModeSwitch] 残高自動照会エラー ({new_mode}): {e}")
-    else:
-        # off の場合
-        settings["last_balance"] = None
-        settings["balance_status"] = "off"
-        settings["balance_message"] = "自動投票OFF"
-
-    save_betting_settings_to_supabase(settings)
-    mode_names = {
-        "off": "自動投票なし (OFF)",
-        "ipat": "即PAT (IPAT)",
-        "umaca": "UMACAスマート"
-    }
-    return {
-        "status": "ok",
-        "betting_mode": new_mode,
-        "last_balance": settings.get("last_balance"),
-        "balance_status": settings.get("balance_status"),
-        "balance_message": settings.get("balance_message"),
-        "message": f"自動投票モードを「{mode_names.get(new_mode, new_mode)}」に設定しました。"
-    }
-
-@app.post("/settings/test-ipat")
-@app.post("/settings/test-umaca")
-def test_ipat_endpoint(mode: Optional[str] = Query(None, description="テスト対象 ('ipat' または 'umaca'。省略時は現在の設定モード)")):
-    """現在選択中のプラットフォーム（即PAT または UMACAスマート）へのログイン＆残高取得テストを実行"""
-    settings = load_betting_settings_from_supabase()
-    target_mode = (mode or settings.get("betting_mode") or "ipat").lower().strip()
-    if target_mode == "off":
-        # OFF選択中に接続テストを押した場合は設定済みのプラットフォームをテスト
-        target_mode = "umaca" if UMACAFastClient().is_configured() else "ipat"
-
-    try:
-        client = BettingClientFactory.get_client(target_mode)
-        res = client.login()
-        label = "UMACAスマート" if target_mode == "umaca" else "即PAT"
-        bal_label = "投票用残高" if target_mode == "umaca" else "購入限度額"
-
-        if res.get("success"):
-            balance = res.get("balance", 0)
-            settings["last_balance"] = balance
-            settings["balance_status"] = "ok"
-            settings["balance_message"] = None
-            save_betting_settings_to_supabase(settings)
-            return {
-                "success": True,
-                "platform": target_mode,
-                "balance": balance,
-                "message": f"{label}接続成功！ {bal_label}: {balance:,}円"
-            }
-        else:
-            err_msg = res.get("error", f"{label}への接続に失敗しました")
-            settings["last_balance"] = None
-            settings["balance_status"] = "unavailable"
-            settings["balance_message"] = err_msg
-            save_betting_settings_to_supabase(settings)
-            return {
-                "success": False,
-                "platform": target_mode,
-                "balance": None,
-                "error": err_msg
-            }
-    except Exception as e:
-        err_msg = f"接続テスト例外エラー: {e}"
-        settings["last_balance"] = None
-        settings["balance_status"] = "unavailable"
-        settings["balance_message"] = err_msg
-        save_betting_settings_to_supabase(settings)
-        return {
-            "success": False,
-            "platform": target_mode,
-            "balance": None,
-            "error": err_msg
-        }
-
-class ManualBetItem(BaseModel):
-    ticket_type: str
-    combination: List[int]
-    amount: int
-
-class ManualBetRequest(BaseModel):
-    race_id: str
-    venue_name: str
-    race_no: int
-    items: List[ManualBetItem]
-    mode: Optional[str] = None
-    dry_run: bool = False
-
-@app.post("/betting/manual")
-def manual_bet_endpoint(req: ManualBetRequest):
-    """
-    新要件 FR-BET-07: マニュアル（手動・実機テスト）投票API
-    ★【厳格な集計除外規定】: is_manual_bet=True で記録され、AI収支集計から完全に除外されます。
-    """
-    settings = load_betting_settings_from_supabase()
-    target_mode = (req.mode or settings.get("betting_mode") or "ipat").lower().strip()
-    if target_mode == "off":
-        raise HTTPException(status_code=400, detail="投票モードがOFFになっています。設定画面からipatまたはumacaを選択してください。")
-
-    items_dicts = [item.dict() for item in req.items]
-    res = execute_manual_bet(
-        race_id=req.race_id,
-        venue_name=req.venue_name,
-        race_no=req.race_no,
-        items=items_dicts,
-        mode=target_mode,
-        dry_run=req.dry_run
-    )
-    return res
 
 @app.get("/notify/test")
 @app.post("/notify/test")
