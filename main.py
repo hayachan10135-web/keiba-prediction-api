@@ -4725,6 +4725,8 @@ def calculate_hybrid_pass_benefit_info(
         "hypothetical_bet": hypo_bet,
         "hypothetical_payout": hypo_pay,
         "pass_benefit": pass_benefit,
+        "pay_tan": pay_tan if target_u is not None else 0,
+        "pay_fuku": pay_fuku if target_u is not None else 0,
         "actual_order": actual_order,
         "mark_orders": mark_orders,
         "top3_orders": top3_orders,
@@ -4803,8 +4805,75 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                     mark_orders = pass_info.get("mark_orders") or rb_meta.get("mark_orders")
                     top3_orders = pass_info.get("top3_orders") or top3_orders
 
-                    # ★ DB側の本命馬番や払戻金が予想データと不整合を起こしている場合、自動自己修復 ★
-                    if cur_target_u is not None and (d.get("target_umaban") != cur_target_u or d.get("hypothetical_payout") != hypo_pay):
+                    is_real = bool(rb_meta.get("is_real_bet_target") or rb_meta.get("real_bet_level") in ["high", "standard"])
+                    is_virt = bool(
+                        (h_rec or {}).get("is_virtual_bet_target")
+                        or rb_meta.get("is_virtual_bet_target")
+                        or rb_meta.get("real_bet_level") == "virtual"
+                        or (rb_meta.get("real_bet_badge") and "仮想" in str(rb_meta.get("real_bet_badge")))
+                        or d.get("strategy_type") == "virtual"
+                        or (d.get("hit_type") and "仮想" in str(d.get("hit_type")))
+                    ) and not is_real
+
+                    if is_virt:
+                        pay_tan = pass_info.get("pay_tan", 0)
+                        pay_fuku = pass_info.get("pay_fuku", 0)
+                        v_profit = hypo_pay - hypo_bet
+                        v_rec = round((hypo_pay / hypo_bet) * 100.0, 1) if hypo_bet > 0 else 0.0
+                        is_virt_hit = (hypo_pay > 0)
+                        hit_type = "仮想的中" if is_virt_hit else "仮想不的中"
+                        marks_summary = format_mark_orders_text(mark_orders)
+                        marks_line = f"\n{marks_summary}" if marks_summary else ""
+                        if is_virt_hit:
+                            v_hits = []
+                            if pay_tan > 0: v_hits.append(f"単勝{cur_target_u}({pay_tan:,}円)")
+                            if pay_fuku > 0: v_hits.append(f"複勝{cur_target_u}({pay_fuku:,}円)")
+                            msg = f"【仮想的中】 {' ＆ '.join(v_hits)}！ 仮想払戻: {hypo_pay:,}円 (収支: {v_profit:+,}円 / 回収率: {v_rec}%){marks_line}"
+                        else:
+                            ord_info = f" (◎{cur_target_u}番: {cur_order}着)" if (cur_order and cur_order < 90) else ""
+                            msg = f"【仮想不的中】{ord_info} (仮想投資: {hypo_bet:,}円 / 払戻: 0円 / 収支: {v_profit:,}円 / 回収率: 0.0%){marks_line}"
+
+                        d["is_pass"] = False
+                        d["total_bet"] = hypo_bet
+                        d["total_payout"] = hypo_pay
+                        d["profit"] = v_profit
+                        d["recovery_rate"] = v_rec
+                        profit = v_profit
+                        recovery = v_rec
+                        d["is_hit"] = is_virt_hit
+                        d["hit_type"] = hit_type
+                        d["strategy_type"] = "virtual"
+                        d["tansho_bet"] = 100
+                        d["fukusho_bet"] = 100
+                        d["tansho_payout"] = pay_tan
+                        d["fukusho_payout"] = pay_fuku
+                        d["bet_breakdown"] = {"単勝": 100, "複勝": 100}
+                        p_bd = {}
+                        if pay_tan > 0: p_bd["単勝"] = pay_tan
+                        if pay_fuku > 0: p_bd["複勝"] = pay_fuku
+                        d["payout_breakdown"] = p_bd
+
+                        try:
+                            if supabase:
+                                supabase.table("keiba_race_settlements").update({
+                                    "is_pass": False,
+                                    "total_bet": hypo_bet,
+                                    "total_payout": hypo_pay,
+                                    "is_hit": is_virt_hit,
+                                    "hit_type": hit_type,
+                                    "strategy_type": "virtual",
+                                    "tansho_bet": 100,
+                                    "fukusho_bet": 100,
+                                    "tansho_payout": pay_tan,
+                                    "fukusho_payout": pay_fuku,
+                                    "bet_breakdown": {"単勝": 100, "複勝": 100},
+                                    "payout_breakdown": p_bd,
+                                    "message": msg
+                                }).eq("race_id", race_id).execute()
+                        except Exception as e_vh:
+                            print(f"[VirtHeal Error] {race_id}: {e_vh}")
+                    elif cur_target_u is not None and (d.get("target_umaban") != cur_target_u or d.get("hypothetical_payout") != hypo_pay):
+                        # ★ DB側の本命馬番や払戻金が予想データと不整合を起こしている場合、自動自己修復 ★
                         try:
                             heal_payload = {
                                 "target_umaban": cur_target_u,
@@ -5403,6 +5472,11 @@ def process_settlement_calculation(
     except Exception as e_stats:
         print(f"[StatsOverlay] レース確定統計更新エラー ({race_id}): {e_stats}")
 
+    try:
+        pred_data = sync_virtual_badge_to_prediction(race_id, pred_data, race_date)
+    except Exception as e_v_sync:
+        print(f"[VirtualBadgeSync Error] {race_id}: {e_v_sync}")
+
     rec = pred_data.get("recommendation", {})
     hybrid_rec = pred_data.get("hybrid_recommendation")
 
@@ -5418,103 +5492,222 @@ def process_settlement_calculation(
         "is_real_bet_target": bool((hybrid_rec or {}).get("is_real_bet_target", False)),
         "real_bet_badge": (hybrid_rec or {}).get("real_bet_badge"),
         "real_bet_level": (hybrid_rec or {}).get("real_bet_level", "none"),
+        "is_virtual_bet_target": bool((hybrid_rec or {}).get("is_virtual_bet_target", False)),
+        "virtual_bet_slot": (hybrid_rec or {}).get("virtual_bet_slot"),
         "edge_ratio": (hybrid_rec or {}).get("edge_ratio"),
         "is_final_odds": bool((hybrid_rec or {}).get("is_final_odds", False))
     }
 
-    # ハイブリッド推奨を最優先で照合（見送りレース）
+    # ハイブリッド推奨を最優先で照合（見送りレース または 仮想馬券レース）
     if not hybrid_rec or not hybrid_rec.get("is_participate", False):
+        is_real = bool(real_bet_meta.get("is_real_bet_target") or real_bet_meta.get("real_bet_level") in ["high", "standard"])
+        is_virt = bool(
+            (hybrid_rec or {}).get("is_virtual_bet_target")
+            or real_bet_meta.get("is_virtual_bet_target")
+            or real_bet_meta.get("real_bet_level") == "virtual"
+            or (real_bet_meta.get("real_bet_badge") and "仮想" in str(real_bet_meta.get("real_bet_badge")))
+        ) and not is_real
+
         pass_info = calculate_hybrid_pass_benefit_info(hybrid_rec, race_res, target_u, actual_order, pred_data=pred_data)
         hypo_bet = pass_info["hypothetical_bet"]
         hypo_pay = pass_info["hypothetical_payout"]
         pass_benefit = pass_info["pass_benefit"]
+        pay_tan = pass_info.get("pay_tan", 0)
+        pay_fuku = pass_info.get("pay_fuku", 0)
         mark_orders = pass_info.get("mark_orders", [])
         top3_orders = pass_info.get("top3_orders", [])
-        msg = pass_info["message"]
+        marks_summary = format_mark_orders_text(mark_orders)
+        marks_line = f"\n{marks_summary}" if marks_summary else ""
 
         real_bet_meta["mark_orders"] = mark_orders
         real_bet_meta["top3_orders"] = top3_orders
 
-        settlement = {
-            "race_id": race_id,
-            "race_date": race_date,
-            "race_name": race_name,
-            "strategy_type": hybrid_rec.get("strategy_type", "skip") if hybrid_rec else "skip",
-            "target_umaban": target_u,
-            "horse_name": h_name,
-            "grade": grade,
-            "is_pass": True,
-            "tansho_bet": 0,
-            "fukusho_bet": 0,
-            "umatan_bet": 0,
-            "umaren_bet": 0,
-            "trio_bet": 0,
-            "total_bet": 0,
-            "actual_order": actual_order if (actual_order and actual_order < 90) else None,
-            "tansho_payout": 0,
-            "fukusho_payout": 0,
-            "umatan_payout": 0,
-            "umaren_payout": 0,
-            "trio_payout": 0,
-            "total_payout": 0,
-            "is_hit": False,
-            "hit_type": "見送り",
-            "hypothetical_bet": hypo_bet,
-            "hypothetical_payout": hypo_pay,
-            "pass_benefit": pass_benefit,
-            "bet_breakdown": {},
-            "payout_breakdown": {},
-            "bet_details": {"real_bet_meta": real_bet_meta},
-            "payout_details": None,
-            "mark_orders": mark_orders,
-            "top3_orders": top3_orders,
-            "track_bias": t_bias,
-            "odds_alerts": o_alerts
-        }
-        save_settlement(settlement)
-        if supabase:
-            try:
-                supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
-            except Exception:
-                pass
+        if is_virt:
+            # ★ 仮想馬券: 全参戦（仮想含む）モードで収支を集計 ★
+            v_profit = hypo_pay - hypo_bet
+            v_rec = round((hypo_pay / hypo_bet) * 100.0, 1) if hypo_bet > 0 else 0.0
+            is_virt_hit = (hypo_pay > 0)
+            hit_type_virt = "仮想的中" if is_virt_hit else "仮想不的中"
 
-        return {
-            "race_id": race_id,
-            "race_name": race_name,
-            "is_pass": True,
-            "grade": grade,
-            "target_umaban": target_u,
-            "horse_name": h_name,
-            "actual_order": actual_order if (actual_order and actual_order < 90) else None,
-            "is_hit": False,
-            "total_bet": 0,
-            "total_payout": 0,
-            "profit": 0,
-            "recovery_rate": 0.0,
-            "from_cache": from_cache,
-            "message": msg,
-            "hypothetical_bet": hypo_bet,
-            "hypothetical_payout": hypo_pay,
-            "pass_benefit": pass_benefit,
-            "strategy_type": hybrid_rec.get("strategy_type", "skip") if hybrid_rec else "skip",
-            "hit_type": "見送り",
-            "bet_breakdown": {},
-            "payout_breakdown": {},
-            "bet_details": None,
-            "payout_details": None,
-            "tansho_bet": 0,
-            "fukusho_bet": 0,
-            "umatan_bet": 0,
-            "umaren_bet": 0,
-            "trio_bet": 0,
-            "tansho_payout": 0,
-            "fukusho_payout": 0,
-            "umatan_payout": 0,
-            "umaren_payout": 0,
-            "trio_payout": 0,
-            "mark_orders": mark_orders,
-            "top3_orders": top3_orders
-        }
+            p_breakdown = {}
+            if pay_tan > 0: p_breakdown["単勝"] = pay_tan
+            if pay_fuku > 0: p_breakdown["複勝"] = pay_fuku
+
+            p_details = []
+            if pay_tan > 0:
+                p_details.append({"type": "単勝", "comb": f"{target_u}", "amount": 100, "payout": pay_tan})
+            if pay_fuku > 0:
+                p_details.append({"type": "複勝", "comb": f"{target_u}", "amount": 100, "payout": pay_fuku})
+
+            if is_virt_hit:
+                hit_texts = [f"{p['type']}{p['comb']}({p['payout']:,}円)" for p in p_details]
+                msg_virt = f"【仮想的中】 {' ＆ '.join(hit_texts)}！ 仮想払戻: {hypo_pay:,}円 (収支: {v_profit:+,}円 / 回収率: {v_rec}%){marks_line}"
+            else:
+                ord_info = f" (◎{target_u}番: {actual_order}着)" if (actual_order and actual_order < 90) else ""
+                msg_virt = f"【仮想不的中】{ord_info} (仮想投資: {hypo_bet:,}円 / 払戻: 0円 / 収支: {v_profit:,}円 / 回収率: 0.0%){marks_line}"
+
+            settlement = {
+                "race_id": race_id,
+                "race_date": race_date,
+                "race_name": race_name,
+                "strategy_type": "virtual",
+                "target_umaban": target_u,
+                "horse_name": h_name,
+                "grade": grade,
+                "is_pass": False,
+                "tansho_bet": 100,
+                "fukusho_bet": 100,
+                "umatan_bet": 0,
+                "umaren_bet": 0,
+                "trio_bet": 0,
+                "total_bet": hypo_bet,
+                "actual_order": actual_order if (actual_order and actual_order < 90) else None,
+                "tansho_payout": pay_tan,
+                "fukusho_payout": pay_fuku,
+                "umatan_payout": 0,
+                "umaren_payout": 0,
+                "trio_payout": 0,
+                "total_payout": hypo_pay,
+                "is_hit": is_virt_hit,
+                "hit_type": hit_type_virt,
+                "hypothetical_bet": hypo_bet,
+                "hypothetical_payout": hypo_pay,
+                "pass_benefit": pass_benefit,
+                "bet_breakdown": {"単勝": 100, "複勝": 100},
+                "payout_breakdown": p_breakdown,
+                "bet_details": {"real_bet_meta": real_bet_meta},
+                "payout_details": p_details,
+                "mark_orders": mark_orders,
+                "top3_orders": top3_orders,
+                "track_bias": t_bias,
+                "odds_alerts": o_alerts
+            }
+            save_settlement(settlement)
+            if supabase:
+                try:
+                    supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+                except Exception:
+                    pass
+
+            return {
+                "race_id": race_id,
+                "race_name": race_name,
+                "is_pass": False,
+                "grade": grade,
+                "target_umaban": target_u,
+                "horse_name": h_name,
+                "actual_order": actual_order if (actual_order and actual_order < 90) else None,
+                "is_hit": is_virt_hit,
+                "total_bet": hypo_bet,
+                "total_payout": hypo_pay,
+                "profit": v_profit,
+                "recovery_rate": v_rec,
+                "from_cache": from_cache,
+                "message": msg_virt,
+                "hypothetical_bet": hypo_bet,
+                "hypothetical_payout": hypo_pay,
+                "pass_benefit": pass_benefit,
+                "strategy_type": "virtual",
+                "hit_type": hit_type_virt,
+                "bet_breakdown": {"単勝": 100, "複勝": 100},
+                "payout_breakdown": p_breakdown,
+                "bet_details": {"real_bet_meta": real_bet_meta},
+                "payout_details": p_details,
+                "tansho_bet": 100,
+                "fukusho_bet": 100,
+                "umatan_bet": 0,
+                "umaren_bet": 0,
+                "trio_bet": 0,
+                "tansho_payout": pay_tan,
+                "fukusho_payout": pay_fuku,
+                "umatan_payout": 0,
+                "umaren_payout": 0,
+                "trio_payout": 0,
+                "mark_orders": mark_orders,
+                "top3_orders": top3_orders
+            }
+        else:
+            msg = pass_info["message"]
+            settlement = {
+                "race_id": race_id,
+                "race_date": race_date,
+                "race_name": race_name,
+                "strategy_type": hybrid_rec.get("strategy_type", "skip") if hybrid_rec else "skip",
+                "target_umaban": target_u,
+                "horse_name": h_name,
+                "grade": grade,
+                "is_pass": True,
+                "tansho_bet": 0,
+                "fukusho_bet": 0,
+                "umatan_bet": 0,
+                "umaren_bet": 0,
+                "trio_bet": 0,
+                "total_bet": 0,
+                "actual_order": actual_order if (actual_order and actual_order < 90) else None,
+                "tansho_payout": 0,
+                "fukusho_payout": 0,
+                "umatan_payout": 0,
+                "umaren_payout": 0,
+                "trio_payout": 0,
+                "total_payout": 0,
+                "is_hit": False,
+                "hit_type": "見送り",
+                "hypothetical_bet": hypo_bet,
+                "hypothetical_payout": hypo_pay,
+                "pass_benefit": pass_benefit,
+                "bet_breakdown": {},
+                "payout_breakdown": {},
+                "bet_details": {"real_bet_meta": real_bet_meta},
+                "payout_details": None,
+                "mark_orders": mark_orders,
+                "top3_orders": top3_orders,
+                "track_bias": t_bias,
+                "odds_alerts": o_alerts
+            }
+            save_settlement(settlement)
+            if supabase:
+                try:
+                    supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", race_id).execute()
+                except Exception:
+                    pass
+
+            return {
+                "race_id": race_id,
+                "race_name": race_name,
+                "is_pass": True,
+                "grade": grade,
+                "target_umaban": target_u,
+                "horse_name": h_name,
+                "actual_order": actual_order if (actual_order and actual_order < 90) else None,
+                "is_hit": False,
+                "total_bet": 0,
+                "total_payout": 0,
+                "profit": 0,
+                "recovery_rate": 0.0,
+                "from_cache": from_cache,
+                "message": msg,
+                "hypothetical_bet": hypo_bet,
+                "hypothetical_payout": hypo_pay,
+                "pass_benefit": pass_benefit,
+                "strategy_type": hybrid_rec.get("strategy_type", "skip") if hybrid_rec else "skip",
+                "hit_type": "見送り",
+                "bet_breakdown": {},
+                "payout_breakdown": {},
+                "bet_details": None,
+                "payout_details": None,
+                "tansho_bet": 0,
+                "fukusho_bet": 0,
+                "umatan_bet": 0,
+                "umaren_bet": 0,
+                "trio_bet": 0,
+                "tansho_payout": 0,
+                "fukusho_payout": 0,
+                "umatan_payout": 0,
+                "umaren_payout": 0,
+                "trio_payout": 0,
+                "mark_orders": mark_orders,
+                "top3_orders": top3_orders
+            }
 
     # 参戦レースの場合
     tansho_bets = hybrid_rec.get("tansho_bets") or []
@@ -6055,6 +6248,14 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         except Exception as e:
             print(f"Supabaseサマリー用キャッシュ取得エラー: {e}")
 
+    sched_map = {}
+    if supabase and rows:
+        try:
+            sched_res = supabase.table("keiba_scheduled_races").select("race_id, is_virtual_bet_target, virtual_bet_slot, real_bet_badge, real_bet_level, is_real_bet_target").eq("race_date", target_date).execute()
+            sched_map = {item["race_id"]: item for item in (sched_res.data or [])}
+        except Exception as e_sched:
+            print(f"Supabaseスケジュール取得エラー: {e_sched}")
+
     pass_benefit_total = 0
     pass_avoided_losses = 0
     pass_missed_profits = 0
@@ -6064,21 +6265,42 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         h_rec = p_data.get("hybrid_recommendation") or {}
         b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
         rb_meta = b_det.get("real_bet_meta") or {}
+        sc_info = sched_map.get(r["race_id"], {})
 
         # 実戦推奨情報を付与（キャッシュ破棄後も bet_details.real_bet_meta から復元）
-        r["is_real_bet_target"] = h_rec.get("is_real_bet_target", rb_meta.get("is_real_bet_target", False))
-        badge_val = h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge")
+        is_real = bool(
+            h_rec.get("is_real_bet_target")
+            or rb_meta.get("is_real_bet_target")
+            or sc_info.get("is_real_bet_target")
+            or (rb_meta.get("real_bet_level") in ["high", "standard"])
+            or (h_rec.get("real_bet_level") in ["high", "standard"])
+        )
+        r["is_real_bet_target"] = is_real
+
+        badge_val = h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge") or sc_info.get("real_bet_badge")
         if badge_val and isinstance(badge_val, str):
             badge_val = badge_val.replace("🎯", "⭐")
         r["real_bet_badge"] = badge_val
         if r.get("strategy_name") and isinstance(r["strategy_name"], str):
             r["strategy_name"] = r["strategy_name"].replace("🎯", "⭐")
-        r["real_bet_level"] = h_rec.get("real_bet_level") or rb_meta.get("real_bet_level", "none")
+        r["real_bet_level"] = h_rec.get("real_bet_level") or rb_meta.get("real_bet_level") or sc_info.get("real_bet_level") or "none"
         r["edge_ratio"] = h_rec.get("edge_ratio") if h_rec.get("edge_ratio") is not None else rb_meta.get("edge_ratio")
         r["is_final_odds"] = h_rec.get("is_final_odds", rb_meta.get("is_final_odds", False))
 
+        is_virt = bool(
+            sc_info.get("is_virtual_bet_target")
+            or h_rec.get("is_virtual_bet_target")
+            or rb_meta.get("is_virtual_bet_target")
+            or r.get("real_bet_level") == "virtual"
+            or (r.get("real_bet_badge") and "仮想" in str(r.get("real_bet_badge")))
+            or r.get("strategy_type") == "virtual"
+            or (r.get("hit_type") and "仮想" in str(r.get("hit_type")))
+        ) and not is_real
+        r["is_virtual_bet_target"] = is_virt
+
         if r.get("strategy_type") == "cancelled" or r.get("hit_type") == "開催中止":
             r["is_real_bet_target"] = False
+            r["is_virtual_bet_target"] = False
             r["real_bet_badge"] = "⛔【開催中止】全額返還"
             r["real_bet_level"] = "none"
             r["hypothetical_bet"] = 0
@@ -6086,6 +6308,53 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
             r["pass_benefit"] = 0
             r["mark_orders"] = []
             r["top3_orders"] = []
+        elif is_virt:
+            # ★ 仮想馬券: 全参戦（仮想含む）モードで収支を集計 ★
+            c_res = res_cache_map.get(r["race_id"], {})
+            if p_data and c_res:
+                pass_info = calculate_hybrid_pass_benefit_info(h_rec, c_res, r.get("target_umaban"), r.get("actual_order"), pred_data=p_data)
+                v_bet = pass_info["hypothetical_bet"]
+                v_pay = pass_info["hypothetical_payout"]
+                pb = pass_info["pass_benefit"]
+                r["mark_orders"] = pass_info.get("mark_orders") or rb_meta.get("mark_orders")
+                r["top3_orders"] = pass_info.get("top3_orders") or rb_meta.get("top3_orders")
+                if not r.get("tansho_payout"):
+                    r["tansho_payout"] = pass_info.get("pay_tan", 0)
+                if not r.get("fukusho_payout"):
+                    r["fukusho_payout"] = pass_info.get("pay_fuku", 0)
+            else:
+                v_bet = r.get("total_bet") or r.get("hypothetical_bet") or 200
+                v_pay = r.get("total_payout") or r.get("hypothetical_payout") or 0
+                pb = r.get("pass_benefit") or 0
+                r["mark_orders"] = r.get("mark_orders") or rb_meta.get("mark_orders")
+                r["top3_orders"] = r.get("top3_orders") or rb_meta.get("top3_orders")
+
+            r["hypothetical_bet"] = v_bet
+            r["hypothetical_payout"] = v_pay
+            r["pass_benefit"] = pb
+
+            # 全参戦集計のために投資・払戻・的中・券種をセット
+            r["total_bet"] = v_bet
+            r["total_payout"] = v_pay
+            r["profit"] = v_pay - v_bet
+            r["recovery_rate"] = round((v_pay / v_bet) * 100.0, 1) if v_bet > 0 else 0.0
+            r["is_pass"] = 0
+            r["is_hit"] = 1 if v_pay > 0 else 0
+            r["hit_type"] = "仮想的中" if v_pay > 0 else "仮想不的中"
+            r["strategy_type"] = "virtual"
+            r["real_bet_level"] = "virtual"
+            if not r.get("real_bet_badge"):
+                slot_no = sc_info.get("virtual_bet_slot") or 1
+                r["real_bet_badge"] = f"💡【仮想馬券】会場No.{slot_no}推奨 (単複)"
+            if (r.get("tansho_bet") or 0) == 0:
+                r["tansho_bet"] = 100
+                r["fukusho_bet"] = 100
+            if not r.get("bet_breakdown"):
+                r["bet_breakdown"] = {"単勝": 100, "複勝": 100}
+            p_bd = r.get("payout_breakdown") if isinstance(r.get("payout_breakdown"), dict) else {}
+            if (r.get("tansho_payout") or 0) > 0: p_bd["単勝"] = r["tansho_payout"]
+            if (r.get("fukusho_payout") or 0) > 0: p_bd["複勝"] = r["fukusho_payout"]
+            r["payout_breakdown"] = p_bd
         elif r.get("is_pass") == 1:
             c_res = res_cache_map.get(r["race_id"], {})
             if p_data and c_res:
@@ -8138,7 +8407,7 @@ def fix_duplicated_horses_cache_2026():
         print(f"[FixDuplicates] クリーンアップ例外: {e}")
 
 
-def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
+def heal_today_weights_and_results(target_date: Optional[str] = None, force_resettle: bool = False) -> dict:
     """指定日(デフォルト本日)の馬体重未反映レースおよび結果未検証レースを一括補完・検証"""
     if not supabase:
         return {"status": "error", "message": "Supabase not connected"}
@@ -8191,10 +8460,17 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
             except Exception as we:
                 errors.append(f"weight({rid}): {we}")
 
-        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース)
+        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース または 仮想馬券でis_pass=1のままのレース)
         is_real_target = bool((dj.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
+        is_virt_target = bool(
+            sr.get("is_virtual_bet_target")
+            or (dj.get("hybrid_recommendation") or {}).get("is_virtual_bet_target")
+            or sr.get("real_bet_level") == "virtual"
+            or (sr.get("real_bet_badge") and "仮想" in str(sr.get("real_bet_badge")))
+        ) and not is_real_target
         needs_real_resettle = is_real_target and (settle_pass_map.get(rid) in (1, True))
-        if mins_to_post <= -8.0 and (rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle):
+        needs_virt_resettle = is_virt_target and (settle_pass_map.get(rid) in (1, True))
+        if mins_to_post <= -8.0 and (force_resettle or rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle or needs_virt_resettle):
             try:
                 verify_race_result(rid, bypass_cache=True, is_19h_settle=False)
                 supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", rid).execute()
@@ -8219,8 +8495,11 @@ def heal_today_weights_and_results(target_date: Optional[str] = None) -> dict:
 
 @app.post("/admin/heal-today")
 @app.get("/admin/heal-today")
-def endpoint_heal_today(date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)")):
-    return heal_today_weights_and_results(date)
+def endpoint_heal_today(
+    date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)"),
+    force_resettle: bool = Query(False, description="全レースの結果照合・確定を強制再計算するか")
+):
+    return heal_today_weights_and_results(date, force_resettle=force_resettle)
 
 
 @app.post("/admin/reselect-daily-real-bet")
