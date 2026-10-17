@@ -846,6 +846,8 @@ class BettingSettingsResponse(BaseModel):
     ipat_configured: bool
     umaca_configured: Optional[bool] = False
     last_balance: Optional[int] = None
+    balance_status: Optional[str] = "ok"
+    balance_message: Optional[str] = None
     remaining_bet_amount: int = 0
     remaining_real_races_count: int = 0
     balance_shortfall: int = 0
@@ -1026,6 +1028,8 @@ def get_betting_settings_endpoint():
         ipat_configured=(has_umaca_env if cur_mode == "umaca" else has_ipat_env),
         umaca_configured=has_umaca_env,
         last_balance=settings.get("last_balance"),
+        balance_status=settings.get("balance_status", "ok" if settings.get("last_balance") is not None else "unavailable"),
+        balance_message=settings.get("balance_message"),
         remaining_bet_amount=rem_amt,
         remaining_real_races_count=rem_count,
         balance_shortfall=shortfall,
@@ -1042,15 +1046,34 @@ def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
     settings = load_betting_settings_from_supabase()
     settings["betting_mode"] = new_mode
 
-    # モード切替時に選択したプラットフォームの最新残高も自動照会して反映を試みる
+    # モード切替時に選択したプラットフォームの最新残高を自動照会
     if new_mode in ("ipat", "umaca"):
         try:
-            client = UMACAFastClient() if new_mode == "umaca" else IPATFastClient()
+            client = BettingClientFactory.get_client(new_mode)
             l_res = client.login()
             if l_res.get("success"):
                 settings["last_balance"] = l_res.get("balance", 0)
+                settings["balance_status"] = "ok"
+                settings["balance_message"] = None
+            else:
+                # 取得できなかった場合は前回の古い残高をクリアして明示
+                settings["last_balance"] = None
+                settings["balance_status"] = "unavailable"
+                err_text = l_res.get("error", "残高を取得できませんでした")
+                if "時間外" in err_text:
+                    settings["balance_message"] = "ただいま投票受付時間外です"
+                else:
+                    settings["balance_message"] = err_text
         except Exception as e:
-            print(f"[BettingModeSwitch] 残高自動照会スキップ ({new_mode}): {e}")
+            settings["last_balance"] = None
+            settings["balance_status"] = "unavailable"
+            settings["balance_message"] = f"照会例外: {e}"
+            print(f"[BettingModeSwitch] 残高自動照会エラー ({new_mode}): {e}")
+    else:
+        # off の場合
+        settings["last_balance"] = None
+        settings["balance_status"] = "off"
+        settings["balance_message"] = "自動投票OFF"
 
     save_betting_settings_to_supabase(settings)
     mode_names = {
@@ -1062,6 +1085,8 @@ def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
         "status": "ok",
         "betting_mode": new_mode,
         "last_balance": settings.get("last_balance"),
+        "balance_status": settings.get("balance_status"),
+        "balance_message": settings.get("balance_message"),
         "message": f"自動投票モードを「{mode_names.get(new_mode, new_mode)}」に設定しました。"
     }
 
@@ -1072,24 +1097,20 @@ def test_ipat_endpoint(mode: Optional[str] = Query(None, description="テスト�
     settings = load_betting_settings_from_supabase()
     target_mode = (mode or settings.get("betting_mode") or "ipat").lower().strip()
     if target_mode == "off":
-        # OFF選択中に接続テストを押した場合は設定済みのプラットフォーム（UMACA優先またはIPAT）をテスト
+        # OFF選択中に接続テストを押した場合は設定済みのプラットフォームをテスト
         target_mode = "umaca" if UMACAFastClient().is_configured() else "ipat"
 
     try:
-        if target_mode == "umaca":
-            client = UMACAFastClient()
-            res = client.login()
-            label = "UMACAスマート"
-            bal_label = "投票用残高"
-        else:
-            client = IPATFastClient()
-            res = client.login()
-            label = "即PAT"
-            bal_label = "購入限度額"
+        client = BettingClientFactory.get_client(target_mode)
+        res = client.login()
+        label = "UMACAスマート" if target_mode == "umaca" else "即PAT"
+        bal_label = "投票用残高" if target_mode == "umaca" else "購入限度額"
 
         if res.get("success"):
             balance = res.get("balance", 0)
             settings["last_balance"] = balance
+            settings["balance_status"] = "ok"
+            settings["balance_message"] = None
             save_betting_settings_to_supabase(settings)
             return {
                 "success": True,
@@ -1098,16 +1119,28 @@ def test_ipat_endpoint(mode: Optional[str] = Query(None, description="テスト�
                 "message": f"{label}接続成功！ {bal_label}: {balance:,}円"
             }
         else:
+            err_msg = res.get("error", f"{label}への接続に失敗しました")
+            settings["last_balance"] = None
+            settings["balance_status"] = "unavailable"
+            settings["balance_message"] = err_msg
+            save_betting_settings_to_supabase(settings)
             return {
                 "success": False,
                 "platform": target_mode,
-                "error": res.get("error", f"{label}への接続に失敗しました")
+                "balance": None,
+                "error": err_msg
             }
     except Exception as e:
+        err_msg = f"接続テスト例外エラー: {e}"
+        settings["last_balance"] = None
+        settings["balance_status"] = "unavailable"
+        settings["balance_message"] = err_msg
+        save_betting_settings_to_supabase(settings)
         return {
             "success": False,
             "platform": target_mode,
-            "error": f"接続テスト例外エラー: {e}"
+            "balance": None,
+            "error": err_msg
         }
 
 class ManualBetItem(BaseModel):
