@@ -151,3 +151,4 @@ def endpoint_stats_dict_info():
         "supabase_connected": supabase is not None,
         "server_time_jst": now_jst().strftime("%Y-%m-%d %H:%M:%S")
     }
+
