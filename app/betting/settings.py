@@ -126,3 +126,4 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
     except Exception as e:
         print(f"[RemainingBetAmount] 計算エラー: {e}")
         return 0, 0, []
+
