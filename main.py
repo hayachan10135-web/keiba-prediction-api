@@ -5835,7 +5835,7 @@ def verify_race_result(
         c_orders = cached_data.get("orders", {}) if isinstance(cached_data, dict) else {}
         c_payouts = cached_data.get("payouts", {}) if isinstance(cached_data, dict) else {}
         c_order_vals = [int(v) for v in c_orders.values() if str(v).isdigit()]
-        c_has_top3 = (1 in c_order_vals) and (2 in c_order_vals) and (3 in c_order_vals)
+        c_has_top3 = (1 in c_order_vals) and (sum(1 for v in c_order_vals if v in (1, 2, 3)) >= 3)
         c_has_pay = bool(c_payouts.get("tansho") or c_payouts.get("umaren") or c_payouts.get("fukusho"))
         if c_has_top3 and c_has_pay:
             from_cache = True
@@ -5860,8 +5860,9 @@ def verify_race_result(
     if actual_order is None and target_u is not None:
         actual_order = orders.get(str(target_u))
 
-    # ★ 着順および払戻金が実数値で確認できるかの厳格チェック
-    has_top3 = (1 in orders.values()) and (2 in orders.values()) and (3 in orders.values())
+    # ★ 着順および払戻金が実数値で確認できるかの厳格チェック（同着考慮）
+    order_vals = [int(v) for v in orders.values() if str(v).isdigit()]
+    has_top3 = (1 in order_vals) and (sum(1 for v in order_vals if v in (1, 2, 3)) >= 3)
     has_payouts = (len(payouts.get("tansho", {})) > 0) or (len(payouts.get("umaren", {})) > 0) or (len(payouts.get("fukusho", {})) > 0)
     has_target_order = (actual_order is not None and isinstance(actual_order, int) and 1 <= actual_order <= 30)
 
@@ -6906,9 +6907,9 @@ async def background_maintenance_loop():
                                     check_and_notify_balance_shortfall()
                         except Exception as fe:
                             print(f"[Scheduler] 朝通知エラー: {fe}")
-                else:
-                    # 本日が非開催日（平日等）の場合はチェック済みとしてマーク
-                    last_830_predict_date = today_str
+                    else:
+                        # 本日が非開催日（平日等）の場合はチェック済みとしてマーク
+                        last_830_predict_date = today_str
 
             if supabase:
                 # --- ③ 各レース【発走 60分前 / 30分前 / 15分前 / 5分前】のマルチステージ自動推論 ＆ 最終確定通知 ---
@@ -8141,6 +8142,18 @@ def apply_verified_20261017_12r_on_startup():
             supabase.table("keiba_race_settlements").upsert(payload["settlements"], on_conflict="race_id").execute()
         if payload.get("scheduled"):
             supabase.table("keiba_scheduled_races").upsert(payload["scheduled"], on_conflict="race_id").execute()
+        try:
+            b_settings = load_betting_settings_from_supabase()
+            b_dict = b_settings.get("betted_races_by_date", {})
+            if "2026-10-17" in b_dict and isinstance(b_dict["2026-10-17"], list):
+                b_dict["2026-10-17"] = [
+                    x for x in b_dict["2026-10-17"]
+                    if isinstance(x, dict) and x.get("race_id") not in ("202604040112", "202605040612")
+                ]
+                b_settings["betted_races_by_date"] = b_dict
+                save_betting_settings_to_supabase(b_settings)
+        except Exception:
+            pass
         invalidate_summary_caches()
         print("[Startup] 2026-10-17 新潟12R・東京12R 見送り復元＆12R確定データをDBへ即時反映しました。")
     except Exception as e:
