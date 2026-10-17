@@ -92,13 +92,21 @@ class IPATFastClient:
             if "間違っています" in page_text or "エラー" in page_text or "ログイン画面から" in page_text:
                 return {"success": False, "error": "即PATログイン認証エラー (加入者番号・暗証番号・PARSをご確認ください)"}
 
-            # メニュー画面からセッションパラメータ（u, g, mli）を保存
+            # メニュー画面から emenu フォームを優先してセッションパラメータ（u, g, mli, nbs）を保存
             soup2 = BeautifulSoup(page_text, "html.parser")
-            for inp in soup2.find_all("input"):
-                name = inp.get("name")
-                val = inp.get("value")
-                if name and val is not None and name in ("u", "g", "mli", "nbs"):
-                    self.session_data[name] = val
+            emenu = soup2.find("form", {"name": "emenu"})
+            if emenu:
+                for inp in emenu.find_all("input"):
+                    name = inp.get("name")
+                    val = inp.get("value")
+                    if name and val is not None:
+                        self.session_data[name] = val
+            else:
+                for inp in soup2.find_all("input"):
+                    name = inp.get("name")
+                    val = inp.get("value")
+                    if name and val is not None and name in ("u", "g", "mli", "nbs"):
+                        self.session_data[name] = val
 
             # 残高パース
             m = re.search(r"購入限度額[\s\S]{0,40}?([\d,]+)\s*円", page_text)
@@ -170,7 +178,17 @@ class IPATFastClient:
                         venue_val = opt.get("value")
                         break
             if not venue_val:
-                return {"status": "failed", "step": "select_venue", "error": f"競馬場 {venue_name} が選択肢に見つかりませんでした"}
+                available_venues = [opt.get_text().strip() for opt in j_select.find_all("option")] if j_select else []
+                err_detail = f"発売中: {', '.join(available_venues)}" if available_venues else "発売中競馬場なし(時間外またはセッションエラー)"
+                return {"status": "failed", "step": "select_venue", "error": f"競馬場 {venue_name} が選択肢に見つかりませんでした ({err_detail})"}
+
+            # kw_150 のフォームから hidden inputs を session_data に取り込む
+            form150 = soup_sel.find("form")
+            if form150:
+                for inp in form150.find_all("input"):
+                    n, v = inp.get("name"), inp.get("value")
+                    if n and v is not None:
+                        self.session_data[n] = v
 
             # 各買い目を投入
             for idx, item in enumerate(items):
@@ -197,6 +215,13 @@ class IPATFastClient:
 
                 r_160 = self.session.post(f"{self.BASE_URL}/kw_160.cgi", data=form_data_160, timeout=10)
                 r_160.encoding = "euc-jp"
+                soup_160 = BeautifulSoup(r_160.text, "html.parser")
+                form160 = soup_160.find("form")
+                if form160:
+                    for inp in form160.find_all("input"):
+                        n, v = inp.get("name"), inp.get("value")
+                        if n and v is not None:
+                            self.session_data[n] = v
 
                 # kw_170.cgi へPOST (馬番・金額投入)
                 form_data_170 = dict(self.session_data)
@@ -217,7 +242,7 @@ class IPATFastClient:
                     soup_170 = BeautifulSoup(r_170.text, "html.parser")
                     for inp in soup_170.find_all("input"):
                         n, v = inp.get("name"), inp.get("value")
-                        if n in ("u", "g", "mli", "nbs") and v:
+                        if n and v is not None:
                             self.session_data[n] = v
 
             if added_count == 0:
@@ -244,7 +269,7 @@ class IPATFastClient:
             receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
             balance_after = max(0, current_balance - added_amount)
             self.last_balance = balance_after
-            print(f"[IPATFast] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
+            print(f"[IPATFast] [SUCCESS] 投票完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
 
             return {
                 "status": "success",
