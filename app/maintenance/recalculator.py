@@ -204,3 +204,4 @@ def recalculate_period_records():
         "real_bet_recovery_rate": rb_roi,
         "pass_benefit_total": total_pass_benefit
     }
+
