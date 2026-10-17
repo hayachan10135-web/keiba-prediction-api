@@ -395,16 +395,17 @@ class UMACAFastClient:
                 }
 
             # 4. 最終投票確定 (pw_742_i.cgi) へPOST
-            # SendNB() と ToSend() の処理を再現
-            for i, nb_val in enumerate(active_nbs):
-                form_741[f"{i + 1:03d}"] = nb_val
+            # SendNB() と ToSend() の処理を完全再現 (001〜255 の全スロットに Nb[0..254] をセット)
+            for slot_idx in range(255):
+                key = f"{slot_idx + 1:03d}"
+                form_741[key] = active_nbs[slot_idx] if slot_idx < len(active_nbs) else "0"
             form_741["l"] = str(total_amount)
             form_741["s"] = str(total_amount)
 
             r_742 = self.session.post(f"{self.BASE_URL}/pw_742_i.cgi", data=form_741, timeout=15)
             html_742 = self._decode_euc(r_742)
 
-            if "エラー" in html_742 and "受け付けました" not in html_742:
+            if ("エラー" in html_742 or "正しくありません" in html_742) and ("受付番号" not in html_742 and "受け付けました" not in html_742):
                 return {"status": "failed", "step": "submit_742", "error": "最終投票送信時にエラーが返されました"}
 
             # 受付番号の抽出
