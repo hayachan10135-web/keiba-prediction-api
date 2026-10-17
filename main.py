@@ -1590,17 +1590,22 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
         except Exception as se:
             print(f"レース一覧確定情報付与エラー: {se}")
 
-        # 1日1レース厳選保証: 実戦対象が0レースまたは複数レースの場合は1レースに自動調停
-        real_count = sum(1 for v in cached_preds_map.values() if v.get("is_real_bet_target"))
-        if real_count != 1 and formatted_date >= today_jst_str() and cached_preds_map:
-            top_rid = ensure_daily_single_real_bet(formatted_date)
-            if top_rid:
-                for rid_k, v_info in cached_preds_map.items():
-                    if rid_k == top_rid:
-                        v_info["is_real_bet_target"] = True
-                        v_info["real_bet_badge"] = "⭐【本日厳選No.1】"
-                    else:
-                        v_info["is_real_bet_target"] = False
+        # 実馬券厳選保証: 自然条件(戦略B/A/C/A-2)を満たすレースは全て実馬券とし、0レースの時のみ当日No.1の1レースを実馬券に昇格
+        natural_real_count = sum(1 for v in cached_preds_map.values() if v.get("is_real_bet_target"))
+        has_downgraded_ref = any("参考推奨" in str(v.get("real_bet_badge") or "") for v in cached_preds_map.values())
+        if (natural_real_count == 0 or has_downgraded_ref) and formatted_date >= today_jst_str() and cached_preds_map:
+            ensure_daily_single_real_bet(formatted_date)
+            try:
+                p_res2 = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
+                for row in (p_res2.data or []):
+                    d_json = row.get("data_json") or {}
+                    h_rec = d_json.get("hybrid_recommendation")
+                    if h_rec and row["race_id"] in cached_preds_map:
+                        cached_preds_map[row["race_id"]]["is_real_bet_target"] = h_rec.get("is_real_bet_target", False)
+                        cached_preds_map[row["race_id"]]["real_bet_badge"] = h_rec.get("real_bet_badge")
+                        cached_preds_map[row["race_id"]]["real_bet_level"] = h_rec.get("real_bet_level", "none")
+            except Exception:
+                pass
 
     for venue in venues:
         races_in_venue = venue.get("races", [])
@@ -2129,28 +2134,31 @@ def calculate_dynamic_bet(score: float, odds: Optional[float] = None):
         return "D", "見送り推奨", True, 0, 0
 
 
-# --- 【1日1レース厳選】ヘルパー機構 ---
+# --- 【実馬券選定 ＆ 0レース時の当日No.1昇格保証】ヘルパー機構 ---
 _daily_top_race_id_cache: Dict[str, str] = {}
 _auto_betted_dates: Set[str] = set()
+NATURAL_REAL_STRATEGIES = ("strategy_b", "strategy_a", "strategy_c", "strategy_a_hole")
 
-def has_already_betted_today(date_str: str) -> bool:
-    """当日すでに即PAT投票完了済みのレースが存在するか確認 (1日1レース厳守)"""
-    if date_str in _auto_betted_dates:
+def has_already_betted_race(date_str: str, race_id: str) -> bool:
+    """指定レース(race_id)がすでに自動投票完了済みか確認 (同一レース二重発注防止)"""
+    if race_id in _auto_betted_races:
         return True
     try:
         settings = load_betting_settings_from_supabase()
         betted = settings.get("betted_races_by_date", {})
-        if date_str in betted and betted[date_str]:
-            _auto_betted_dates.add(date_str)
-            return True
+        for item in betted.get(date_str, []):
+            if isinstance(item, dict) and item.get("race_id") == race_id:
+                _auto_betted_races.add(race_id)
+                return True
     except Exception:
         pass
     return False
 
 def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
     """
-    当日(target_date)全レースの中から、平地（障害・新馬除く）で最も確信度・適性が高い
-    『本日のNo.1厳選勝負レース』の race_id を特定して返す。（当日未発走レースを優先選出）
+    当日(target_date)全レースの中で、自然条件（戦略B/A/C/A-2）を満たすレースが0レースのときのみ、
+    『確信度 × エッジ適性スコア』が最も高い1レースの race_id を特定して返す。
+    自然条件を満たすレースが1つ以上存在する場合は None を返す（全合致レースをそのまま実馬券とする）。
     """
     if not target_date or not supabase:
         return None
@@ -2158,28 +2166,19 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
     now_t = now_jst_naive()
     is_today = (target_date == today_jst_str())
 
-    if target_date in _daily_top_race_id_cache:
-        cached_rid = _daily_top_race_id_cache[target_date]
-        if is_today:
-            # キャッシュ済みレースが既に発走時刻を過ぎている場合はキャッシュ無効化して次レースを再探索
-            try:
-                res_check = supabase.table("keiba_scheduled_races").select("post_datetime").eq("race_id", cached_rid).execute()
-                if res_check.data and res_check.data[0].get("post_datetime"):
-                    p_dt = datetime.datetime.strptime(res_check.data[0]["post_datetime"], "%Y-%m-%d %H:%M:%S")
-                    if now_t >= p_dt:
-                        _daily_top_race_id_cache.pop(target_date, None)
-                    else:
-                        return cached_rid
-            except Exception:
-                return cached_rid
-        else:
-            return cached_rid
-
     try:
         res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
         rows = res.data or []
         if not rows:
             return None
+
+        # 自然条件（戦略B / A / C / A-2）を満たすレースが1つでもあれば、昇格枠は不要
+        for r in rows:
+            dj = r.get("data_json") or {}
+            h_rec = dj.get("hybrid_recommendation") or {}
+            if h_rec.get("strategy_type") in NATURAL_REAL_STRATEGIES:
+                _daily_top_race_id_cache.pop(target_date, None)
+                return None
 
         candidates = []
         for r in rows:
@@ -2193,7 +2192,8 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
             if len(horses) < 8:
                 continue
 
-            # 当日の場合は未発走（発走時刻前）のレースのみを対象とする
+            # 当日の場合は未発走（発走時刻前）のレースを優先対象とする
+            is_unrun = True
             if is_today:
                 p_time_str = (dj.get("race_details") or {}).get("post_time", "")
                 m_t = re.search(r"(\d{1,2}):(\d{2})", p_time_str)
@@ -2202,34 +2202,28 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
                     r_parts = [int(p) for p in target_date.split("-")]
                     post_dt = datetime.datetime(r_parts[0], r_parts[1], r_parts[2], hh, mm)
                     if now_t >= post_dt:
-                        continue
+                        is_unrun = False
 
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            is_natural_real = bool(h_rec.get("is_real_bet_target"))
             aptitude_score = conf * min(max(edge, 0.8), 2.5)
 
             candidates.append({
                 "race_id": rid,
+                "is_unrun": is_unrun,
                 "confidence_score": conf,
                 "edge_ratio": edge,
-                "is_natural_real": is_natural_real,
                 "aptitude_score": aptitude_score
             })
 
         if not candidates:
             return None
 
-        # 1. 既存の戦略B/A/C/A-2に自然合致したレースがある場合は最高スコアの1レース
-        natural_matches = [c for c in candidates if c["is_natural_real"]]
-        if natural_matches:
-            natural_matches.sort(key=lambda x: (x["confidence_score"], x["aptitude_score"]), reverse=True)
-            chosen_rid = natural_matches[0]["race_id"]
-        else:
-            # 2. 自然合致がない場合は当日全レースから最高確信度・適性度の1レース
-            candidates.sort(key=lambda x: (x["confidence_score"], x["aptitude_score"]), reverse=True)
-            chosen_rid = candidates[0]["race_id"]
+        unrun_candidates = [c for c in candidates if c["is_unrun"]]
+        pool = unrun_candidates if unrun_candidates else candidates
+        pool.sort(key=lambda x: (x["aptitude_score"], x["confidence_score"]), reverse=True)
+        chosen_rid = pool[0]["race_id"]
 
         _daily_top_race_id_cache[target_date] = chosen_rid
         return chosen_rid
@@ -2239,10 +2233,9 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
 
 def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
     """
-    【1日1レース厳選保証】
-    当日全レースの中から、最も適性・確信度が高い1レース（未発走優先）のみを実馬券枠（is_real_bet_target = True）とし、
-    他のレースをすべて非実馬券（is_real_bet_target = False）に制御する。
-    本命馬（◎）の馬番・馬名と買い目を100%完全同期する。
+    【実馬券厳選ルール】
+    1. 戦略B（勝負馬券）および戦略A・C・A-2（実馬券1〜3）を満たすレースはすべて実馬券（is_real_bet_target = True）とする。
+    2. 上記を満たすレースが0レースのときのみ、当日全レースの中で『確信度 × エッジ適性スコア』が最も高い1レースを実馬券に昇格する。
     """
     if not target_date or not supabase:
         return None
@@ -2256,6 +2249,53 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         if not rows:
             return None
 
+        natural_real_rids = []
+        # Step 1: 過去に「参考推奨」へ格下げされていた自然合致レース（戦略B/A/C/A-2）があれば全て実馬券に復元
+        for r in rows:
+            rid = str(r.get("race_id") or "")
+            dj = r.get("data_json") or {}
+            h_rec = dj.get("hybrid_recommendation") or {}
+            st_type = h_rec.get("strategy_type")
+            if st_type in NATURAL_REAL_STRATEGIES:
+                natural_real_rids.append(rid)
+                if not h_rec.get("is_real_bet_target") or "参考推奨" in str(h_rec.get("real_bet_badge") or ""):
+                    h_rec["is_participate"] = True
+                    h_rec["is_real_bet_target"] = True
+                    h_rec["real_bet_level"] = "high" if st_type == "strategy_b" else "standard"
+                    badge_map = {
+                        "strategy_b": "🔥【超勝負R】単勝＋馬単レバレッジ",
+                        "strategy_a": "⭐【芝厳選】単複ケリー傾斜",
+                        "strategy_c": "🛡️【ダート本命】手堅い単複防衛",
+                        "strategy_a_hole": "⚡【芝波乱妙味】単複好配当狙い"
+                    }
+                    h_rec["real_bet_badge"] = badge_map.get(st_type, "⭐【実馬券推奨】")
+                    dj["hybrid_recommendation"] = h_rec
+                    supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
+
+        # Step 2: 自然合致レースが1レース以上存在する場合は、不要な daily_top 昇格枠を解除して終了
+        if natural_real_rids:
+            for r in rows:
+                rid = str(r.get("race_id") or "")
+                dj = r.get("data_json") or {}
+                h_rec = dj.get("hybrid_recommendation") or {}
+                if h_rec.get("strategy_type") == "daily_top":
+                    h_rec["is_participate"] = False
+                    h_rec["is_real_bet_target"] = False
+                    h_rec["real_bet_level"] = "none"
+                    h_rec["real_bet_badge"] = None
+                    h_rec["strategy_type"] = "skip"
+                    h_rec["strategy_name"] = "見送り推奨 (資金保全)"
+                    h_rec["tansho_bets"] = []
+                    h_rec["fukusho_bets"] = []
+                    h_rec["total_amount"] = 0
+                    dj["hybrid_recommendation"] = h_rec
+                    supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
+            _daily_top_race_id_cache.pop(target_date, None)
+            _all_predictions_cache.pop(target_date, None)
+            _today_races_cache.pop(target_date, None)
+            return natural_real_rids[0]
+
+        # Step 3: 自然合致が0レースのときのみ、確信度 × エッジ適性スコア 最高位の1レースを実馬券に昇格
         candidates = []
         for r in rows:
             rid = str(r.get("race_id") or "")
@@ -2268,7 +2308,7 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
             if len(horses) < 8:
                 continue
 
-            # 当日の場合は未発走（発走時刻前）のレースのみを対象とする
+            is_unrun = True
             if is_today:
                 p_time_str = (dj.get("race_details") or {}).get("post_time", "")
                 m_t = re.search(r"(\d{1,2}):(\d{2})", p_time_str)
@@ -2277,31 +2317,32 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
                     r_parts = [int(p) for p in target_date.split("-")]
                     post_dt = datetime.datetime(r_parts[0], r_parts[1], r_parts[2], hh, mm)
                     if now_t >= post_dt:
-                        continue
+                        is_unrun = False
 
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            is_real = bool(h_rec.get("is_real_bet_target"))
             score = conf * min(max(edge, 0.8), 2.5)
             candidates.append({
                 "race_id": rid,
                 "data_json": dj,
+                "is_unrun": is_unrun,
                 "confidence_score": conf,
                 "edge_ratio": edge,
-                "is_real": is_real,
                 "score": score
             })
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: (x["confidence_score"], x["score"]), reverse=True)
-        top_race = candidates[0]
+        unrun_candidates = [c for c in candidates if c["is_unrun"]]
+        pool = unrun_candidates if unrun_candidates else candidates
+        pool.sort(key=lambda x: (x["score"], x["confidence_score"]), reverse=True)
+        top_race = pool[0]
         top_rid = top_race["race_id"]
         top_dj = top_race["data_json"]
 
-        # ★ 本命馬（◎ または prob_win 最大馬）を正確に特定（horses[0]を盲信しない） ★
+        # 本命馬（◎ または prob_win 最大馬）を特定
         horses = top_dj.get("horses") or []
         honmei_horse = next((h for h in horses if h.get("mark") == "◎"), None)
         if not honmei_horse:
@@ -2327,17 +2368,17 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
             d_tan = 700
             d_fuku = 300
             h_rec["strategy_name"] = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】ダート適性単複 (1日1R限定)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】ダート適性単複 (0R時昇格)"
         elif w0_odds >= 5.0:
             d_tan = 500
             d_fuku = 500
             h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝妙味単複 (1日1R限定)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝妙味単複 (0R時昇格)"
         else:
             d_tan = 700
             d_fuku = 300
             h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝本命単複 (1日1R限定)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝本命単複 (0R時昇格)"
 
         tansho_bets.append({
             "ticket_type": "単勝",
@@ -2367,7 +2408,6 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         h_rec["summary"] = f"{h_rec['strategy_name']}：単勝{d_tan}円＋複勝{d_fuku}円 計{d_tan+d_fuku}円"
         top_dj["hybrid_recommendation"] = h_rec
 
-        # recommendation (TanFuku) も完全同期
         top_rec = top_dj.get("recommendation") or {}
         top_rec["target_umaban"] = w0_u
         top_rec["horse_name"] = w0_name
@@ -2381,33 +2421,26 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         top_dj["recommendation"] = top_rec
 
         supabase.table("keiba_predictions_cache").update({"data_json": top_dj}).eq("race_id", top_rid).execute()
-        # 厳選勝負レースの発走5分前自動推論＆即PAT発注が確実に作動するよう is_predicted を 1 にリセット
         try:
             supabase.table("keiba_scheduled_races").update({"is_predicted": 1}).eq("race_id", top_rid).execute()
         except Exception:
             pass
-        print(f"[DailySingleRealBet] {target_date}: 厳選No.1勝負レースとして {top_rid} (◎{w0_u}番 {w0_name}) を選出・設定しました。")
+        print(f"[DailySingleRealBet] {target_date}: 自然合致0Rのため厳選No.1レースとして {top_rid} (◎{w0_u}番 {w0_name}) を昇格しました。")
 
-        # 当日の他の全レース（発走済み含む）の is_real_bet_target を False にリセット
+        # 他の daily_top 昇格レースがあれば解除
         for r in rows:
             r_rid = str(r.get("race_id") or "")
             if r_rid != top_rid:
                 r_dj = r.get("data_json") or {}
                 r_h = r_dj.get("hybrid_recommendation") or {}
-                if r_h.get("is_real_bet_target"):
+                if r_h.get("strategy_type") == "daily_top" and r_h.get("is_real_bet_target"):
+                    r_h["is_participate"] = False
                     r_h["is_real_bet_target"] = False
-                    r_h["real_bet_level"] = "virtual"
-                    s_name = r_h.get("strategy_name", "")
-                    r_h["real_bet_badge"] = f"🎮【参考推奨】{s_name.split(':')[1].strip() if ':' in s_name else s_name}"
+                    r_h["real_bet_level"] = "none"
+                    r_h["real_bet_badge"] = None
+                    r_h["strategy_type"] = "skip"
                     r_dj["hybrid_recommendation"] = r_h
                     supabase.table("keiba_predictions_cache").update({"data_json": r_dj}).eq("race_id", r_rid).execute()
-
-        if is_today:
-            try:
-                # 投票されなかった新潟7R等の過去レースの収支照合を is_pass=1 (見送り) に補正
-                supabase.table("keiba_race_settlements").update({"is_pass": 1}).eq("race_date", target_date).neq("race_id", top_rid).execute()
-            except Exception:
-                pass
 
         _daily_top_race_id_cache[target_date] = top_rid
         _all_predictions_cache.pop(target_date, None)
@@ -3387,14 +3420,6 @@ def compute_hybrid_rec_from_inputs(
             skip_reason = "新馬戦除外 (過去走データなしのため見送り)"
         else:
             skip_reason = "見送り推奨"
-
-    # 【1日1レース厳守フィルター】
-    # デイリートップ以外のレースは実馬券対象から除外（参考推奨へ移行）
-    if is_participate and is_real_bet_target and not is_daily_top_race:
-        is_real_bet_target = False
-        real_bet_level = "virtual"
-        s_part = strategy_name.split(':')[1].strip() if ':' in strategy_name else strategy_name
-        real_bet_badge = f"🎮【参考推奨】{s_part}"
 
     tan_amt = sum(b["amount"] for b in tansho_bets)
     fuku_amt = sum(b["amount"] for b in fukusho_bets)
@@ -4385,19 +4410,15 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                         d_json["track_bias"] = tb_info
                 preds[r_id] = d_json
 
-        # 1日1レース厳選保証: 実戦対象が0レースまたは複数レースの場合は1レースに自動調停
+        # 実馬券厳選保証: 自然条件(戦略B/A/C/A-2)を満たすレースは全て実馬券とし、0レースの時のみ当日No.1の1レースを実馬券に昇格
         real_count = sum(1 for p in preds.values() if (p.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
-        if real_count != 1 and target_date >= today_jst_str() and preds:
-            top_rid = ensure_daily_single_real_bet(target_date)
-            if top_rid and top_rid in preds:
-                for rid_k, p_val in preds.items():
-                    h_r = p_val.get("hybrid_recommendation") or {}
-                    if rid_k == top_rid:
-                        fresh_top = supabase.table("keiba_predictions_cache").select("data_json").eq("race_id", top_rid).execute()
-                        if fresh_top.data and fresh_top.data[0].get("data_json"):
-                            preds[top_rid] = fresh_top.data[0]["data_json"]
-                    else:
-                        h_r["is_real_bet_target"] = False
+        has_downgraded_ref = any("参考推奨" in str((p.get("hybrid_recommendation") or {}).get("real_bet_badge") or "") for p in preds.values())
+        if (real_count == 0 or has_downgraded_ref) and target_date >= today_jst_str() and preds:
+            ensure_daily_single_real_bet(target_date)
+            fresh_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
+            for row in (fresh_res.data or []):
+                if row.get("race_id") and row.get("data_json"):
+                    preds[row["race_id"]] = row["data_json"]
         # 各会場確信度上位3枠（仮想観戦枠）バッジを予測データにも同期反映
         cached_venues_entry = _today_races_cache.get(target_date)
         if cached_venues_entry:
@@ -6859,9 +6880,7 @@ async def background_maintenance_loop():
 
                                     if cur_bet_mode in ("ipat", "umaca"):
                                         mode_label = "UMACA" if cur_bet_mode == "umaca" else "即PAT"
-                                        if has_already_betted_today(today_str):
-                                            print(f"[AutoBet] 本日({today_str})は既に1レース投票済みのためスキップします (1日1レース厳守)")
-                                        elif r_id in _auto_betted_races:
+                                        if has_already_betted_race(today_str, r_id):
                                             print(f"[AutoBet] {r_id} は既に投票済みのためスキップします (二重発注防止)")
                                         else:
                                             _auto_betted_races.add(r_id)
