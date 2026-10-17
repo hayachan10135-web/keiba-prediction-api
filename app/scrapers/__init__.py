@@ -14,7 +14,9 @@ from app.scrapers.netkeiba_client import (
     fetch_netkeiba_race_result,
     normalize_race_res,
     register_post_time_callback,
-    register_schedule_callback
+    register_schedule_callback,
+    USER_AGENTS,
+    HEADERS_PC
 )
 from app.scrapers.schedule_crawler import (
     parse_netkeiba_race_list_html,
@@ -34,6 +36,8 @@ __all__ = [
     "normalize_race_res",
     "register_post_time_callback",
     "register_schedule_callback",
+    "USER_AGENTS",
+    "HEADERS_PC",
     "parse_netkeiba_race_list_html",
     "fetch_venues_for_date_raw",
     "invalidate_venues_cache",
