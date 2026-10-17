@@ -229,66 +229,13 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": err_msg}
     )
 
-# --- 日本時間 (JST) ユーティリティ ---
-JST = zoneinfo.ZoneInfo("Asia/Tokyo")
-
-def now_jst() -> datetime.datetime:
-    """日本時間の現在時刻を取得"""
-    return datetime.datetime.now(JST)
-
-def now_jst_naive() -> datetime.datetime:
-    """比較用のタイムゾーンなしJST現在日時を取得"""
-    return now_jst().replace(tzinfo=None)
-
-def today_jst_str() -> str:
-    """日本時間の当日日付 (YYYY-MM-DD)"""
-    return now_jst().strftime("%Y-%m-%d")
-
-def parse_post_datetime(p_dt_str: Optional[str], fallback_date_str: Optional[str] = None) -> Optional[datetime.datetime]:
-    """Supabase等から返る発走日時文字列 ('YYYY-MM-DD HH:MM:SS', ISO形式 'T'/'Z'/'+09:00', 'HH:MM') を安全にnaive JST datetimeへ変換"""
-    if not p_dt_str or not isinstance(p_dt_str, str):
-        return None
-    s = p_dt_str.strip()
-    m_full = re.search(r"(\d{4})-(\d{2})-(\d{2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
-    if m_full:
-        try:
-            return datetime.datetime(
-                int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)),
-                int(m_full.group(4)), int(m_full.group(5)), int(m_full.group(6) or 0)
-            )
-        except Exception:
-            pass
-    if fallback_date_str:
-        m_hm = re.search(r"(\d{1,2}):(\d{2})", s)
-        m_d = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", fallback_date_str.strip())
-        if m_hm and m_d:
-            try:
-                return datetime.datetime(
-                    int(m_d.group(1)), int(m_d.group(2)), int(m_d.group(3)),
-                    int(m_hm.group(1)), int(m_hm.group(2)), 0
-                )
-            except Exception:
-                pass
-    return None
 
 
 
 
 
-GLOBAL_VENUE_MAP = {
-    1: "札幌", 2: "函館", 3: "福島", 4: "新潟", 5: "東京",
-    6: "中山", 7: "中京", 8: "京都", 9: "阪神", 10: "小倉"
-}
 
-CANCELLED_RACE_NAMES = {
-    "202605010308": "東京8R (積雪中止)",
-    "202605010309": "東京9R (積雪中止)",
-    "202605010310": "東京10R (積雪中止)",
-    "202605010311": "東京11R 早春S (積雪中止)",
-    "202605010312": "東京12R (積雪中止)",
-    "202610010604": "小倉4R (中止)",
-}
-# モデル・辞書パス定数は app/ml/model_loader.py へ移管完了
+
 
 # --- Supabase クライアント初期化 ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
