@@ -3866,7 +3866,23 @@ def predict_race_core(
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
 
     cached_pred = get_cached_prediction(race_id)
-    if not force_refresh and cached_pred:
+
+    # ★ 発走後判定（レース終了後にオッズ変動で再推論が走り本命馬が事後的にすり替わるのを完全防止） ★
+    is_post_race = False
+    if cached_pred:
+        r_d_str = resolve_race_date_for_id(race_id) or today_jst_str()
+        if r_d_str < today_jst_str():
+            is_post_race = True
+        elif r_d_str == today_jst_str():
+            p_str = (cached_pred.get("race_details") or {}).get("post_time", "")
+            m_t = re.search(r"(\d{1,2}):(\d{2})", p_str)
+            if m_t:
+                d_parts = [int(p) for p in r_d_str.split("-")]
+                est_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], int(m_t.group(1)), int(m_t.group(2)))
+                if now_jst_naive() >= est_dt:
+                    is_post_race = True
+
+    if cached_pred and (not force_refresh or is_post_race):
         # scoreキーの欠損を補完（FastAPIのレスポンスバリデーション安全化）
         for h in cached_pred.get("horses", []):
             if "score" not in h or h["score"] is None:
@@ -4297,6 +4313,19 @@ def calculate_hybrid_pass_benefit_info(
     fuku_map = payouts_data.get("fukusho", {})
 
     # 本命馬の単複(単100+複100)を仮想買い目として検証
+    # pred_dataが渡されている場合は、予想カードに表示される本命馬(◎)の馬番と完全同期
+    if pred_data:
+        p_rec = pred_data.get("recommendation") or {}
+        p_target = p_rec.get("target_umaban")
+        if p_target is not None:
+            target_u = int(p_target)
+        else:
+            # recommendation にない場合は horses の mark='◎' をフォールバック探索
+            for h in pred_data.get("horses", []):
+                if h.get("mark") == "◎":
+                    target_u = int(h.get("umaban"))
+                    break
+
     hit_details = []
     if target_u is not None:
         unit_tan = tan_map.get(target_u, 0) or tan_map.get(str(target_u), 0)
@@ -4392,13 +4421,41 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
             if d["is_pass"]:
                 if pred_cache and res_cache:
                     h_rec = pred_cache.get("hybrid_recommendation") if pred_cache else None
-                    pass_info = calculate_hybrid_pass_benefit_info(h_rec, res_cache, d.get("target_umaban"), order, pred_data=pred_cache)
+                    expected_target_u = (pred_cache.get("recommendation") or {}).get("target_umaban")
+                    expected_h_name = (pred_cache.get("recommendation") or {}).get("horse_name")
+                    cur_target_u = expected_target_u if expected_target_u is not None else d.get("target_umaban")
+
+                    orders_map = res_cache.get("orders", {})
+                    cur_order = orders_map.get(cur_target_u) if cur_target_u is not None else order
+                    if cur_order is None and cur_target_u is not None:
+                        cur_order = orders_map.get(str(cur_target_u))
+
+                    pass_info = calculate_hybrid_pass_benefit_info(h_rec, res_cache, cur_target_u, cur_order, pred_data=pred_cache)
                     hypo_bet = pass_info["hypothetical_bet"]
                     hypo_pay = pass_info["hypothetical_payout"]
                     pass_benefit = pass_info["pass_benefit"]
                     msg = pass_info["message"]
                     mark_orders = pass_info.get("mark_orders") or rb_meta.get("mark_orders")
                     top3_orders = pass_info.get("top3_orders") or top3_orders
+
+                    # ★ DB側の本命馬番や払戻金が予想データと不整合を起こしている場合、自動自己修復 ★
+                    if cur_target_u is not None and (d.get("target_umaban") != cur_target_u or d.get("hypothetical_payout") != hypo_pay):
+                        try:
+                            heal_payload = {
+                                "target_umaban": cur_target_u,
+                                "horse_name": expected_h_name,
+                                "actual_order": cur_order if (cur_order and cur_order < 90) else None,
+                                "hypothetical_payout": hypo_pay,
+                                "pass_benefit": pass_benefit,
+                                "message": msg
+                            }
+                            if supabase:
+                                supabase.table("keiba_race_settlements").update(heal_payload).eq("race_id", race_id).execute()
+                            d.update(heal_payload)
+                            order = cur_order
+                            print(f"[Settlement Heal] {race_id}: 本命馬不整合を自己修復更新しました ({d.get('target_umaban')} -> {cur_target_u}番 {expected_h_name}, 払戻:{hypo_pay}円)")
+                        except Exception as he_settle:
+                            print(f"[Settlement Heal Warning] {race_id}: {he_settle}")
                 else:
                     hypo_bet = d.get("hypothetical_bet") or 0
                     hypo_pay = d.get("hypothetical_payout") or 0
