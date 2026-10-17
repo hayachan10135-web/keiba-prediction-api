@@ -201,14 +201,62 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
             print(f"レース一覧キャッシュ付与エラー: {e}")
 
         try:
-            s_res = supabase.table("keiba_race_settlements").select("race_id, is_hit, is_pass, total_payout").eq("race_date", formatted_date).execute()
+            s_res = supabase.table("keiba_race_settlements").select(
+                "race_id, is_hit, is_pass, total_payout, total_bet, real_bet_badge, real_bet_level, is_real_bet_target, is_virtual_bet_target, bet_details, strategy_type"
+            ).eq("race_date", formatted_date).execute()
             for s_row in (s_res.data or []):
                 is_hit_val = 1 if (s_row.get("is_hit") == 1 and s_row.get("is_pass") == 0) else 0
+                is_real_val = bool(s_row.get("is_real_bet_target"))
+                is_virt_val = bool(s_row.get("is_virtual_bet_target"))
+                rb_badge_val = s_row.get("real_bet_badge")
+                rb_level_val = s_row.get("real_bet_level") or "none"
+                virt_slot_val = None
+
+                b_det = s_row.get("bet_details")
+                if isinstance(b_det, dict):
+                    rb_meta = b_det.get("real_bet_meta")
+                    if isinstance(rb_meta, dict):
+                        if not rb_badge_val:
+                            rb_badge_val = rb_meta.get("real_bet_badge")
+                        if not is_real_val and rb_meta.get("is_real_bet_target"):
+                            is_real_val = True
+                        if not is_virt_val and rb_meta.get("is_virtual_bet_target"):
+                            is_virt_val = True
+                        if rb_level_val == "none" and rb_meta.get("real_bet_level"):
+                            rb_level_val = rb_meta.get("real_bet_level")
+                        virt_slot_val = rb_meta.get("virtual_bet_slot")
+
+                if rb_badge_val and isinstance(rb_badge_val, str):
+                    rb_badge_val = rb_badge_val.replace("🎯", "⭐")
+                    if "第" in rb_badge_val and "推奨" in rb_badge_val and not virt_slot_val:
+                        m_slot = re.search(r"第(\d+)推奨", rb_badge_val)
+                        if m_slot:
+                            virt_slot_val = int(m_slot.group(1))
+
+                # バッジ文字列から実馬券または仮想枠を補完判定
+                if rb_badge_val:
+                    if "仮想" in rb_badge_val or rb_level_val == "virtual":
+                        is_virt_val = True
+                        is_real_val = False
+                        rb_level_val = "virtual"
+                    elif any(k in rb_badge_val for k in ["本日厳選", "勝負", "本線", "厳選", "推奨"]):
+                        is_real_val = True
+                        is_virt_val = False
+                        if rb_level_val == "none":
+                            rb_level_val = "standard"
+
                 settled_map[s_row["race_id"]] = {
                     "is_settled": 1,
                     "is_hit": is_hit_val,
                     "is_pass": s_row.get("is_pass", 0),
-                    "total_payout": s_row.get("total_payout", 0)
+                    "total_payout": s_row.get("total_payout", 0),
+                    "total_bet": s_row.get("total_bet", 0),
+                    "is_real_bet_target": is_real_val,
+                    "is_virtual_bet_target": is_virt_val,
+                    "real_bet_badge": rb_badge_val,
+                    "real_bet_level": rb_level_val,
+                    "virtual_bet_slot": virt_slot_val,
+                    "strategy_type": s_row.get("strategy_type")
                 }
         except Exception as se:
             print(f"レース一覧確定情報付与エラー: {se}")
@@ -233,20 +281,74 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
     for venue in venues:
         races_in_venue = venue.get("races", [])
         for race in races_in_venue:
-            info = cached_preds_map.get(race["race_id"])
-            if info:
-                race["is_real_bet_target"] = info["is_real_bet_target"]
-                badge_str = info["real_bet_badge"]
+            rid = race["race_id"]
+            s_info = settled_map.get(rid)
+            info = cached_preds_map.get(rid)
+
+            if s_info:
+                # 確定済みレース: 確定テーブルの真実を最優先反映
+                race["is_settled"] = 1
+                race["is_hit"] = s_info.get("is_hit", 0)
+                race["is_pass"] = s_info.get("is_pass", 0)
+                race["total_payout"] = s_info.get("total_payout", 0)
+                race["total_bet"] = s_info.get("total_bet", 0)
+                race["is_real_bet_target"] = s_info.get("is_real_bet_target", False)
+                race["real_bet_badge"] = s_info.get("real_bet_badge")
+                race["real_bet_level"] = s_info.get("real_bet_level", "none")
+                race["is_virtual_bet_target"] = s_info.get("is_virtual_bet_target", False)
+                race["virtual_bet_slot"] = s_info.get("virtual_bet_slot")
+
+                if info:
+                    race["edge_ratio"] = info.get("edge_ratio")
+                    race["is_final_odds"] = info.get("is_final_odds", True)
+                    race["confidence_score"] = info.get("confidence_score", 0.0)
+                else:
+                    race["edge_ratio"] = None
+                    race["is_final_odds"] = True
+                    race["confidence_score"] = 0.0
+
+                # 確定済みバッジを predictions_cache (data_json) 側にも自己修復・同期
+                if rid in raw_preds_cache:
+                    c_d = raw_preds_cache[rid]
+                    c_hrec = c_d.get("hybrid_recommendation")
+                    if c_hrec and (
+                        c_hrec.get("is_real_bet_target") != race["is_real_bet_target"]
+                        or c_hrec.get("real_bet_badge") != race["real_bet_badge"]
+                        or c_hrec.get("real_bet_level") != race["real_bet_level"]
+                        or c_hrec.get("is_virtual_bet_target") != race["is_virtual_bet_target"]
+                        or c_hrec.get("virtual_bet_slot") != race["virtual_bet_slot"]
+                    ):
+                        c_hrec["is_real_bet_target"] = race["is_real_bet_target"]
+                        c_hrec["real_bet_badge"] = race["real_bet_badge"]
+                        c_hrec["real_bet_level"] = race["real_bet_level"]
+                        c_hrec["is_virtual_bet_target"] = race["is_virtual_bet_target"]
+                        c_hrec["virtual_bet_slot"] = race["virtual_bet_slot"]
+                        c_hrec["virtual_badge"] = race["real_bet_badge"] if race["is_virtual_bet_target"] else None
+                        if supabase:
+                            try:
+                                supabase.table("keiba_predictions_cache").update({"data_json": c_d}).eq("race_id", rid).execute()
+                            except Exception:
+                                pass
+            elif info:
+                # 未確定レース: 予測キャッシュから反映
+                race["is_settled"] = 0
+                race["is_hit"] = 0
+                race["is_pass"] = 0
+                race["is_real_bet_target"] = info.get("is_real_bet_target", False)
+                badge_str = info.get("real_bet_badge")
                 if badge_str and isinstance(badge_str, str):
                     badge_str = badge_str.replace("🎯", "⭐")
                 race["real_bet_badge"] = badge_str
                 race["real_bet_level"] = info.get("real_bet_level", "none")
-                race["edge_ratio"] = info["edge_ratio"]
-                race["is_final_odds"] = info["is_final_odds"]
+                race["edge_ratio"] = info.get("edge_ratio")
+                race["is_final_odds"] = info.get("is_final_odds", False)
                 race["confidence_score"] = info.get("confidence_score", 0.0)
                 race["is_virtual_bet_target"] = info.get("is_virtual_bet_target", False)
                 race["virtual_bet_slot"] = info.get("virtual_bet_slot")
             else:
+                race["is_settled"] = 0
+                race["is_hit"] = 0
+                race["is_pass"] = 0
                 race["is_real_bet_target"] = False
                 race["real_bet_badge"] = None
                 race["real_bet_level"] = "none"
@@ -256,17 +358,11 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
 
-            s_info = settled_map.get(race["race_id"])
-            if s_info:
-                race["is_settled"] = s_info.get("is_settled", 0)
-                race["is_hit"] = s_info.get("is_hit", 0)
-                race["is_pass"] = s_info.get("is_pass", 0)
-            else:
-                race["is_settled"] = 0
-                race["is_hit"] = 0
-                race["is_pass"] = 0
+        # 過去日（昨日以前）の場合は既にレース結果が確定しているため、動的な仮想枠再選考・上書きはスキップ！
+        if formatted_date < today_jst_str():
+            continue
 
-        # 各会場ごとに確信度上位3レースを「仮想馬券枠 (各場3R)」として保証
+        # 各会場ごとに確信度上位3レースを「仮想馬券枠 (各場3R)」として保証 (当日未確定レース対象)
         eligible_for_virtual = []
         for r in races_in_venue:
             if float(r.get("confidence_score") or 0.0) <= 0.0:
@@ -309,10 +405,10 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                             except Exception as ue:
                                 print(f"仮想枠キャッシュ同期エラー ({vr_id}): {ue}")
 
-        # 会場内でトップ3から漏れた全レース（新馬・障害含む）の仮想枠ステータスを「見送り(none)」に完全整合
+        # 会場内でトップ3から漏れた全レース（新馬・障害含む）の仮想枠ステータスを「見送り(none)」に完全整合 (未確定レース対象)
         for other_r in races_in_venue:
             or_id = other_r.get("race_id")
-            if or_id and or_id not in top3_virtual_ids and not other_r.get("is_real_bet_target"):
+            if or_id and or_id not in top3_virtual_ids and not other_r.get("is_real_bet_target") and not other_r.get("is_settled"):
                 other_r["is_virtual_bet_target"] = False
                 other_r["virtual_bet_slot"] = None
                 other_r["real_bet_level"] = "none"

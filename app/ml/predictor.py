@@ -932,12 +932,8 @@ def predict_race_core(
 
     # 出馬表スクレイピング
     try:
-        shutuba = fetch_shutuba_table(race_id)
-        race_name = shutuba["race_name"]
-        race_details = shutuba["race_details"]
-        horses = shutuba["horses"]
-        course_meta = shutuba.get("course_meta", {})
-        target_race_date = (_resolve_race_date_handler(race_id) if _resolve_race_date_handler else None) or shutuba.get("race_date") or today_jst_str()
+        race_name, race_details, horses, course_meta = fetch_shutuba_table(race_id)
+        target_race_date = (_resolve_race_date_handler(race_id) if _resolve_race_date_handler else None) or today_jst_str()
         if not target_race_date or target_race_date == today_jst_str():
             target_race_date = (_resolve_race_date_handler(race_id) if _resolve_race_date_handler else None) or today_jst_str()
 

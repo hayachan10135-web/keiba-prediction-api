@@ -541,20 +541,28 @@ def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: O
     h_rec = pred_data.get("hybrid_recommendation")
     if not h_rec or not isinstance(h_rec, dict):
         return pred_data
-    # 既にリアル勝負枠の場合は何もしない
-    if h_rec.get("is_real_bet_target"):
+    target_d = race_date or today_jst_str()
+    # 当日未確定レースで既にリアル勝負枠の場合は同期不要
+    if h_rec.get("is_real_bet_target") and target_d >= today_jst_str() and not pred_data.get("is_settled"):
         return pred_data
 
-    target_d = race_date or today_jst_str()
-
     def _apply_venue_race_sync(r_item: dict):
-        if r_item.get("is_virtual_bet_target"):
+        if r_item.get("is_real_bet_target"):
+            h_rec["is_real_bet_target"] = True
+            h_rec["real_bet_badge"] = r_item.get("real_bet_badge")
+            h_rec["real_bet_level"] = r_item.get("real_bet_level", "standard")
+            h_rec["is_virtual_bet_target"] = False
+            h_rec["virtual_bet_slot"] = None
+            h_rec["virtual_badge"] = None
+        elif r_item.get("is_virtual_bet_target"):
+            h_rec["is_real_bet_target"] = False
             h_rec["is_virtual_bet_target"] = True
             h_rec["virtual_bet_slot"] = r_item.get("virtual_bet_slot")
             h_rec["real_bet_level"] = r_item.get("real_bet_level", "virtual")
             h_rec["real_bet_badge"] = r_item.get("real_bet_badge")
             h_rec["virtual_badge"] = r_item.get("real_bet_badge")
         else:
+            h_rec["is_real_bet_target"] = False
             h_rec["is_virtual_bet_target"] = False
             h_rec["virtual_bet_slot"] = None
             h_rec["real_bet_level"] = "none"
@@ -703,14 +711,23 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                         rid = r.get("race_id")
                         if rid in preds:
                             hr = preds[rid].get("hybrid_recommendation")
-                            if hr and not hr.get("is_real_bet_target"):
-                                if r.get("is_virtual_bet_target"):
+                            if hr and isinstance(hr, dict):
+                                if r.get("is_real_bet_target"):
+                                    hr["is_real_bet_target"] = True
+                                    hr["real_bet_badge"] = r.get("real_bet_badge")
+                                    hr["real_bet_level"] = r.get("real_bet_level", "standard")
+                                    hr["is_virtual_bet_target"] = False
+                                    hr["virtual_bet_slot"] = None
+                                    hr["virtual_badge"] = None
+                                elif r.get("is_virtual_bet_target"):
+                                    hr["is_real_bet_target"] = False
                                     hr["is_virtual_bet_target"] = True
                                     hr["virtual_bet_slot"] = r.get("virtual_bet_slot")
                                     hr["real_bet_level"] = r.get("real_bet_level", "virtual")
                                     hr["real_bet_badge"] = r.get("real_bet_badge")
                                     hr["virtual_badge"] = r.get("real_bet_badge")
                                 else:
+                                    hr["is_real_bet_target"] = False
                                     hr["is_virtual_bet_target"] = False
                                     hr["virtual_bet_slot"] = None
                                     hr["real_bet_level"] = "none"
@@ -881,6 +898,13 @@ def _startup_background_init():
         normalize_mislabeled_dates()
         fix_duplicated_horses_cache_2026()
         _clear_morning_unannounced_badges()
+        # 過去日（10/17等）の確定バッジ整合を確実に復元
+        try:
+            raw_v_1017 = fetch_venues_for_date_raw("2026-10-17")
+            if raw_v_1017:
+                attach_prediction_badges_to_venues("2026-10-17", raw_v_1017)
+        except Exception as e_1017:
+            print(f"[Startup 10/17 Heal Warning] {e_1017}")
         if not is_before_morning_prediction(today_jst_str()):
             ensure_daily_single_real_bet(today_jst_str())
         endpoint_sync_active_post_times(today_jst_str())
