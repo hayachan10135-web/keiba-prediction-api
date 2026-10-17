@@ -8128,10 +8128,11 @@ def apply_verified_20261017_12r_on_startup():
     """新潟12R・東京12Rの見送り復元および京都12R・全36レースの確定データを起動時に一括反映"""
     if not supabase:
         return
-    json_path = os.path.join(BASE_DIR, "verified_20261017_12r.json")
-    if not os.path.exists(json_path):
-        return
     try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(base_dir, "verified_20261017_12r.json")
+        if not os.path.exists(json_path):
+            return
         with open(json_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
         if payload.get("predictions"):
