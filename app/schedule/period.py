@@ -140,3 +140,4 @@ def discover_period_kaisai_dates(now_dt: Optional[datetime.datetime] = None) -> 
     res_dates = sorted(list(set(available_dates)))[-6:]
     _period_kaisai_dates_cache[today_k] = (now_ts, res_dates)
     return res_dates
+
