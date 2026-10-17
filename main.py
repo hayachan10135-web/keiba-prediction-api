@@ -24,6 +24,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
+from umaca_fast_client import UMACAFastClient
 
 app = FastAPI(title="Keiba Prediction & Verification API")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -809,6 +810,7 @@ class BettingSettingsResponse(BaseModel):
     auto_bet_real_only: bool
     available_modes: List[BettingModeItem]
     ipat_configured: bool
+    umaca_configured: Optional[bool] = False
     last_balance: Optional[int] = None
     remaining_bet_amount: int = 0
     remaining_real_races_count: int = 0
@@ -897,18 +899,20 @@ _last_warned_shortfall: int = 0
 
 def check_and_notify_balance_shortfall():
     """
-    即PAT自動投票モードが有効な場合、残り投票予定額と即PAT残高を比較し、
+    自動投票モード (即PAT / UMACAスマート) が有効な場合、残り投票予定額と現在残高を比較し、
     不足が発生しそうな場合に FCM プッシュ通知を送信
     """
     global _last_balance_warning_date, _last_warned_shortfall
     b_settings = load_betting_settings_from_supabase()
-    if b_settings.get("betting_mode") != "ipat":
+    cur_mode = b_settings.get("betting_mode", "off")
+    if cur_mode not in ("ipat", "umaca"):
         return
 
+    platform_label = "UMACAスマート" if cur_mode == "umaca" else "即PAT"
     cur_balance = b_settings.get("last_balance")
     if cur_balance is None:
         try:
-            client = IPATFastClient()
+            client = UMACAFastClient() if cur_mode == "umaca" else IPATFastClient()
             l_res = client.login()
             if l_res.get("success"):
                 cur_balance = l_res.get("balance", 0)
@@ -937,8 +941,8 @@ def check_and_notify_balance_shortfall():
         if len(target_races) > 3:
             race_names_str += f" 他{len(target_races)-3}レース"
 
-        title = f"⚠️【即PAT残高不足警告】{shortfall:,}円 不足の恐れ"
-        body = f"本日残り実戦投票予定: {rem_count}レース 計{rem_amt:,}円\n即PAT残高: {cur_balance:,}円 (不足額: -{shortfall:,}円)\n対象: {race_names_str}\n※即PAT口座へ追加入金を行ってください。"
+        title = f"⚠️【{platform_label}残高不足警告】{shortfall:,}円 不足の恐れ"
+        body = f"本日残り実戦投票予定: {rem_count}レース 計{rem_amt:,}円\n{platform_label}残高: {cur_balance:,}円 (不足額: -{shortfall:,}円)\n対象: {race_names_str}\n※{platform_label}へ追加入金（チャージ）を行ってください。"
 
         print(f"[BalanceWarning] {title} を送信します")
         send_fcm_notification(
@@ -958,6 +962,7 @@ def get_betting_settings_endpoint():
     settings = load_betting_settings_from_supabase()
     cur_mode = settings.get("betting_mode", "off")
     has_ipat_env = bool(os.getenv("IPAT_USER_NUM") and os.getenv("IPAT_PIN") and os.getenv("IPAT_PARS"))
+    has_umaca_env = UMACAFastClient().is_configured()
     
     modes = [
         BettingModeItem(
@@ -974,21 +979,22 @@ def get_betting_settings_endpoint():
         ),
         BettingModeItem(
             id="umaca",
-            name="UMACAスマート (準備中)",
-            enabled=False,
-            description="未テストのため現在選択できません。"
+            name="UMACAスマート",
+            enabled=True,
+            description="発走5分前に「実馬券・勝負馬券」に該当した場合、UMACAスマートへ自動で買い目を投入します（投票用残高内）。"
         )
     ]
     
     rem_amt, rem_count, _ = calculate_remaining_real_bet_amount()
     last_bal = settings.get("last_balance") or 0
-    shortfall = max(0, rem_amt - last_bal) if (cur_mode == "ipat" and last_bal is not None) else 0
+    shortfall = max(0, rem_amt - last_bal) if (cur_mode in ("ipat", "umaca") and last_bal is not None) else 0
 
     return BettingSettingsResponse(
         betting_mode=cur_mode,
         auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
         available_modes=modes,
-        ipat_configured=has_ipat_env,
+        ipat_configured=(has_umaca_env if cur_mode == "umaca" else has_ipat_env),
+        umaca_configured=has_umaca_env,
         last_balance=settings.get("last_balance"),
         remaining_bet_amount=rem_amt,
         remaining_real_races_count=rem_count,
@@ -998,48 +1004,80 @@ def get_betting_settings_endpoint():
 
 @app.post("/settings/betting-mode")
 def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
-    """自動投票モードを変更 (off / ipat)"""
+    """自動投票モードを変更 (off / ipat / umaca)"""
     new_mode = req.betting_mode.lower().strip()
-    if new_mode not in ("off", "ipat"):
-        if new_mode == "umaca":
-            raise HTTPException(status_code=400, detail="UMACAスマートは未テストのため現在選択できません。")
+    if new_mode not in ("off", "ipat", "umaca"):
         raise HTTPException(status_code=400, detail=f"無効な投票モードです: {new_mode}")
     
     settings = load_betting_settings_from_supabase()
     settings["betting_mode"] = new_mode
+
+    # モード切替時に選択したプラットフォームの最新残高も自動照会して反映を試みる
+    if new_mode in ("ipat", "umaca"):
+        try:
+            client = UMACAFastClient() if new_mode == "umaca" else IPATFastClient()
+            l_res = client.login()
+            if l_res.get("success"):
+                settings["last_balance"] = l_res.get("balance", 0)
+        except Exception as e:
+            print(f"[BettingModeSwitch] 残高自動照会スキップ ({new_mode}): {e}")
+
     save_betting_settings_to_supabase(settings)
-    mode_names = {"off": "自動投票なし (OFF)", "ipat": "即PAT (IPAT)"}
+    mode_names = {
+        "off": "自動投票なし (OFF)",
+        "ipat": "即PAT (IPAT)",
+        "umaca": "UMACAスマート"
+    }
     return {
         "status": "ok",
         "betting_mode": new_mode,
+        "last_balance": settings.get("last_balance"),
         "message": f"自動投票モードを「{mode_names.get(new_mode, new_mode)}」に設定しました。"
     }
 
 @app.post("/settings/test-ipat")
-def test_ipat_endpoint():
-    """即PATへのログイン＆残高取得テストを実行"""
+@app.post("/settings/test-umaca")
+def test_ipat_endpoint(mode: Optional[str] = Query(None, description="テスト対象 ('ipat' または 'umaca'。省略時は現在の設定モード)")):
+    """現在選択中のプラットフォーム（即PAT または UMACAスマート）へのログイン＆残高取得テストを実行"""
+    settings = load_betting_settings_from_supabase()
+    target_mode = (mode or settings.get("betting_mode") or "ipat").lower().strip()
+    if target_mode == "off":
+        # OFF選択中に接続テストを押した場合は設定済みのプラットフォーム（UMACA優先またはIPAT）をテスト
+        target_mode = "umaca" if UMACAFastClient().is_configured() else "ipat"
+
     try:
-        client = IPATFastClient()
-        res = client.login()
+        if target_mode == "umaca":
+            client = UMACAFastClient()
+            res = client.login()
+            label = "UMACAスマート"
+            bal_label = "投票用残高"
+        else:
+            client = IPATFastClient()
+            res = client.login()
+            label = "即PAT"
+            bal_label = "購入限度額"
+
         if res.get("success"):
             balance = res.get("balance", 0)
-            settings = load_betting_settings_from_supabase()
             settings["last_balance"] = balance
             save_betting_settings_to_supabase(settings)
             return {
                 "success": True,
+                "platform": target_mode,
                 "balance": balance,
-                "message": f"即PAT接続成功！ 購入限度額: {balance:,}円"
+                "message": f"{label}接続成功！ {bal_label}: {balance:,}円"
             }
         else:
             return {
                 "success": False,
-                "error": res.get("error", "即PATへの接続に失敗しました")
+                "platform": target_mode,
+                "error": res.get("error", f"{label}への接続に失敗しました")
             }
     except Exception as e:
         return {
             "success": False,
-            "error": f"即PATテスト例外エラー: {e}"
+            "platform": target_mode,
+            "error": f"接続テスト例外エラー: {e}"
         }
 
 @app.get("/notify/test")
@@ -6815,37 +6853,38 @@ async def background_maintenance_loop():
                                         }
                                     )
 
-                                    # --- 【即PAT 自動投票実行判定】 ---
+                                    # --- 【自動投票実行判定 (即PAT / UMACAスマート)】 ---
                                     b_settings = load_betting_settings_from_supabase()
                                     cur_bet_mode = b_settings.get("betting_mode", "off")
 
-                                    if cur_bet_mode == "ipat":
+                                    if cur_bet_mode in ("ipat", "umaca"):
+                                        mode_label = "UMACA" if cur_bet_mode == "umaca" else "即PAT"
                                         if has_already_betted_today(today_str):
                                             print(f"[AutoBet] 本日({today_str})は既に1レース投票済みのためスキップします (1日1レース厳守)")
                                         elif r_id in _auto_betted_races:
                                             print(f"[AutoBet] {r_id} は既に投票済みのためスキップします (二重発注防止)")
                                         else:
                                             _auto_betted_races.add(r_id)
-                                            print(f"[AutoBet] 🎫 {r_id} ({r_name}) の即PAT自動投票を開始します...")
+                                            print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
                                             try:
                                                 v_code = r_id[4:6] if len(r_id) == 12 else "05"
                                                 v_name = VENUE_CODE_MAP.get(v_code, "東京")
                                                 r_no = int(r_id[10:12]) if len(r_id) == 12 else 11
 
-                                                ipat_items = []
+                                                bet_items = []
                                                 for b in all_tickets:
                                                     c_list = b.get("combination")
                                                     if not c_list:
                                                         t_u = b.get("target_umaban")
                                                         c_list = [t_u] if t_u is not None else []
-                                                    ipat_items.append({
+                                                    bet_items.append({
                                                         "ticket_type": b.get("ticket_type", "単勝"),
                                                         "combination": c_list,
                                                         "amount": b.get("amount", 100)
                                                     })
 
-                                                client = IPATFastClient()
-                                                bet_res = client.execute_bets(v_name, r_no, ipat_items, dry_run=False)
+                                                client = UMACAFastClient() if cur_bet_mode == "umaca" else IPATFastClient()
+                                                bet_res = client.execute_bets(v_name, r_no, bet_items, dry_run=False)
 
                                                 if bet_res.get("status") == "success":
                                                     rcpt = bet_res.get("receipt_no", "")
@@ -6855,44 +6894,53 @@ async def background_maintenance_loop():
                                                         cur_s = load_betting_settings_from_supabase()
                                                         b_dict = cur_s.get("betted_races_by_date", {})
                                                         b_list = b_dict.get(today_str, [])
-                                                        b_list.append({"race_id": r_id, "receipt_no": str(rcpt), "amount": tot_amt, "time": now_jst().strftime("%H:%M:%S")})
+                                                        b_list.append({
+                                                            "race_id": r_id,
+                                                            "receipt_no": str(rcpt),
+                                                            "amount": tot_amt,
+                                                            "mode": cur_bet_mode,
+                                                            "time": now_jst().strftime("%H:%M:%S")
+                                                        })
                                                         b_dict[today_str] = b_list
                                                         cur_s["betted_races_by_date"] = b_dict
                                                         save_betting_settings_to_supabase(cur_s)
                                                     except Exception as me:
                                                         print(f"[AutoBet Meta Save Error] {me}")
-                                                    print(f"[AutoBet] 🎉 投票成功！ 受付番号: {rcpt}")
+                                                    print(f"[AutoBet] 🎉 {mode_label}投票成功！ 受付番号: {rcpt}")
                                                     send_fcm_notification(
-                                                        title=f"🎫【即PAT投票完了】{v_name}{r_no}R",
-                                                        body=f"受付番号:{rcpt} / {len(ipat_items)}点 計{tot_amt:,}円 投票完了！\n残高より正常に引き落とされました。",
+                                                        title=f"🎫【{mode_label}投票完了】{v_name}{r_no}R",
+                                                        body=f"受付番号:{rcpt} / {len(bet_items)}点 計{tot_amt:,}円 投票完了！\n残高より正常に引き落とされました。",
                                                         data={
                                                             "type": "AUTO_BET_SUCCESS",
                                                             "race_id": r_id,
                                                             "receipt_no": str(rcpt),
-                                                            "amount": str(tot_amt)
+                                                            "amount": str(tot_amt),
+                                                            "mode": cur_bet_mode
                                                         }
                                                     )
                                                 else:
                                                     err_msg = bet_res.get("reason") or bet_res.get("error") or "投票処理エラー"
-                                                    print(f"[AutoBet] ⚠️ 投票失敗: {err_msg}")
+                                                    print(f"[AutoBet] ⚠️ {mode_label}投票失敗: {err_msg}")
                                                     send_fcm_notification(
-                                                        title=f"⚠️【即PAT投票エラー】{v_name}{r_no}R",
+                                                        title=f"⚠️【{mode_label}投票エラー】{v_name}{r_no}R",
                                                         body=f"自動投票に失敗しました: {err_msg}",
                                                         data={
                                                             "type": "AUTO_BET_FAILED",
                                                             "race_id": r_id,
-                                                            "error": str(err_msg)
+                                                            "error": str(err_msg),
+                                                            "mode": cur_bet_mode
                                                         }
                                                     )
                                             except Exception as ab_err:
                                                 print(f"[AutoBet] 例外エラー: {ab_err}")
                                                 send_fcm_notification(
-                                                    title=f"⚠️【即PAT投票例外】{r_name}",
+                                                    title=f"⚠️【{mode_label}投票例外】{r_name}",
                                                     body=f"投票通信中に例外が発生しました: {ab_err}",
                                                     data={
                                                         "type": "AUTO_BET_FAILED",
                                                         "race_id": r_id,
-                                                        "error": str(ab_err)
+                                                        "error": str(ab_err),
+                                                        "mode": cur_bet_mode
                                                     }
                                                 )
                             except Exception as pe:
