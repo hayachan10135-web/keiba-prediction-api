@@ -354,11 +354,24 @@ def save_settlement(data: dict):
             row_dict["odds_alerts"] = data["odds_alerts"]
         if "top3_orders" in data and data["top3_orders"] is not None:
             row_dict["top3_orders"] = data["top3_orders"]
+        if "mark_orders" in data and data["mark_orders"] is not None:
+            row_dict["mark_orders"] = data["mark_orders"]
+
+        # bet_details 内の real_bet_meta にも常に top3_orders と mark_orders を格納して冗長保護
+        b_det_ensure = row_dict.get("bet_details") or {}
+        if isinstance(b_det_ensure, dict):
+            rb_meta_ensure = b_det_ensure.setdefault("real_bet_meta", {})
+            if isinstance(rb_meta_ensure, dict):
+                if data.get("top3_orders") is not None:
+                    rb_meta_ensure["top3_orders"] = data["top3_orders"]
+                if data.get("mark_orders") is not None:
+                    rb_meta_ensure["mark_orders"] = data["mark_orders"]
+            row_dict["bet_details"] = b_det_ensure
 
         try:
             supabase.table("keiba_race_settlements").upsert(row_dict).execute()
         except Exception as col_err:
-            if "track_bias" in row_dict or "odds_alerts" in row_dict or "top3_orders" in row_dict:
+            if "track_bias" in row_dict or "odds_alerts" in row_dict or "top3_orders" in row_dict or "mark_orders" in row_dict:
                 b_det = row_dict.get("bet_details") or {}
                 if "track_bias" in row_dict:
                     b_det["track_bias"] = row_dict.pop("track_bias")
@@ -366,6 +379,8 @@ def save_settlement(data: dict):
                     b_det["odds_alerts"] = row_dict.pop("odds_alerts")
                 if "top3_orders" in row_dict:
                     b_det["top3_orders"] = row_dict.pop("top3_orders")
+                if "mark_orders" in row_dict:
+                    b_det["mark_orders"] = row_dict.pop("mark_orders")
                 row_dict["bet_details"] = b_det
                 supabase.table("keiba_race_settlements").upsert(row_dict).execute()
             else:

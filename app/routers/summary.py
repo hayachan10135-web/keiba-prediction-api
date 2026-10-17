@@ -16,6 +16,11 @@ from app.settlement.summary_calculator import (
     get_summary_dates_list,
     calculate_aggregate_summary
 )
+from app.settlement import (
+    extract_top3_orders,
+    extract_mark_orders,
+    sync_orders_marks
+)
 
 router = APIRouter(tags=["Summary"])
 
@@ -167,11 +172,29 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
             elif pb < 0:
                 pass_missed_profits += abs(pb)
 
-        # mark_orders を正規化
-        if not isinstance(r.get("mark_orders"), list):
-            r["mark_orders"] = []
-        if not isinstance(r.get("top3_orders"), list):
-            r["top3_orders"] = []
+        # mark_orders / top3_orders の完全自己修復・出走表印同期
+        raw_mo = r.get("mark_orders") or rb_meta.get("mark_orders") or b_det.get("mark_orders")
+        raw_t3 = r.get("top3_orders") or rb_meta.get("top3_orders") or b_det.get("top3_orders")
+
+        r_orders = res_cache_map.get(r["race_id"], {}).get("orders") or {}
+        if p_data and r_orders:
+            t3 = extract_top3_orders(p_data, r_orders)
+            mo = extract_mark_orders(p_data, r_orders)
+        else:
+            t3 = raw_t3 if isinstance(raw_t3, list) else []
+            mo = raw_mo if isinstance(raw_mo, list) else []
+            if p_data:
+                t3, mo = sync_orders_marks(t3, mo, p_data)
+
+        r["mark_orders"] = mo if isinstance(mo, list) else []
+        r["top3_orders"] = t3 if isinstance(t3, list) else []
+
+        # 本命馬の人気(target_popularity)が未設定の場合、出走表から補完
+        if r.get("target_popularity") is None and p_data and r.get("target_umaban") is not None:
+            t_u = r.get("target_umaban")
+            h_match = next((h for h in p_data.get("horses", []) if h.get("umaban") == t_u), None)
+            if h_match and h_match.get("popularity"):
+                r["target_popularity"] = h_match.get("popularity")
 
         if not isinstance(r.get("bet_breakdown"), dict):
             b_dict = {}

@@ -16,8 +16,10 @@ from app.settlement import (
     process_settlement_calculation,
     extract_top3_orders,
     extract_mark_orders,
+    sync_orders_marks,
+    save_cached_result,
 )
-from app.scrapers import fetch_shutuba_table, fetch_venues_for_date_raw
+from app.scrapers import fetch_shutuba_table, fetch_venues_for_date_raw, fetch_netkeiba_race_result
 
 CURRENT_DB_VERSION = "v5_umaren_3point_strategy"
 
@@ -507,18 +509,48 @@ def heal_settlement_marks(date: Optional[str] = None) -> dict:
     if not supabase:
         return {"status": "error", "message": "Supabase not connected"}
 
-    query = supabase.table("keiba_race_settlements").select("*")
-    if date:
-        query = query.eq("race_date", date)
-    res = query.order("race_id", desc=True).limit(200).execute()
-    rows = res.data or []
+    # 全レコードをページネーションで漏れなく取得
+    all_rows = []
+    page_size = 500
+    offset = 0
+    while True:
+        query = supabase.table("keiba_race_settlements").select("*")
+        if date:
+            query = query.eq("race_date", date)
+        res = query.order("race_id", desc=True).range(offset, offset + page_size - 1).execute()
+        batch = res.data or []
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
 
+    rows = all_rows
     repaired = []
+
     for r in rows:
         rid = r["race_id"]
-        r_date = r.get("race_date")
+        r_date = r.get("race_date") or resolve_race_date_for_id(rid)
         pred = _get_cached_prediction_fn(rid) if _get_cached_prediction_fn else None
         result = _get_cached_result_fn(rid) if _get_cached_result_fn else None
+
+        # 結果キャッシュが未取得の場合は netkeiba からリアルタイム取得
+        if not result and r.get("hit_type") != "開催中止":
+            try:
+                fresh_res = fetch_netkeiba_race_result(rid)
+                if fresh_res and fresh_res.get("orders"):
+                    result = fresh_res
+                    r_name_val = r.get("race_name") or fresh_res.get("race_name", f"Race {rid}")
+                    save_cached_result(rid, r_name_val, r_date, fresh_res)
+            except Exception as e_res_fetch:
+                print(f"[HealMarks Result Fetch Error] {rid}: {e_res_fetch}")
+
+        # 予想キャッシュが未取得の場合は生成
+        if not pred and _predict_race_core_fn:
+            try:
+                pred = _predict_race_core_fn(rid, force_refresh=False, is_auto_final=False)
+            except Exception as e_pred_fetch:
+                print(f"[HealMarks Pred Fetch Error] {rid}: {e_pred_fetch}")
+
         if pred and result:
             pred_target = (pred.get("recommendation") or {}).get("target_umaban")
             if pred_target is None:
@@ -549,17 +581,23 @@ def heal_settlement_marks(date: Optional[str] = None) -> dict:
                 except Exception as e_recalc:
                     print(f"[HealMarks Recalc Error] {rid}: {e_recalc}")
 
+            # top3_orders の更新判定
             if fresh_top3 and fresh_top3 != r.get("top3_orders"):
                 update_payload["top3_orders"] = fresh_top3
                 needs_update = True
 
-            if fresh_marks and fresh_marks != (r.get("bet_details") or {}).get("real_bet_meta", {}).get("mark_orders"):
+            # mark_orders の更新判定 (カラム直接 or bet_details 内)
+            current_mo = r.get("mark_orders") or (r.get("bet_details") or {}).get("real_bet_meta", {}).get("mark_orders")
+            if fresh_marks and fresh_marks != current_mo:
                 b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
                 rb_meta = b_det.get("real_bet_meta") if isinstance(b_det.get("real_bet_meta"), dict) else {}
                 rb_meta["mark_orders"] = fresh_marks
                 rb_meta["top3_orders"] = fresh_top3
                 b_det["real_bet_meta"] = rb_meta
+                b_det["mark_orders"] = fresh_marks
+                b_det["top3_orders"] = fresh_top3
                 update_payload["bet_details"] = b_det
+                update_payload["mark_orders"] = fresh_marks
                 needs_update = True
 
             if needs_update:
@@ -567,7 +605,16 @@ def heal_settlement_marks(date: Optional[str] = None) -> dict:
                     supabase.table("keiba_race_settlements").update(update_payload).eq("race_id", rid).execute()
                     repaired.append({"race_id": rid, "type": "marks_synchronized"})
                 except Exception as e_up:
-                    print(f"[HealMarks Update Error] {rid}: {e_up}")
+                    # mark_orders カラムが存在しない場合のフォールバック
+                    if "mark_orders" in update_payload:
+                        update_payload.pop("mark_orders", None)
+                        try:
+                            supabase.table("keiba_race_settlements").update(update_payload).eq("race_id", rid).execute()
+                            repaired.append({"race_id": rid, "type": "marks_synchronized_fallback"})
+                        except Exception as e_up2:
+                            print(f"[HealMarks Update Fallback Error] {rid}: {e_up2}")
+                    else:
+                        print(f"[HealMarks Update Error] {rid}: {e_up}")
 
     invalidate_summary_caches()
     return {
