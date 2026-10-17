@@ -451,7 +451,7 @@ def get_today_races(
         target_date = p_info["today_str"]
 
     now_ts = time.time()
-    cache_ttl = 30.0 if target_date == p_info["today_str"] else 3600.0
+    cache_ttl = 30.0
     if not force_refresh:
         c_val = _today_races_cache.get(target_date)
         if c_val and (now_ts - c_val[0] < cache_ttl):
