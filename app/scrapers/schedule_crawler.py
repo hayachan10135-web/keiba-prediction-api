@@ -212,3 +212,4 @@ def invalidate_venues_cache(date_str: Optional[str] = None):
     else:
         _period_venues_cache.clear()
         _period_checked_empty_dates.clear()
+
