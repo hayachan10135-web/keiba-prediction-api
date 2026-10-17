@@ -75,3 +75,4 @@ def verify_race_result_endpoint(
         raise HTTPException(status_code=500, detail="照合ハンドラーが未初期化です。")
 
     return _verify_race_handler(race_id, bypass_cache=bypass_cache, is_19h_settle=is_19h_settle)
+

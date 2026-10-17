@@ -59,6 +59,17 @@ from app.routers.settlement import (
     set_settlement_handler,
     VerificationResult
 )
+from app.routers.prediction import (
+    router as prediction_router,
+    set_prediction_handlers,
+    PredictResponse,
+    HorsePrediction,
+    TicketBet,
+    HybridRecommendation,
+    TanFukuRecommendation,
+    RaceDetails,
+    TrackBiasInfo
+)
 
 _strategy_arbiter = StrategyArbiter()
 
@@ -69,6 +80,7 @@ app.include_router(admin_router)
 app.include_router(summary_router)
 app.include_router(batch_router)
 app.include_router(settlement_router)
+app.include_router(prediction_router)
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -543,114 +555,6 @@ def update_stats_from_race_settlement(race_id: str, race_date: str, pred_data: d
 
 
 # --- Pydantic スキーマ ---
-class HorsePrediction(BaseModel):
-    umaban: int
-    wakuban: int
-    horse_name: str
-    jockey: str
-    trainer: Optional[str] = None
-    kinryo: float
-    odds: Optional[float] = None
-    popularity: Optional[int] = None
-    score: Optional[float] = 0.0
-    prob_win: Optional[float] = None
-    prob_top3: Optional[float] = None
-    mark: str
-    is_blinker: Optional[bool] = False
-    is_first_blinker: Optional[bool] = False
-    horse_weight: Optional[int] = None
-    weight_diff: Optional[int] = None
-    sex_age: Optional[str] = None
-    base_odds: Optional[float] = None
-    odds_history: Optional[Dict[str, float]] = None
-    odds_change_pct: Optional[float] = None
-    odds_trend: Optional[str] = None
-    odds_alert: Optional[str] = None
-    bias_match: Optional[str] = None
-
-class TicketBet(BaseModel):
-    ticket_type: str
-    combination: List[int]
-    combination_str: str
-    amount: int
-    odds: Optional[float] = None
-    expected_payout: Optional[int] = None
-    is_real_odds: Optional[bool] = False
-    memo: Optional[str] = None
-
-class HybridRecommendation(BaseModel):
-    is_participate: bool
-    strategy_name: str = "波乱度メタモデル最適化"
-    strategy_type: Optional[str] = "daiharan"
-    total_amount: int
-    summary: str
-    tansho_bets: Optional[List[TicketBet]] = []
-    fukusho_bets: Optional[List[TicketBet]] = []
-    umatan_bets: Optional[List[TicketBet]] = []
-    tansho_amount: Optional[int] = 0
-    fukusho_amount: Optional[int] = 0
-    umatan_amount: Optional[int] = 0
-    umaren_bets: List[TicketBet] = []
-    sanrentan_bets: Optional[List[TicketBet]] = []
-    hypothetical_umaren_bets: Optional[List[TicketBet]] = []
-    trio_bets: Optional[List[TicketBet]] = []
-    trio_bet: Optional[TicketBet] = None
-    reason: Optional[str] = None
-    is_real_odds_applied: Optional[bool] = False
-    total_expected_payout: Optional[int] = None
-    prob_gachi: Optional[float] = None
-    prob_himo: Optional[float] = None
-    edge_ratio: Optional[float] = None
-    confidence_score: Optional[float] = None
-    is_real_bet_target: Optional[bool] = False
-    real_bet_badge: Optional[str] = None
-    real_bet_level: Optional[str] = None
-    is_final_odds: Optional[bool] = False
-    # 仮想馬券フィールド
-    is_virtual_bet_target: Optional[bool] = False
-    virtual_bet_slot: Optional[int] = None
-    virtual_strategy_name: Optional[str] = None
-    virtual_badge: Optional[str] = None
-    virtual_bets: Optional[List[TicketBet]] = []
-    virtual_total_amount: Optional[int] = 0
-
-class TanFukuRecommendation(BaseModel):
-    target_umaban: Optional[int]
-    horse_name: Optional[str]
-    grade: str
-    confidence_label: str
-    is_pass: bool
-    tansho_amount: int
-    fukusho_amount: int
-    total_amount: int
-    summary: str
-
-class RaceDetails(BaseModel):
-    race_num: str
-    post_time: str
-    course_details: str
-
-class TrackBiasInfo(BaseModel):
-    venue_name: str
-    surface_name: str
-    sample_races: int
-    bias_summary: str
-    waku_bias: str = "flat"  # "inside" | "outside" | "flat"
-    running_style_bias: str = "flat"  # "front" | "closer" | "flat"
-    inside_top3_ratio: float = 0.0
-    outside_top3_ratio: float = 0.0
-    detail_text: str = ""
-
-class PredictResponse(BaseModel):
-    race_id: str
-    race_name: str
-    race_details: RaceDetails
-    horses: List[HorsePrediction]
-    recommendation: TanFukuRecommendation
-    hybrid_recommendation: Optional[HybridRecommendation] = None
-    track_bias: Optional[TrackBiasInfo] = None
-
-
 def calc_trio_odds(o1: float, o2: float, o3: float) -> float:
     """Harville確率モデルに基づく三連複推定オッズ計算"""
     p1 = 0.80 / max(1.1, float(o1))
@@ -1390,7 +1294,6 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
     return venues
 
 
-@app.get("/races/today")
 def get_today_races(
     date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)"),
     force_refresh: bool = Query(False, description="手動でレース一覧・発走時刻を再取得する場合True")
@@ -3627,7 +3530,6 @@ def predict_race_core(
 
 _all_predictions_cache: Dict[str, Tuple[float, dict]] = {}
 
-@app.get("/predict/all")
 def get_all_predictions_for_date(date: Optional[str] = Query(None, description="対象日付 (YYYY-MM-DD)")):
     """指定日付の全レースのキャッシュ済み予想を一括返却（アプリの先読み・ゼロレイテンシ用）"""
     target_date = date if date else today_jst_str()
@@ -3753,9 +3655,10 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
         return {"date": target_date, "count": 0, "predictions": {}}
 
 
-@app.get("/predict/{race_id}", response_model=PredictResponse)
 def predict_race(race_id: str, force_refresh: bool = Query(False, description="手動で予想を再実行する場合True")):
     return predict_race_core(race_id, force_refresh=force_refresh, is_auto_final=False)
+
+set_prediction_handlers(get_today_races, get_all_predictions_for_date, predict_race)
 
 
 
