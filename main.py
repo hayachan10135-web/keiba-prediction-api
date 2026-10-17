@@ -4285,6 +4285,74 @@ def format_mark_orders_text(mark_orders: List[dict]) -> str:
     return "【確定着順】 " + " / ".join(parts)
 
 
+def sync_orders_marks(top3_orders: Optional[List[dict]], mark_orders: Optional[List[dict]], pred_data: Optional[dict]) -> Tuple[List[dict], List[dict]]:
+    """確定着順(top3_orders)および印馬着順(mark_orders)の印・馬名を最新の予想データ(pred_data)の印と完全同期"""
+    if not pred_data:
+        return top3_orders or [], mark_orders or []
+    horses = pred_data.get("horses", [])
+    if not horses:
+        return top3_orders or [], mark_orders or []
+
+    h_map = {}
+    for h in horses:
+        if "umaban" in h:
+            try:
+                h_map[int(h["umaban"])] = h
+            except (ValueError, TypeError):
+                pass
+
+    synced_top3 = []
+    for t in (top3_orders or []):
+        t_copy = dict(t)
+        try:
+            u = int(t_copy.get("umaban", 0))
+            if u in h_map:
+                m = h_map[u].get("mark", "-")
+                if m in ("〇", "○"):
+                    m = "◯"
+                t_copy["mark"] = m
+                if h_map[u].get("horse_name"):
+                    t_copy["horse_name"] = h_map[u]["horse_name"]
+        except Exception:
+            pass
+        synced_top3.append(t_copy)
+
+    order_info_by_umaban = {}
+    for mo in (mark_orders or []):
+        try:
+            u = int(mo.get("umaban", 0))
+            if u:
+                order_info_by_umaban[u] = mo
+        except Exception:
+            pass
+
+    synced_marks = []
+    target_marks = ["◎", "◯", "▲"]
+    for mark in target_marks:
+        h = next((x for x in horses if x.get("mark") == mark or (mark == "◯" and x.get("mark") in ("〇", "○"))), None)
+        if h:
+            try:
+                u = int(h["umaban"])
+                name = h.get("horse_name", f"馬{u}")
+                prev_info = order_info_by_umaban.get(u, {})
+                synced_marks.append({
+                    "mark": mark,
+                    "umaban": u,
+                    "horse_name": name,
+                    "order": prev_info.get("order"),
+                    "order_text": prev_info.get("order_text", "未確定"),
+                    "popularity": h.get("popularity", prev_info.get("popularity"))
+                })
+            except Exception:
+                pass
+
+    if not synced_marks and mark_orders:
+        synced_marks = mark_orders
+
+    return synced_top3, synced_marks
+
+
+
 def calculate_hybrid_pass_benefit_info(
     h_rec: Optional[dict],
     race_res: Optional[dict],
@@ -4383,9 +4451,43 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
             orders = res_cache.get("orders", {})
             b_det = d.get("bet_details") if isinstance(d.get("bet_details"), dict) else {}
             rb_meta = b_det.get("real_bet_meta") if isinstance(b_det.get("real_bet_meta"), dict) else {}
-            top3_orders = d.get("top3_orders") or extract_top3_orders(pred_cache, orders) or rb_meta.get("top3_orders")
 
-            # ★ 見送りレース・参戦レース問わず、1〜3着(top3_orders)が未キャッシュの場合は自動取得＆永続化 ★
+            # ★ 1. 本命馬番の不整合チェック＆完全自己修復 ★
+            # 予想データ(pred_cache)の本命馬番とDBのtarget_umabanが不一致の場合、
+            # オッズ変動等で後から本命が昇格・変更されたため、確定結果を最新予想データで強制再計算＆DB自動更新
+            if pred_cache and res_cache:
+                p_rec = pred_cache.get("recommendation") or {}
+                expected_target_u = p_rec.get("target_umaban")
+                if expected_target_u is None:
+                    for h in pred_cache.get("horses", []):
+                        if h.get("mark") == "◎":
+                            expected_target_u = int(h.get("umaban"))
+                            break
+
+                if expected_target_u is not None and d.get("target_umaban") != expected_target_u:
+                    print(f"[Settlement Target Mismatch Heal] {race_id}: DB target={d.get('target_umaban')} vs Pred target={expected_target_u}. Recalculating settlement...")
+                    r_date_val = d.get("race_date") or resolve_race_date_for_id(race_id)
+                    r_name_val = d.get("race_name") or f"Race {race_id}"
+                    return process_settlement_calculation(
+                        race_id=race_id,
+                        race_date=r_date_val,
+                        race_name=r_name_val,
+                        pred_data=pred_cache,
+                        race_res=res_cache,
+                        from_cache=True
+                    )
+
+            # ★ 2. 確定着順(top3_orders)および印馬着順(mark_orders)の最新化＆印同期 ★
+            if pred_cache and orders:
+                top3_orders = extract_top3_orders(pred_cache, orders)
+                mark_orders = extract_mark_orders(pred_cache, orders)
+            else:
+                top3_orders = d.get("top3_orders") or rb_meta.get("top3_orders")
+                mark_orders = d.get("mark_orders") or rb_meta.get("mark_orders")
+                if pred_cache:
+                    top3_orders, mark_orders = sync_orders_marks(top3_orders, mark_orders, pred_cache)
+
+            # 1〜3着(top3_orders)が未キャッシュの場合は自動取得＆永続化
             if not top3_orders and d.get("hit_type") != "中止":
                 try:
                     fresh_res = fetch_netkeiba_race_result(race_id)
@@ -4403,11 +4505,26 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                                 rb_meta["mark_orders"] = healed_marks
                             b_det["real_bet_meta"] = rb_meta
                             d["bet_details"] = b_det
-                            supabase.table("keiba_race_settlements").update({"bet_details": b_det}).eq("race_id", race_id).execute()
+                            supabase.table("keiba_race_settlements").update({"bet_details": b_det, "top3_orders": top3_orders}).eq("race_id", race_id).execute()
                 except Exception as te:
                     print(f"[Settlement Top3 Heal Warning] {race_id}: {te}")
 
-            if d["is_pass"]:
+            # DBのtop3_ordersが未設定または最新と異なる場合はDBに永続化同期
+            if top3_orders and top3_orders != d.get("top3_orders"):
+                try:
+                    if supabase:
+                        supabase.table("keiba_race_settlements").update({"top3_orders": top3_orders}).eq("race_id", race_id).execute()
+                        d["top3_orders"] = top3_orders
+                except Exception as t3e:
+                    print(f"[Settlement Top3 Sync Warning] {race_id}: {t3e}")
+
+            is_virtual_or_pass = bool(
+                d.get("is_pass")
+                or d.get("strategy_type") == "virtual"
+                or (d.get("hit_type") and "仮想" in str(d.get("hit_type")))
+            )
+
+            if is_virtual_or_pass:
                 if pred_cache and res_cache:
                     h_rec = pred_cache.get("hybrid_recommendation") if pred_cache else None
                     expected_target_u = (pred_cache.get("recommendation") or {}).get("target_umaban")
@@ -4424,7 +4541,7 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                     hypo_pay = pass_info["hypothetical_payout"]
                     pass_benefit = pass_info["pass_benefit"]
                     msg = pass_info["message"]
-                    mark_orders = pass_info.get("mark_orders") or rb_meta.get("mark_orders")
+                    mark_orders = pass_info.get("mark_orders") or mark_orders
                     top3_orders = pass_info.get("top3_orders") or top3_orders
 
                     is_real = bool(rb_meta.get("is_real_bet_target") or rb_meta.get("real_bet_level") in ["high", "standard"])
@@ -4456,6 +4573,9 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                             msg = f"【仮想不的中】{ord_info} (仮想投資: {hypo_bet:,}円 / 払戻: 0円 / 収支: {v_profit:,}円 / 回収率: 0.0%){marks_line}"
 
                         d["is_pass"] = False
+                        d["target_umaban"] = cur_target_u
+                        d["horse_name"] = expected_h_name or d.get("horse_name")
+                        d["actual_order"] = cur_order if (cur_order and cur_order < 90) else None
                         d["total_bet"] = hypo_bet
                         d["total_payout"] = hypo_pay
                         d["profit"] = v_profit
@@ -4479,6 +4599,9 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                             if supabase:
                                 supabase.table("keiba_race_settlements").update({
                                     "is_pass": False,
+                                    "target_umaban": cur_target_u,
+                                    "horse_name": expected_h_name or d.get("horse_name"),
+                                    "actual_order": cur_order if (cur_order and cur_order < 90) else None,
                                     "total_bet": hypo_bet,
                                     "total_payout": hypo_pay,
                                     "is_hit": is_virt_hit,
@@ -4490,6 +4613,7 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                                     "fukusho_payout": pay_fuku,
                                     "bet_breakdown": {"単勝": 100, "複勝": 100},
                                     "payout_breakdown": p_bd,
+                                    "top3_orders": top3_orders,
                                     "message": msg
                                 }).eq("race_id", race_id).execute()
                         except Exception as e_vh:
@@ -4503,6 +4627,7 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                                 "actual_order": cur_order if (cur_order and cur_order < 90) else None,
                                 "hypothetical_payout": hypo_pay,
                                 "pass_benefit": pass_benefit,
+                                "top3_orders": top3_orders,
                                 "message": msg
                             }
                             if supabase:
@@ -4719,17 +4844,21 @@ def save_settlement(data: dict):
             row_dict["track_bias"] = data["track_bias"]
         if "odds_alerts" in data and data["odds_alerts"] is not None:
             row_dict["odds_alerts"] = data["odds_alerts"]
+        if "top3_orders" in data and data["top3_orders"] is not None:
+            row_dict["top3_orders"] = data["top3_orders"]
 
         try:
             supabase.table("keiba_race_settlements").upsert(row_dict).execute()
         except Exception as col_err:
-            # カラム（track_bias, odds_alerts）が未定義の場合の安全フォールバック（bet_details内に退避）
-            if "track_bias" in row_dict or "odds_alerts" in row_dict:
+            # カラム（track_bias, odds_alerts, top3_orders）が未定義の場合の安全フォールバック（bet_details内に退避）
+            if "track_bias" in row_dict or "odds_alerts" in row_dict or "top3_orders" in row_dict:
                 b_det = row_dict.get("bet_details") or {}
                 if "track_bias" in row_dict:
                     b_det["track_bias"] = row_dict.pop("track_bias")
                 if "odds_alerts" in row_dict:
                     b_det["odds_alerts"] = row_dict.pop("odds_alerts")
+                if "top3_orders" in row_dict:
+                    b_det["top3_orders"] = row_dict.pop("top3_orders")
                 row_dict["bet_details"] = b_det
                 supabase.table("keiba_race_settlements").upsert(row_dict).execute()
             else:
@@ -5888,6 +6017,38 @@ def get_daily_summary(date: Optional[str] = Query(None, description="集計対�
         b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
         rb_meta = b_det.get("real_bet_meta") or {}
         sc_info = sched_map.get(r["race_id"], {})
+        # 印同期と本命馬番の自己修復
+        if p_data:
+            p_rec = p_data.get("recommendation") or {}
+            expected_u = p_rec.get("target_umaban")
+            if expected_u is None:
+                for h in p_data.get("horses", []):
+                    if h.get("mark") == "◎":
+                        expected_u = int(h.get("umaban"))
+                        break
+            c_res = res_cache_map.get(r["race_id"])
+            if expected_u is not None and r.get("target_umaban") != expected_u and c_res:
+                try:
+                    healed = process_settlement_calculation(
+                        race_id=r["race_id"],
+                        race_date=target_date,
+                        race_name=r.get("race_name") or f"Race {r['race_id']}",
+                        pred_data=p_data,
+                        race_res=c_res,
+                        from_cache=True
+                    )
+                    r.update(healed)
+                    b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+                    rb_meta = b_det.get("real_bet_meta") or {}
+                except Exception as he_ds:
+                    print(f"[DailySummary Heal Warning] {r['race_id']}: {he_ds}")
+
+            c_orders = c_res.get("orders", {}) if c_res else {}
+            if c_orders:
+                r["top3_orders"] = extract_top3_orders(p_data, c_orders) or r.get("top3_orders")
+                r["mark_orders"] = extract_mark_orders(p_data, c_orders) or r.get("mark_orders")
+            else:
+                r["top3_orders"], r["mark_orders"] = sync_orders_marks(r.get("top3_orders"), r.get("mark_orders"), p_data)
 
         # 実戦推奨情報を付与（キャッシュ破棄後も bet_details.real_bet_meta から復元）
         is_real = bool(
@@ -8045,13 +8206,14 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
     pred_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", t_date).execute()
     pred_map = {r["race_id"]: (r.get("data_json") or {}) for r in (pred_res.data or []) if r.get("race_id")}
 
-    settle_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass").eq("race_date", t_date).execute()
+    settle_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass, target_umaban").eq("race_date", t_date).execute()
     settle_rows = settle_res.data or []
     settled_rids = {
         r["race_id"] for r in settle_rows
         if r.get("actual_order") is not None or r.get("is_pass") in (1, True)
     }
     settle_pass_map = {r["race_id"]: r.get("is_pass") for r in settle_rows if r.get("race_id")}
+    settle_target_map = {r["race_id"]: r.get("target_umaban") for r in settle_rows if r.get("race_id")}
 
     healed_weights = []
     settled_now = []
@@ -8082,7 +8244,7 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
             except Exception as we:
                 errors.append(f"weight({rid}): {we}")
 
-        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース または 仮想馬券でis_pass=1のままのレース)
+        # 2. 結果検証の補完 (発走8分後以降の未検証レース または 実馬券昇格後にis_pass=1のままのレース または 仮想馬券でis_pass=1のままのレース または 本命馬番不整合レース)
         is_real_target = bool((dj.get("hybrid_recommendation") or {}).get("is_real_bet_target"))
         is_virt_target = bool(
             sr.get("is_virtual_bet_target")
@@ -8090,9 +8252,11 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
             or sr.get("real_bet_level") == "virtual"
             or (sr.get("real_bet_badge") and "仮想" in str(sr.get("real_bet_badge")))
         ) and not is_real_target
+        pred_target_u = (dj.get("recommendation") or {}).get("target_umaban")
+        needs_target_resettle = pred_target_u is not None and (settle_target_map.get(rid) is not None) and (settle_target_map.get(rid) != pred_target_u)
         needs_real_resettle = is_real_target and (settle_pass_map.get(rid) in (1, True))
         needs_virt_resettle = is_virt_target and (settle_pass_map.get(rid) in (1, True))
-        if mins_to_post <= -8.0 and (force_resettle or rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle or needs_virt_resettle):
+        if mins_to_post <= -8.0 and (force_resettle or rid not in settled_rids or int(sr.get("is_settled") or 0) == 0 or needs_real_resettle or needs_virt_resettle or needs_target_resettle):
             try:
                 verify_race_result(rid, bypass_cache=True, is_19h_settle=False)
                 supabase.table("keiba_scheduled_races").update({"is_settled": 1}).eq("race_id", rid).execute()
@@ -8112,6 +8276,84 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
         "settled_now_count": len(settled_now),
         "settled_now_races": settled_now,
         "errors": errors
+    }
+
+
+@app.post("/admin/heal-settlement-marks")
+@app.get("/admin/heal-settlement-marks")
+def heal_settlement_marks(date: Optional[str] = Query(None, description="修復対象日付 (YYYY-MM-DD, 省略時は全期間)")):
+    """keiba_race_settlements の印・本命馬・確定着順を最新の predictions_cache と results_cache から走査して一括自己修復"""
+    if not supabase:
+        return {"status": "error", "message": "Supabase not connected"}
+
+    query = supabase.table("keiba_race_settlements").select("*")
+    if date:
+        query = query.eq("race_date", date)
+    res = query.order("race_id", desc=True).limit(200).execute()
+    rows = res.data or []
+
+    repaired = []
+    for r in rows:
+        rid = r["race_id"]
+        r_date = r.get("race_date")
+        pred = get_cached_prediction(rid)
+        result = get_cached_result(rid)
+        if pred and result:
+            pred_target = (pred.get("recommendation") or {}).get("target_umaban")
+            if pred_target is None:
+                for h in pred.get("horses", []):
+                    if h.get("mark") == "◎":
+                        pred_target = int(h.get("umaban"))
+                        break
+            orders = result.get("orders", {})
+            fresh_top3 = extract_top3_orders(pred, orders)
+            fresh_marks = extract_mark_orders(pred, orders)
+
+            needs_update = False
+            update_payload = {}
+
+            if pred_target is not None and r.get("target_umaban") != pred_target:
+                # 本命馬番が不一致 -> process_settlement_calculation で完全再計算
+                try:
+                    process_settlement_calculation(
+                        race_id=rid,
+                        race_date=r_date,
+                        race_name=r.get("race_name", f"Race {rid}"),
+                        pred_data=pred,
+                        race_res=result,
+                        from_cache=True
+                    )
+                    repaired.append({"race_id": rid, "type": "target_umaban_recalculated", "old_target": r.get("target_umaban"), "new_target": pred_target})
+                    continue
+                except Exception as e_recalc:
+                    print(f"[HealMarks Recalc Error] {rid}: {e_recalc}")
+
+            if fresh_top3 and fresh_top3 != r.get("top3_orders"):
+                update_payload["top3_orders"] = fresh_top3
+                needs_update = True
+
+            if fresh_marks and fresh_marks != (r.get("bet_details") or {}).get("real_bet_meta", {}).get("mark_orders"):
+                b_det = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+                rb_meta = b_det.get("real_bet_meta") if isinstance(b_det.get("real_bet_meta"), dict) else {}
+                rb_meta["mark_orders"] = fresh_marks
+                rb_meta["top3_orders"] = fresh_top3
+                b_det["real_bet_meta"] = rb_meta
+                update_payload["bet_details"] = b_det
+                needs_update = True
+
+            if needs_update:
+                try:
+                    supabase.table("keiba_race_settlements").update(update_payload).eq("race_id", rid).execute()
+                    repaired.append({"race_id": rid, "type": "marks_synchronized"})
+                except Exception as e_up:
+                    print(f"[HealMarks Update Error] {rid}: {e_up}")
+
+    invalidate_summary_caches()
+    return {
+        "status": "ok",
+        "scanned_count": len(rows),
+        "repaired_count": len(repaired),
+        "repaired_details": repaired
     }
 
 
