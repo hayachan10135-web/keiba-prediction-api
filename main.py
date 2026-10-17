@@ -1306,25 +1306,18 @@ def ensure_schedules_registered_for_venues(formatted_date: str, venues: List[dic
         if supabase and updates_for_schedule:
             existing_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", formatted_date).execute()
             existing_rids = {str(x.get("race_id")) for x in (existing_res.data or [])}
-            new_inserts = []
-            for row in updates_for_schedule:
-                if row["race_id"] in existing_rids:
-                    try:
-                        supabase.table("keiba_scheduled_races").update({
-                            "post_datetime": row["post_datetime"],
-                            "race_name": row["race_name"]
-                        }).eq("race_id", row["race_id"]).execute()
-                    except Exception:
-                        pass
-                else:
-                    new_inserts.append({
-                        "race_id": row["race_id"],
-                        "race_date": row["race_date"],
-                        "race_name": row["race_name"],
-                        "post_datetime": row["post_datetime"],
-                        "is_predicted": 1,
-                        "is_settled": 0
-                    })
+            new_inserts = [
+                {
+                    "race_id": row["race_id"],
+                    "race_date": row["race_date"],
+                    "race_name": row["race_name"],
+                    "post_datetime": row["post_datetime"],
+                    "is_predicted": 1,
+                    "is_settled": 0
+                }
+                for row in updates_for_schedule
+                if row["race_id"] not in existing_rids
+            ]
             if new_inserts:
                 try:
                     supabase.table("keiba_scheduled_races").upsert(new_inserts, on_conflict="race_id").execute()
@@ -6869,22 +6862,23 @@ async def background_maintenance_loop():
 
             # --- ② JST朝 8:30 以降、当日の未予想レース事前予想（朝オッズによる暫定判定）を一括実行 ---
             if (now_dt.hour > 8 or (now_dt.hour == 8 and now_dt.minute >= 30)) and last_830_predict_date != today_str:
-                period_dates = discover_period_kaisai_dates(now_dt)
-                if today_str in period_dates:
-                    already_predicted_count = 0
-                    if supabase:
-                        try:
-                            chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
-                            already_predicted_count = len(chk_p.data or [])
-                        except Exception:
-                            pass
-                    if already_predicted_count >= 24:
-                        print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
-                        last_830_predict_date = today_str
-                    elif not batch_status["is_running"]:
-                        print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
-                        run_batch_worker(today_str, "predict", False, False)
-                        last_830_predict_date = today_str
+                already_predicted_count = 0
+                if supabase:
+                    try:
+                        chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
+                        already_predicted_count = len(chk_p.data or [])
+                    except Exception:
+                        pass
+                if already_predicted_count >= 24:
+                    print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
+                    last_830_predict_date = today_str
+                else:
+                    period_dates = discover_period_kaisai_dates(now_dt)
+                    if today_str in period_dates:
+                        if not batch_status["is_running"]:
+                            print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
+                            run_batch_worker(today_str, "predict", False, False)
+                            last_830_predict_date = today_str
 
                         # 朝の実戦推奨候補を走査してダイジェスト通知
                         try:
@@ -8129,10 +8123,35 @@ def endpoint_reselect_daily_real_bet(target_date: Optional[str] = Query(None)):
     }
 
 
+def apply_verified_20261017_12r_on_startup():
+    """新潟12R・東京12Rの見送り復元および京都12R・全36レースの確定データを起動時に一括反映"""
+    if not supabase:
+        return
+    json_path = os.path.join(BASE_DIR, "verified_20261017_12r.json")
+    if not os.path.exists(json_path):
+        return
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("predictions"):
+            supabase.table("keiba_predictions_cache").upsert(payload["predictions"], on_conflict="race_id").execute()
+        if payload.get("results"):
+            supabase.table("keiba_race_results_cache").upsert(payload["results"], on_conflict="race_id").execute()
+        if payload.get("settlements"):
+            supabase.table("keiba_race_settlements").upsert(payload["settlements"], on_conflict="race_id").execute()
+        if payload.get("scheduled"):
+            supabase.table("keiba_scheduled_races").upsert(payload["scheduled"], on_conflict="race_id").execute()
+        invalidate_summary_caches()
+        print("[Startup] 2026-10-17 新潟12R・東京12R 見送り復元＆12R確定データをDBへ即時反映しました。")
+    except Exception as e:
+        print(f"[Startup] verified_20261017_12r 反映エラー: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
+    apply_verified_20261017_12r_on_startup()
     load_stats_overlay_from_supabase()
     load_betting_settings_from_supabase()
     asyncio.create_task(background_maintenance_loop())
