@@ -111,6 +111,13 @@ from app.routers.batch import (
     BatchStartResponse,
     BatchStatusResponse
 )
+from app.batch import (
+    run_batch_worker,
+    set_batch_worker_dependencies,
+    background_maintenance_loop,
+    sync_daily_schedules_if_needed,
+    set_scheduler_dependencies,
+)
 from app.routers.settlement import (
     router as settlement_router,
     set_settlement_handler,
@@ -1244,140 +1251,16 @@ set_settlement_handler(verify_race_result)
 # ★ 一括処理（1開催期間内の未予想・未検証レースの高速差分実行）
 # =========================================================================
 
-def run_batch_worker(
-    target_date: Optional[str] = None,
-    mode: str = "all",
-    force_predict: bool = False,
-    is_19h_settle: bool = False
-):
-    global batch_status
-    batch_status["is_running"] = True
-    batch_status["current"] = 0
-    batch_status["predicted"] = 0
-    batch_status["settled"] = 0
-    batch_status["message"] = "開催期間内の対象レースを走査中..."
-
-    try:
-        now_dt = now_jst_naive()
-        today_str = today_jst_str()
-        p_info = get_current_kaisai_period(now_dt)
-
-        period_dates = discover_period_kaisai_dates(now_dt)
-
-        # target_date が明示されている場合は指定日のみを対象とする
-        if target_date:
-            clean_d = target_date.replace("-", "")
-            fmt_d = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else target_date
-            target_dates = [fmt_d]
-        elif mode == "all" and not is_19h_settle:
-            target_dates = period_dates if period_dates else []
-        else:
-            target_dates = period_dates
-
-        if not target_dates:
-            batch_status["total"] = 0
-            batch_status["message"] = "今開催期間の対象レースが見つかりませんでした。"
-            return
-
-        # 対象開催日の全レースを収集
-        all_period_races = []
-        for d_str in target_dates:
-            venues = fetch_venues_for_date_raw(d_str)
-            for v in venues:
-                for r in v.get("races", []):
-                    all_period_races.append((d_str, r))
-
-        if not all_period_races:
-            batch_status["total"] = 0
-            batch_status["message"] = "開催期間内に処理可能なレースが見つかりませんでした。"
-            return
-
-        # Supabaseからすでに予想済み・検証済みのrace_idを一括取得して差分判定を高速化
-        predicted_ids = set()
-        settled_ids = set()
-        if supabase:
-            try:
-                p_res = supabase.table("keiba_predictions_cache").select("race_id").in_("race_date", target_dates).execute()
-                predicted_ids = {row["race_id"] for row in (p_res.data or [])}
-            except Exception as e:
-                print(f"[Batch] 予想済みID一括取得エラー: {e}")
-
-            try:
-                s_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass").in_("race_date", target_dates).execute()
-                for row in (s_res.data or []):
-                    if row.get("actual_order") is not None or row.get("is_pass") == 1 or row.get("is_pass") is True:
-                        settled_ids.add(row["race_id"])
-            except Exception as e:
-                print(f"[Batch] 検証済みID一括取得エラー: {e}")
-
-        # 実際に未予想または未検証のレースだけを抽出
-        work_items = []
-        for d_str, race_item in all_period_races:
-            r_id = race_item["race_id"]
-            r_info = race_item.get("race_info", "")
-
-            do_predict = False
-            if mode in ("all", "predict"):
-                if force_predict or (r_id not in predicted_ids):
-                    do_predict = True
-
-            do_settle = False
-            if mode in ("all", "settle") and (r_id not in settled_ids):
-                # 過去開催日のレースはすべて発走済み、当日開催分は発走時刻後のみ検証対象
-                is_past_post = True
-                if d_str > today_str:
-                    is_past_post = False
-                elif d_str == today_str and not is_19h_settle:
-                    m = re.search(r"(\d{1,2}):(\d{2})", r_info)
-                    if m:
-                        try:
-                            p_hour, p_minute = int(m.group(1)), int(m.group(2))
-                            p_dt = now_dt.replace(hour=p_hour, minute=p_minute, second=0, microsecond=0)
-                            if now_dt < p_dt:
-                                is_past_post = False
-                        except Exception:
-                            pass
-                if is_past_post:
-                    do_settle = True
-
-            if do_predict or do_settle:
-                work_items.append((d_str, race_item, do_predict, do_settle))
-
-        batch_status["total"] = len(work_items)
-
-        if not work_items:
-            batch_status["message"] = f"完了: 今開催期間(全{len(all_period_races)}R)はすべて予想・検証済みです"
-            return
-
-        for idx, (d_str, race_item, do_predict, do_settle) in enumerate(work_items, 1):
-            r_id = race_item["race_id"]
-            batch_status["current"] = idx
-            batch_status["message"] = f"処理中 ({idx}/{len(work_items)}件: 予想{batch_status['predicted']}件 / 検証{batch_status['settled']}件)"
-
-            if do_predict:
-                try:
-                    predict_race_core(r_id, force_refresh=force_predict, is_auto_final=False)
-                    batch_status["predicted"] += 1
-                    predicted_ids.add(r_id)
-                except Exception as pe:
-                    print(f"[Batch] 予想スキップ/エラー ({r_id}): {pe}")
-
-            if do_settle:
-                try:
-                    verify_race_result(r_id, is_19h_settle=is_19h_settle)
-                    batch_status["settled"] += 1
-                    settled_ids.add(r_id)
-                except Exception:
-                    pass
-
-        batch_status["message"] = f"完了: 対象{len(work_items)}R処理 (新規予想{batch_status['predicted']}件 / 新規検証{batch_status['settled']}件)"
-
-    except Exception as e:
-        batch_status["message"] = f"エラー終了: {e}"
-        print(f"[Batch] ワーカー全体エラー: {e}")
-    finally:
-        batch_status["is_running"] = False
-        invalidate_summary_caches()
+# run_batch_worker は app/batch/worker.py へ移管完了
+set_batch_worker_dependencies(
+    get_current_kaisai_period=get_current_kaisai_period,
+    discover_period_kaisai_dates=discover_period_kaisai_dates,
+    fetch_venues_for_date_raw=fetch_venues_for_date_raw,
+    predict_race_core=predict_race_core,
+    verify_race_result=verify_race_result,
+    now_jst_naive=now_jst_naive,
+    today_jst_str=today_jst_str,
+)
 
 
 def recalculate_period_records():
@@ -1562,394 +1445,31 @@ set_batch_workers(run_batch_worker, recalculate_period_records)
 #   ⑥ 金曜日 夜20:00 : 1開催期間分の一時キャッシュ破棄（成績台帳は永続保持）
 # =========================================================================
 
-async def sync_daily_schedules_if_needed(today_str: str):
-    """当日のJRA開催有無を確認し、開催日であればレーススケジュールをkeiba_scheduled_racesに事前登録"""
-    if not supabase:
-        return
-    if today_str in _period_checked_empty_dates:
-        return
-    try:
-        res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", today_str).execute()
-        valid_ids = [r["race_id"] for r in (res.data or []) if len(r["race_id"]) == 12]
-        if len(valid_ids) >= 20:
-            return
-
-        venues = fetch_venues_for_date_raw(today_str)
-        if venues:
-            print(f"[Scheduler] {today_str} (JST) のJRA開催スケジュール ({sum(len(v.get('races', [])) for v in venues)}R) を事前登録しました。")
-    except Exception as e:
-        print(f"[Scheduler] スケジュール事前登録エラー: {e}")
+# sync_daily_schedules_if_needed は app/batch/scheduler.py へ移管完了
 
 
-async def background_maintenance_loop():
-    print("[Scheduler] リアルタイム・メンテナンススケジューラー (JST同期・1開催期間サイクル版) を開始しました。")
-    last_friday_cleaned_period = None
-    last_17h_settle_date = None
-    last_19h_settle_date = None
-    last_830_predict_date = None
-
-    while True:
-        try:
-            now_dt = now_jst_naive()
-            today_str = today_jst_str()
-            p_info = get_current_kaisai_period(now_dt)
-
-            # --- ⑥ 金曜 20:00 以降の古いキャッシュ自動整理 (75日以前の過去分のみ安全破棄) ---
-            if now_dt.weekday() == 4 and now_dt.hour >= 20:
-                if last_friday_cleaned_period != p_info["period_start"]:
-                    clear_kaisai_period_caches()
-                    last_friday_cleaned_period = p_info["period_start"]
-                    last_830_predict_date = None
-                    last_17h_settle_date = None
-                    last_19h_settle_date = None
-
-            # --- ① JST朝 7:30 以降、当日のレーススケジュールを事前登録 ---
-            if now_dt.hour > 7 or (now_dt.hour == 7 and now_dt.minute >= 30):
-                await sync_daily_schedules_if_needed(today_str)
-
-            # --- ② JST朝 8:30 以降、当日の未予想レース事前予想（朝オッズによる暫定判定）を一括実行 ---
-            if (now_dt.hour > 8 or (now_dt.hour == 8 and now_dt.minute >= 30)) and last_830_predict_date != today_str:
-                period_dates = discover_period_kaisai_dates(now_dt)
-                if today_str in period_dates:
-                    already_predicted_count = 0
-                    if supabase:
-                        try:
-                            chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
-                            already_predicted_count = len(chk_p.data or [])
-                        except Exception:
-                            pass
-                    if already_predicted_count >= 24:
-                        print(f"[Scheduler] 当日({today_str})の事前予想は既に完了済み({already_predicted_count}R)のため朝8:30一括予想をスキップします。")
-                        await asyncio.to_thread(ensure_daily_single_real_bet, today_str)
-                        last_830_predict_date = today_str
-                    elif not batch_status["is_running"]:
-                        print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "predict", False, False))
-                        await asyncio.to_thread(ensure_daily_single_real_bet, today_str)
-                        last_830_predict_date = today_str
-
-                        # 朝の実戦推奨候補を走査してダイジェスト通知
-                        try:
-                            if supabase:
-                                p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", today_str).execute()
-                                real_races = []
-                                for row in (p_res.data or []):
-                                    h_rec = row.get("data_json", {}).get("hybrid_recommendation") or {}
-                                    if h_rec.get("is_real_bet_target"):
-                                        r_name = row.get("data_json", {}).get("race_name", row["race_id"])
-                                        b_txt = h_rec.get("real_bet_badge", "実戦推奨")
-                                        e_ratio = h_rec.get("edge_ratio", 0.0)
-                                        real_races.append(f"・{r_name} (エッジ{e_ratio}倍 {b_txt})")
-
-                                if real_races:
-                                    summary_body = "\n".join(real_races[:5])
-                                    if len(real_races) > 5:
-                                        summary_body += f"\n他{len(real_races)-5}レース"
-                                    summary_body += "\n※発走60分前(馬体重)・30分前・15分前・5分前(最終確定)にオッズ推移を追跡し判定します。"
-                                    send_fcm_notification(
-                                        title=f"🌅【本日実戦推奨候補】計{len(real_races)}レース該当！",
-                                        body=summary_body,
-                                        data={"type": "MORNING_SUMMARY", "race_date": today_str}
-                                    )
-                                    check_and_notify_balance_shortfall()
-                        except Exception as fe:
-                            print(f"[Scheduler] 朝通知エラー: {fe}")
-                else:
-                    # 本日が非開催日（平日等）の場合はチェック済みとしてマーク
-                    last_830_predict_date = today_str
-
-            if supabase:
-                # --- ③ 各レース【発走 60分前 / 30分前 / 15分前 / 5分前】のマルチステージ自動推論 ＆ 最終確定通知 ---
-                try:
-                    res_pred = supabase.table("keiba_scheduled_races")\
-                        .select("*")\
-                        .eq("race_date", today_str)\
-                        .lt("is_predicted", 5)\
-                        .execute()
-                    unpredicted_races = res_pred.data or []
-
-                    for r in unpredicted_races:
-                        r_id = r["race_id"]
-                        p_dt_str = r.get("post_datetime")
-                        cur_stage = int(r.get("is_predicted") or 0)
-                        post_dt = parse_post_datetime(p_dt_str, today_str)
-                        if not post_dt:
-                            continue
-
-                        mins_to_post = (post_dt - now_dt).total_seconds() / 60.0
-                        if mins_to_post <= 0 or mins_to_post > 65.0:
-                            continue
-
-                        # Stage 5: 発走 5分前 (0 < mins <= 6.5) -> 最終オッズ推論 ＆ 確定通知
-                        if mins_to_post <= 6.5 and cur_stage < 5:
-                            print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
-                            try:
-                                pred_res = await asyncio.to_thread(predict_race_core, r_id, True, True, "05m")
-                                supabase.table("keiba_scheduled_races")\
-                                    .update({"is_predicted": 5})\
-                                    .eq("race_id", r_id)\
-                                    .execute()
-                                print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
-
-                                h_rec = pred_res.get("hybrid_recommendation") or {}
-                                if h_rec.get("is_real_bet_target"):
-                                    badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
-                                    edge = h_rec.get("edge_ratio", 0.0)
-                                    target_u = pred_res.get("recommendation", {}).get("target_umaban")
-                                    h_name = pred_res.get("recommendation", {}).get("horse_name", "")
-                                    r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
-
-                                    all_tickets = (
-                                        (h_rec.get("tansho_bets") or [])
-                                        + (h_rec.get("fukusho_bets") or [])
-                                        + (h_rec.get("umatan_bets") or [])
-                                        + (h_rec.get("umaren_bets") or [])
-                                        + (h_rec.get("trio_bets") or [])
-                                        + (h_rec.get("sanrentan_bets") or [])
-                                    )
-                                    bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])
-                                    tot_amt = h_rec.get("total_amount", 0)
-
-                                    body_text = f"◎{target_u}番 {h_name} (期待エッジ:{edge}倍)\n【推奨買い目】{bets_summary} 計{tot_amt:,}円"
-                                    send_fcm_notification(
-                                        title=f"{badge} {r_name}！",
-                                        body=body_text,
-                                        data={
-                                            "type": "REAL_BET_FINAL",
-                                            "race_id": r_id,
-                                            "edge_ratio": str(edge),
-                                            "badge": badge
-                                        }
-                                    )
-
-                                    # --- 【自動投票実行判定 (即PAT / UMACAスマート)】 ---
-                                    b_settings = load_betting_settings_from_supabase()
-                                    cur_bet_mode = b_settings.get("betting_mode", "off")
-
-                                    if cur_bet_mode in ("ipat", "umaca"):
-                                        mode_label = "UMACA" if cur_bet_mode == "umaca" else "即PAT"
-                                        if has_already_betted_race(today_str, r_id):
-                                            print(f"[AutoBet] {r_id} は既に投票済みのためスキップします (二重発注防止)")
-                                        else:
-                                            _auto_betted_races.add(r_id)
-                                            print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
-                                            try:
-                                                v_code = r_id[4:6] if len(r_id) == 12 else "05"
-                                                v_name = VENUE_CODE_MAP.get(v_code, "東京")
-                                                r_no = int(r_id[10:12]) if len(r_id) == 12 else 11
-
-                                                bet_items = []
-                                                for b in all_tickets:
-                                                    c_list = b.get("combination")
-                                                    if not c_list:
-                                                        t_u = b.get("target_umaban")
-                                                        c_list = [t_u] if t_u is not None else []
-                                                    bet_items.append({
-                                                        "ticket_type": b.get("ticket_type", "単勝"),
-                                                        "combination": c_list,
-                                                        "amount": b.get("amount", 100)
-                                                    })
-
-                                                client = BettingClientFactory.get_client(cur_bet_mode)
-                                                bet_res = await asyncio.to_thread(client.execute_bets, v_name, r_no, bet_items, False)
-
-                                                if bet_res.get("status") == "success":
-                                                    rcpt = bet_res.get("receipt_no", "")
-                                                    _auto_betted_dates.add(today_str)
-                                                    _auto_betted_races.add(r_id)
-                                                    try:
-                                                        cur_s = load_betting_settings_from_supabase()
-                                                        b_dict = cur_s.get("betted_races_by_date", {})
-                                                        b_list = b_dict.get(today_str, [])
-                                                        b_list.append({
-                                                            "race_id": r_id,
-                                                            "receipt_no": str(rcpt),
-                                                            "amount": tot_amt,
-                                                            "mode": cur_bet_mode,
-                                                            "time": now_jst().strftime("%H:%M:%S")
-                                                        })
-                                                        b_dict[today_str] = b_list
-                                                        cur_s["betted_races_by_date"] = b_dict
-                                                        if bet_res.get("balance") is not None:
-                                                            cur_s["last_balance"] = bet_res.get("balance")
-                                                            cur_s["last_balance_updated_at"] = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-                                                        save_betting_settings_to_supabase(cur_s)
-                                                    except Exception as me:
-                                                        print(f"[AutoBet Meta Save Error] {me}")
-                                                    print(f"[AutoBet] 🎉 {mode_label}投票成功！ 受付番号: {rcpt}")
-                                                    send_fcm_notification(
-                                                        title=f"🎫【{mode_label}投票完了】{v_name}{r_no}R",
-                                                        body=f"受付番号:{rcpt} / {len(bet_items)}点 計{tot_amt:,}円 投票完了！\n残高より正常に引き落とされました。",
-                                                        data={
-                                                            "type": "AUTO_BET_SUCCESS",
-                                                            "race_id": r_id,
-                                                            "receipt_no": str(rcpt),
-                                                            "amount": str(tot_amt),
-                                                            "mode": cur_bet_mode
-                                                        }
-                                                    )
-                                                else:
-                                                    err_msg = bet_res.get("reason") or bet_res.get("error") or "投票処理エラー"
-                                                    print(f"[AutoBet] ⚠️ {mode_label}投票失敗: {err_msg}")
-                                                    send_fcm_notification(
-                                                        title=f"⚠️【{mode_label}投票エラー】{v_name}{r_no}R",
-                                                        body=f"自動投票に失敗しました: {err_msg}",
-                                                        data={
-                                                            "type": "AUTO_BET_FAILED",
-                                                            "race_id": r_id,
-                                                            "error": str(err_msg),
-                                                            "mode": cur_bet_mode
-                                                        }
-                                                    )
-                                            except Exception as ab_err:
-                                                print(f"[AutoBet] 例外エラー: {ab_err}")
-                                                send_fcm_notification(
-                                                    title=f"⚠️【{mode_label}投票例外】{r_name}",
-                                                    body=f"投票通信中に例外が発生しました: {ab_err}",
-                                                    data={
-                                                        "type": "AUTO_BET_FAILED",
-                                                        "race_id": r_id,
-                                                        "error": str(ab_err),
-                                                        "mode": cur_bet_mode
-                                                    }
-                                                )
-                            except Exception as pe:
-                                print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
-
-                        # Stage 4: 発走 15分前 (6.5 < mins <= 17.0) -> 本馬場入場後オッズ更新
-                        elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
-                            print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
-                            try:
-                                await asyncio.to_thread(predict_race_core, r_id, True, False, "15m")
-                                supabase.table("keiba_scheduled_races")\
-                                    .update({"is_predicted": 4})\
-                                    .eq("race_id", r_id)\
-                                    .execute()
-                            except Exception as pe:
-                                print(f"[Auto-Predict Stage4] 更新失敗 ({r_id}): {pe}")
-
-                        # Stage 3: 発走 30分前 (17.0 < mins <= 33.0) -> パドック後オッズ更新
-                        elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
-                            print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
-                            try:
-                                await asyncio.to_thread(predict_race_core, r_id, True, False, "30m")
-                                supabase.table("keiba_scheduled_races")\
-                                    .update({"is_predicted": 3})\
-                                    .eq("race_id", r_id)\
-                                    .execute()
-                            except Exception as pe:
-                                print(f"[Auto-Predict Stage3] 更新失敗 ({r_id}): {pe}")
-
-                        # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重取得成功時のみstage=2へ進める)
-                        elif 33.0 < mins_to_post <= 58.0 and cur_stage < 2:
-                            try:
-                                pred_s2 = await asyncio.to_thread(predict_race_core, r_id, True, False, "60m")
-                                has_w = any(h.get("horse_weight") is not None for h in (pred_s2 or {}).get("horses", []))
-                                if has_w:
-                                    supabase.table("keiba_scheduled_races")\
-                                        .update({"is_predicted": 2})\
-                                        .eq("race_id", r_id)\
-                                        .execute()
-                                    print(f"[Auto-Predict Stage2] {r_id}: 馬体重反映完了")
-                            except Exception as we:
-                                print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
-                except Exception as e:
-                    print(f"[Scheduler] 予想ループエラー: {e}")
-
-                # --- ③-B 発走後レースで馬体重が未取得のまま残っている場合の自動バックグラウンド補完 ---
-                try:
-                    res_all_sched = supabase.table("keiba_scheduled_races").select("race_id, post_datetime").eq("race_date", today_str).execute()
-                    past_rids_today = []
-                    for sr in (res_all_sched.data or []):
-                        p_dt = parse_post_datetime(sr.get("post_datetime"), today_str)
-                        if p_dt and now_dt >= p_dt:
-                            past_rids_today.append(sr["race_id"])
-                    if past_rids_today:
-                        p_chk = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", past_rids_today).execute()
-                        healed_cnt = 0
-                        for prow in (p_chk.data or []):
-                            if healed_cnt >= 4:
-                                break
-                            prid = prow.get("race_id")
-                            pdj = prow.get("data_json") or {}
-                            phorses = pdj.get("horses", [])
-                            if phorses and not any(h.get("horse_weight") is not None for h in phorses):
-                                await asyncio.to_thread(predict_race_core, prid, False, False, None)
-                                healed_cnt += 1
-                except Exception as he_loop:
-                    print(f"[Scheduler] 発走後馬体重補完チェック警告: {he_loop}")
-
-                # 予想更新時に即PAT残高不足の恐れがあればアラート通知
-                check_and_notify_balance_shortfall()
-
-                # --- ④ 各レース【発走 10分後】の個別自動照合（未確定時は3分おきにリトライ） ---
-                try:
-                    res_settle = supabase.table("keiba_scheduled_races")\
-                        .select("*")\
-                        .eq("race_date", today_str)\
-                        .eq("is_settled", 0)\
-                        .execute()
-                    unsettled_races = res_settle.data or []
-
-                    for r in unsettled_races:
-                        r_id = r["race_id"]
-                        p_dt_str = r.get("post_datetime")
-                        retries = r.get("retry_count", 0) or 0
-                        post_dt = parse_post_datetime(p_dt_str, today_str)
-                        if not post_dt:
-                            continue
-
-                        # 初回は発走10分後、以降は3分間隔でリトライ
-                        trigger_settle_time = post_dt + datetime.timedelta(minutes=10 + 3 * retries)
-                        if now_dt >= trigger_settle_time:
-                            try:
-                                await asyncio.to_thread(verify_race_result, r_id, True, False)
-                                supabase.table("keiba_scheduled_races")\
-                                    .update({"is_settled": 1})\
-                                    .eq("race_id", r_id)\
-                                    .execute()
-                                print(f"[Auto-Settle] 結果照合完了: {r_id}")
-                            except Exception as se_err:
-                                print(f"[Auto-Settle Retry] {r_id} (retry={retries}): {se_err}")
-                                if retries >= 15:
-                                    supabase.table("keiba_scheduled_races")\
-                                        .update({"is_settled": 1})\
-                                        .eq("race_id", r_id)\
-                                        .execute()
-                                else:
-                                    supabase.table("keiba_scheduled_races")\
-                                        .update({"retry_count": retries + 1})\
-                                        .eq("race_id", r_id)\
-                                        .execute()
-                except Exception as e:
-                    print(f"[Scheduler] 照合ループエラー: {e}")
-
-            # --- ⑤ JST 17:00 および 19:00 の当日最終未確定一括照合 ---
-            if now_dt.hour == 17 and last_17h_settle_date != today_str:
-                if today_str in discover_period_kaisai_dates(now_dt):
-                    if not batch_status["is_running"]:
-                        print(f"[Scheduler] 17:00 当日レースの最終結果照合を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
-                        last_17h_settle_date = today_str
-                else:
-                    last_17h_settle_date = today_str
-
-            if now_dt.hour == 19 and last_19h_settle_date != today_str:
-                if today_str in discover_period_kaisai_dates(now_dt):
-                    if not batch_status["is_running"]:
-                        print(f"[Scheduler] 19:00 当日レースの予備最終結果照合を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
-                        last_19h_settle_date = today_str
-                else:
-                    last_19h_settle_date = today_str
-
-        except Exception as e:
-            print(f"[Scheduler] 全体ループエラー: {e}")
-
-        await asyncio.sleep(60)
+# background_maintenance_loop は app/batch/scheduler.py へ移管完了
+set_scheduler_dependencies(
+    now_jst=now_jst,
+    now_jst_naive=now_jst_naive,
+    today_jst_str=today_jst_str,
+    parse_post_datetime=parse_post_datetime,
+    get_current_kaisai_period=get_current_kaisai_period,
+    clear_kaisai_period_caches=clear_kaisai_period_caches,
+    discover_period_kaisai_dates=discover_period_kaisai_dates,
+    fetch_venues_for_date_raw=fetch_venues_for_date_raw,
+    ensure_daily_single_real_bet=ensure_daily_single_real_bet,
+    send_fcm_notification=send_fcm_notification,
+    check_and_notify_balance_shortfall=check_and_notify_balance_shortfall,
+    predict_race_core=predict_race_core,
+    verify_race_result=verify_race_result,
+    has_already_betted_race=has_already_betted_race,
+    run_batch_worker=run_batch_worker,
+    period_checked_empty_dates=_period_checked_empty_dates,
+    auto_betted_races=_auto_betted_races,
+    auto_betted_dates=_auto_betted_dates,
+    venue_code_map=VENUE_CODE_MAP,
+)
 
 
 
