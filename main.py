@@ -1323,7 +1323,7 @@ def ensure_schedules_registered_for_venues(formatted_date: str, venues: List[dic
                         "race_name": row["race_name"],
                         "post_datetime": row["post_datetime"],
                         "is_predicted": 1,
-                        "is_verified": False
+                        "is_settled": 0
                     })
             if new_inserts:
                 try:
@@ -2210,6 +2210,8 @@ def get_or_select_daily_top_race_id(target_date: str) -> Optional[str]:
         candidates = []
         for r in rows:
             rid = str(r.get("race_id") or "")
+            if rid in ("202604040112", "202605040612"):
+                continue
             dj = r.get("data_json") or {}
             r_name = str(dj.get("race_name") or "")
             c_det = str((dj.get("race_details") or {}).get("course_details") or "")
@@ -2362,109 +2364,99 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
         if not candidates:
             return None
 
-        unrun_candidates = [c for c in candidates if c["is_unrun"]]
-        pool = unrun_candidates if unrun_candidates else candidates
+        unrun_candidates = [c for c in candidates if c["is_unrun"] and c["race_id"] not in ("202604040112", "202605040612")]
+        pool = unrun_candidates if unrun_candidates else [c for c in candidates if c["race_id"] not in ("202604040112", "202605040612")]
+        if not pool:
+            pool = candidates
         pool.sort(key=lambda x: (x["score"], x["confidence_score"]), reverse=True)
+        top_race = pool[0]
+        top_rid = top_race["race_id"]
+        top_dj = top_race["data_json"]
 
-        # 2026-10-17 特例テスト設定: 京都12R(202608040612) と 東京12R(202605040612) の2レース両方を実馬券対象とする
-        forced_rids_today = ["202608040612", "202605040612"] if target_date == "2026-10-17" else []
-        if forced_rids_today:
-            target_races = [c for c in candidates if c["race_id"] in forced_rids_today]
-            if not target_races:
-                target_races = [pool[0]]
+        horses = top_dj.get("horses") or []
+        honmei_horse = next((h for h in horses if h.get("mark") == "◎"), None)
+        if not honmei_horse:
+            honmei_horse = max(horses, key=lambda x: x.get("prob_win", 0.0)) if horses else {}
+        w0_u = int(honmei_horse.get("umaban") or 1)
+        w0_name = str(honmei_horse.get("horse_name") or "")
+        w0_odds = float(honmei_horse.get("odds") or 3.0)
+        c_det = str((top_dj.get("race_details") or {}).get("course_details") or "")
+        is_dirt = ("ダ" in c_det) or ("ダート" in c_det)
+
+        h_rec = top_dj.get("hybrid_recommendation") or {}
+        h_rec["is_participate"] = True
+        h_rec["is_real_bet_target"] = True
+        h_rec["real_bet_level"] = "standard"
+        h_rec["strategy_type"] = "daily_top"
+        h_rec["reason"] = "戦略Daily_No1採択"
+        h_rec["confidence_score"] = top_race["confidence_score"]
+        h_rec["edge_ratio"] = top_race["edge_ratio"]
+
+        tansho_bets = []
+        fukusho_bets = []
+        if is_dirt:
+            d_tan = 700
+            d_fuku = 300
+            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】ダート適性単複 (0R時昇格)"
+        elif w0_odds >= 5.0:
+            d_tan = 500
+            d_fuku = 500
+            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝妙味単複 (0R時昇格)"
         else:
-            target_races = [pool[0]]
+            d_tan = 700
+            d_fuku = 300
+            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
+            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝本命単複 (0R時昇格)"
 
-        promoted_rids = set()
-        for top_race in target_races:
-            top_rid = top_race["race_id"]
-            promoted_rids.add(top_rid)
-            top_dj = top_race["data_json"]
+        tansho_bets.append({
+            "ticket_type": "単勝",
+            "combination": [w0_u],
+            "combination_str": f"{w0_u}",
+            "amount": d_tan,
+            "odds": w0_odds,
+            "expected_payout": int(round(d_tan * w0_odds)),
+            "is_real_odds": True,
+            "memo": f"単勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_tan}円"
+        })
+        est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
+        fukusho_bets.append({
+            "ticket_type": "複勝",
+            "combination": [w0_u],
+            "combination_str": f"{w0_u}",
+            "amount": d_fuku,
+            "odds": est_fuku_odds,
+            "expected_payout": int(round(d_fuku * est_fuku_odds)),
+            "is_real_odds": False,
+            "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_fuku}円"
+        })
 
-            horses = top_dj.get("horses") or []
-            honmei_horse = next((h for h in horses if h.get("mark") == "◎"), None)
-            if not honmei_horse:
-                honmei_horse = max(horses, key=lambda x: x.get("prob_win", 0.0)) if horses else {}
-            w0_u = int(honmei_horse.get("umaban") or 1)
-            w0_name = str(honmei_horse.get("horse_name") or "")
-            w0_odds = float(honmei_horse.get("odds") or 3.0)
-            c_det = str((top_dj.get("race_details") or {}).get("course_details") or "")
-            is_dirt = ("ダ" in c_det) or ("ダート" in c_det)
+        h_rec["tansho_bets"] = tansho_bets
+        h_rec["fukusho_bets"] = fukusho_bets
+        h_rec["total_amount"] = d_tan + d_fuku
+        h_rec["summary"] = f"{h_rec['strategy_name']}：単勝{d_tan}円＋複勝{d_fuku}円 計{d_tan+d_fuku}円"
+        top_dj["hybrid_recommendation"] = h_rec
 
-            h_rec = top_dj.get("hybrid_recommendation") or {}
-            h_rec["is_participate"] = True
-            h_rec["is_real_bet_target"] = True
-            h_rec["real_bet_level"] = "standard"
-            h_rec["strategy_type"] = "daily_top"
-            h_rec["reason"] = "戦略Daily_No1採択"
-            h_rec["confidence_score"] = top_race["confidence_score"]
-            h_rec["edge_ratio"] = top_race["edge_ratio"]
+        top_rec = top_dj.get("recommendation") or {}
+        top_rec["target_umaban"] = w0_u
+        top_rec["horse_name"] = w0_name
+        top_rec["is_pass"] = False
+        top_rec["grade"] = "A"
+        top_rec["confidence_label"] = "厳選勝負"
+        top_rec["tansho_amount"] = d_tan
+        top_rec["fukusho_amount"] = d_fuku
+        top_rec["total_amount"] = d_tan + d_fuku
+        top_rec["summary"] = h_rec["summary"]
+        top_dj["recommendation"] = top_rec
 
-            tansho_bets = []
-            fukusho_bets = []
-            if is_dirt:
-                d_tan = 700
-                d_fuku = 300
-                h_rec["strategy_name"] = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                h_rec["real_bet_badge"] = "⭐【本日厳選No.1】ダート適性単複 (0R時昇格)"
-            elif w0_odds >= 5.0:
-                d_tan = 500
-                d_fuku = 500
-                h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝妙味単複 (0R時昇格)"
-            else:
-                d_tan = 700
-                d_fuku = 300
-                h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
-                h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝本命単複 (0R時昇格)"
+        supabase.table("keiba_predictions_cache").update({"data_json": top_dj}).eq("race_id", top_rid).execute()
+        print(f"[DailySingleRealBet] {target_date}: 自然合致0Rのため厳選No.1レースとして {top_rid} (◎{w0_u}番 {w0_name}) を昇格しました。")
 
-            tansho_bets.append({
-                "ticket_type": "単勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": d_tan,
-                "odds": w0_odds,
-                "expected_payout": int(round(d_tan * w0_odds)),
-                "is_real_odds": True,
-                "memo": f"単勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_tan}円"
-            })
-            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-            fukusho_bets.append({
-                "ticket_type": "複勝",
-                "combination": [w0_u],
-                "combination_str": f"{w0_u}",
-                "amount": d_fuku,
-                "odds": est_fuku_odds,
-                "expected_payout": int(round(d_fuku * est_fuku_odds)),
-                "is_real_odds": False,
-                "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_fuku}円"
-            })
-
-            h_rec["tansho_bets"] = tansho_bets
-            h_rec["fukusho_bets"] = fukusho_bets
-            h_rec["total_amount"] = d_tan + d_fuku
-            h_rec["summary"] = f"{h_rec['strategy_name']}：単勝{d_tan}円＋複勝{d_fuku}円 計{d_tan+d_fuku}円"
-            top_dj["hybrid_recommendation"] = h_rec
-
-            top_rec = top_dj.get("recommendation") or {}
-            top_rec["target_umaban"] = w0_u
-            top_rec["horse_name"] = w0_name
-            top_rec["is_pass"] = False
-            top_rec["grade"] = "A"
-            top_rec["confidence_label"] = "厳選勝負"
-            top_rec["tansho_amount"] = d_tan
-            top_rec["fukusho_amount"] = d_fuku
-            top_rec["total_amount"] = d_tan + d_fuku
-            top_rec["summary"] = h_rec["summary"]
-            top_dj["recommendation"] = top_rec
-
-            supabase.table("keiba_predictions_cache").update({"data_json": top_dj}).eq("race_id", top_rid).execute()
-            print(f"[DailySingleRealBet] {target_date}: 実馬券対象レースとして {top_rid} (◎{w0_u}番 {w0_name}) を昇格しました。")
-
-        # 他の daily_top 昇格レースがあれば解除
+        # 他の daily_top 昇格レースがあれば解除 (見送り状態へ完全復元)
         for r in rows:
             r_rid = str(r.get("race_id") or "")
-            if r_rid not in promoted_rids:
+            if r_rid != top_rid:
                 r_dj = r.get("data_json") or {}
                 r_h = r_dj.get("hybrid_recommendation") or {}
                 if r_h.get("strategy_type") == "daily_top" and r_h.get("is_real_bet_target"):
@@ -2473,15 +2465,27 @@ def ensure_daily_single_real_bet(target_date: str) -> Optional[str]:
                     r_h["real_bet_level"] = "none"
                     r_h["real_bet_badge"] = None
                     r_h["strategy_type"] = "skip"
+                    r_h["strategy_name"] = "見送り推奨 (資金保全)"
+                    r_h["tansho_bets"] = []
+                    r_h["fukusho_bets"] = []
+                    r_h["total_amount"] = 0
+                    r_h["summary"] = "波乱リスクおよびオッズ妙味の観点から見送り推奨"
                     r_dj["hybrid_recommendation"] = r_h
+                    r_rec = r_dj.get("recommendation") or {}
+                    r_rec["is_pass"] = True
+                    r_rec["grade"] = "D"
+                    r_rec["confidence_label"] = "見送り推奨"
+                    r_rec["tansho_amount"] = 0
+                    r_rec["fukusho_amount"] = 0
+                    r_rec["total_amount"] = 0
+                    r_rec["summary"] = "推奨馬なし (見送り)"
+                    r_dj["recommendation"] = r_rec
                     supabase.table("keiba_predictions_cache").update({"data_json": r_dj}).eq("race_id", r_rid).execute()
 
-        first_top_rid = next(iter(promoted_rids), None)
-        if first_top_rid:
-            _daily_top_race_id_cache[target_date] = first_top_rid
+        _daily_top_race_id_cache[target_date] = top_rid
         _all_predictions_cache.pop(target_date, None)
         _today_races_cache.pop(target_date, None)
-        return first_top_rid
+        return top_rid
     except Exception as e:
         print(f"[ensure_daily_single_real_bet] エラー: {e}")
         return None
@@ -4350,11 +4354,8 @@ def predict_race_core(
         if is_auto_final or odds_stage == "05m":
             course_meta["force_final_odds"] = True
 
-        if target_race_date == "2026-10-17" and race_id in ("202608040612", "202605040612"):
-            course_meta["is_daily_top_race"] = True
-        else:
-            top_rid = get_or_select_daily_top_race_id(target_race_date)
-            course_meta["is_daily_top_race"] = bool(top_rid and race_id == top_rid)
+        top_rid = get_or_select_daily_top_race_id(target_race_date)
+        course_meta["is_daily_top_race"] = bool(top_rid and race_id == top_rid and race_id not in ("202604040112", "202605040612"))
 
         result = build_prediction_and_recs(race_name, race_details, race_id, horses, course_meta)
         apply_odds_anomaly_indicators(result["horses"], prev_horses=prev_horses_list, odds_stage=odds_stage)
@@ -6832,7 +6833,7 @@ async def sync_daily_schedules_if_needed(today_str: str):
         if len(valid_ids) >= 20:
             return
 
-        venues = await asyncio.to_thread(fetch_venues_for_date_raw, today_str)
+        venues = fetch_venues_for_date_raw(today_str)
         if venues:
             print(f"[Scheduler] {today_str} (JST) のJRA開催スケジュール ({sum(len(v.get('races', [])) for v in venues)}R) を事前登録しました。")
     except Exception as e:
@@ -6868,7 +6869,7 @@ async def background_maintenance_loop():
 
             # --- ② JST朝 8:30 以降、当日の未予想レース事前予想（朝オッズによる暫定判定）を一括実行 ---
             if (now_dt.hour > 8 or (now_dt.hour == 8 and now_dt.minute >= 30)) and last_830_predict_date != today_str:
-                period_dates = await asyncio.to_thread(discover_period_kaisai_dates, now_dt)
+                period_dates = discover_period_kaisai_dates(now_dt)
                 if today_str in period_dates:
                     already_predicted_count = 0
                     if supabase:
@@ -6882,8 +6883,7 @@ async def background_maintenance_loop():
                         last_830_predict_date = today_str
                     elif not batch_status["is_running"]:
                         print(f"[Scheduler] 朝8:30 当日({today_str})全レースの一括事前予想（暫定判定）を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "predict", False, False))
+                        run_batch_worker(today_str, "predict", False, False)
                         last_830_predict_date = today_str
 
                         # 朝の実戦推奨候補を走査してダイジェスト通知
@@ -6943,7 +6943,7 @@ async def background_maintenance_loop():
                         if mins_to_post <= 6.5 and cur_stage < 5:
                             print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
                             try:
-                                pred_res = await asyncio.to_thread(predict_race_core, r_id, True, True, "05m")
+                                pred_res = predict_race_core(r_id, force_refresh=True, force_final_odds=True, stage_tag="05m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 5})\
                                     .eq("race_id", r_id)\
@@ -7064,35 +7064,38 @@ async def background_maintenance_loop():
                                                 )
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
+                            await asyncio.sleep(0.5)
 
                         # Stage 4: 発走 15分前 (6.5 < mins <= 17.0) -> 本馬場入場後オッズ更新
                         elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
                             print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
                             try:
-                                await asyncio.to_thread(predict_race_core, r_id, True, False, "15m")
+                                predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="15m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 4})\
                                     .eq("race_id", r_id)\
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage4] 更新失敗 ({r_id}): {pe}")
+                            await asyncio.sleep(0.5)
 
                         # Stage 3: 発走 30分前 (17.0 < mins <= 33.0) -> パドック後オッズ更新
                         elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
                             print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
                             try:
-                                await asyncio.to_thread(predict_race_core, r_id, True, False, "30m")
+                                predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="30m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 3})\
                                     .eq("race_id", r_id)\
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage3] 更新失敗 ({r_id}): {pe}")
+                            await asyncio.sleep(0.5)
 
                         # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重取得成功時のみstage=2へ進める)
                         elif 33.0 < mins_to_post <= 58.0 and cur_stage < 2:
                             try:
-                                pred_s2 = await asyncio.to_thread(predict_race_core, r_id, True, False, "60m")
+                                pred_s2 = predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="60m")
                                 has_w = any(h.get("horse_weight") is not None for h in (pred_s2 or {}).get("horses", []))
                                 if has_w:
                                     supabase.table("keiba_scheduled_races")\
@@ -7102,13 +7105,14 @@ async def background_maintenance_loop():
                                     print(f"[Auto-Predict Stage2] {r_id}: 馬体重反映完了")
                             except Exception as we:
                                 print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
+                            await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
 
                 # 予想更新時に残高不足の恐れがあればアラート通知
-                await asyncio.to_thread(check_and_notify_balance_shortfall)
+                check_and_notify_balance_shortfall()
 
-                # --- ④ 各レース【発走 10分後】の個別自動照合（未確定時は3分おきにリトライ） ---
+                # --- ④ 各レース【発走 10分後】の個別自動照合（未確定時は3分おきにリトライ、1ループ最大3件でブロック防止） ---
                 try:
                     res_settle = supabase.table("keiba_scheduled_races")\
                         .select("*")\
@@ -7117,7 +7121,10 @@ async def background_maintenance_loop():
                         .execute()
                     unsettled_races = res_settle.data or []
 
+                    settled_in_tick = 0
                     for r in unsettled_races:
+                        if settled_in_tick >= 3:
+                            break
                         r_id = r["race_id"]
                         p_dt_str = str(r.get("post_datetime") or "").replace("T", " ")[:19]
                         retries = r.get("retry_count", 0) or 0
@@ -7129,8 +7136,9 @@ async def background_maintenance_loop():
                         # 初回は発走10分後、以降は3分間隔でリトライ
                         trigger_settle_time = post_dt + datetime.timedelta(minutes=10 + 3 * retries)
                         if now_dt >= trigger_settle_time:
+                            settled_in_tick += 1
                             try:
-                                await asyncio.to_thread(verify_race_result, r_id, True, False)
+                                verify_race_result(r_id, bypass_cache=True, notify_fcm=False)
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_settled": 1})\
                                     .eq("race_id", r_id)\
@@ -7148,24 +7156,15 @@ async def background_maintenance_loop():
                                         .update({"retry_count": retries + 1})\
                                         .eq("race_id", r_id)\
                                         .execute()
+                            await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"[Scheduler] 照合ループエラー: {e}")
 
             # --- ⑤ JST 17:00 および 19:00 の当日最終未確定一括照合 ---
             if now_dt.hour == 17 and last_17h_settle_date != today_str:
-                if today_str in discover_period_kaisai_dates(now_dt):
-                    if not batch_status["is_running"]:
-                        print(f"[Scheduler] 17:00 当日レースの最終結果照合を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
                 last_17h_settle_date = today_str
 
             if now_dt.hour == 19 and last_19h_settle_date != today_str:
-                if today_str in discover_period_kaisai_dates(now_dt):
-                    if not batch_status["is_running"]:
-                        print(f"[Scheduler] 19:00 当日レースの予備最終結果照合を実行します...")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, lambda: run_batch_worker(today_str, "settle", False, True))
                 last_19h_settle_date = today_str
 
         except Exception as e:
@@ -7609,11 +7608,12 @@ class BatchUpsertPayload(BaseModel):
     predictions: Optional[List[dict]] = None
     settlements: Optional[List[dict]] = None
     scheduled: Optional[List[dict]] = None
+    results: Optional[List[dict]] = None
 
 
 @app.post("/admin/upsert-verified-data")
 def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
-    """検証済みの予想・収支結果・スケジュールデータをSupabaseに一括アップサート"""
+    """検証済みの予想・収支結果・スケジュール・レース結果キャッシュをSupabaseに一括アップサート"""
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase未接続")
 
@@ -7641,10 +7641,14 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
     pred_count = 0
     settle_count = 0
     sched_count = 0
+    res_count = 0
     try:
         if payload.predictions:
             supabase.table("keiba_predictions_cache").upsert(payload.predictions, on_conflict="race_id").execute()
             pred_count = len(payload.predictions)
+        if payload.results:
+            supabase.table("keiba_race_results_cache").upsert(payload.results, on_conflict="race_id").execute()
+            res_count = len(payload.results)
         if payload.settlements:
             supabase.table("keiba_race_settlements").upsert(payload.settlements, on_conflict="race_id").execute()
             settle_count = len(payload.settlements)
@@ -7655,6 +7659,7 @@ def endpoint_upsert_verified_data(payload: BatchUpsertPayload):
         return {
             "status": "ok",
             "predictions_count": pred_count,
+            "results_count": res_count,
             "settlements_count": settle_count,
             "scheduled_count": sched_count
         }
