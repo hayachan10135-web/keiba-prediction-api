@@ -330,18 +330,33 @@ class UMACAClient(BaseBettingClient):
             html_742 = self._decode_euc(r_742)
 
             if "エラー" in html_742 and "受け付けました" not in html_742:
-                return {"status": "failed", "step": "submit_742", "error": "最終投票送信時にエラーが返されました"}
+                soup_err = BeautifulSoup(html_742, "html.parser")
+                compact_err = " ".join(soup_err.get_text().split())[:200]
+                return {"status": "failed", "step": "submit_742", "error": f"最終投票送信エラー: {compact_err}"}
 
-            m_rcpt = re.search(r"受付番号[\s\S]{0,80}?(\d{4})", html_742)
+            # 投票結果画面の厳格検証 (Fail-Fast: 完了文言または受付番号が確認できない場合は失敗)
+            is_umaca_success = ("受け付けました" in html_742) or ("【投票結果】" in html_742) or ("投票完了" in html_742)
+            m_rcpt = re.search(r"受付番号[\s\S]{0,80}?(\d{4,})", html_742)
             if not m_rcpt:
                 m_rcpt = re.search(r"cReceiptNo\s*=\s*[\"'](\d+)[\"']", html_742)
-            receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
+
+            if not is_umaca_success or not m_rcpt:
+                soup_742 = BeautifulSoup(html_742, "html.parser")
+                compact_err = " ".join(soup_742.get_text().split())[:200]
+                print(f"[UMACAClient] [ERROR] 投票不成立を検知: 受付完了画面または受付番号が確認できませんでした (画面内容: {compact_err})")
+                return {
+                    "status": "failed",
+                    "step": "verify_result_742",
+                    "error": f"投票結果画面が確認できませんでした（不成立）: {compact_err}"
+                }
+
+            receipt_no = m_rcpt.group(1)
 
             form_742 = self._extract_form_inputs(html_742, "FORM0")
             balance_after = self._parse_balance(html_742, form_742) or (current_balance - encoded_amount)
             self.last_balance = balance_after
 
-            print(f"[UMACAClient] 🎉 投票完了！ 受付番号: {receipt_no} (合計: {encoded_amount:,}円 / 投票後残高: {balance_after:,}円)")
+            print(f"[UMACAClient] [SUCCESS] 投票結果画面を検証完了！ 受付番号: {receipt_no} (合計: {encoded_amount:,}円 / 投票後残高: {balance_after:,}円)")
             return {
                 "status": "success",
                 "platform": "umaca",

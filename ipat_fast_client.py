@@ -235,21 +235,31 @@ class IPATFastClient:
 
                 r_170 = self.session.post(f"{self.BASE_URL}/kw_170.cgi", data=form_data_170, timeout=10)
                 r_170.encoding = "euc-jp"
-                if "正しくありません" not in r_170.text and "エラー" not in r_170.text:
-                    added_count += 1
-                    added_amount += (int(amt_unit) * 100)
-                    # セッションパラメータ更新
-                    soup_170 = BeautifulSoup(r_170.text, "html.parser")
-                    for inp in soup_170.find_all("input"):
-                        n, v = inp.get("name"), inp.get("value")
-                        if n and v is not None:
-                            self.session_data[n] = v
+                # 完全一致原則: 1点でも投入エラーが出たら即時破棄
+                if "正しくありません" in r_170.text or "エラー" in r_170.text:
+                    print(f"[IPATFast] [ERROR] 買い目投入エラー検知: {t_type}{combo} -> 確定せずに即時中止（全破棄原則）")
+                    return {"status": "failed", "step": "add_ticket_failed", "error": f"買い目投入エラー: {t_type}{combo} (画面にエラーが返されました)"}
 
-            if added_count == 0:
-                return {"status": "failed", "step": "add_tickets", "error": "買い目が1件も投入できませんでした"}
+                added_count += 1
+                added_amount += (int(amt_unit) * 100)
+                last_soup_170 = BeautifulSoup(r_170.text, "html.parser")
 
-            # 3. 最終購入確定 (kw_170 ➔ kw_180 投票ボタン押下)
-            confirm_data = dict(self.session_data)
+            if added_count == 0 or added_count != len(items) or not last_soup_170:
+                return {"status": "failed", "step": "add_tickets", "error": "買い目が完全投入できませんでした（全破棄原則）"}
+
+            # 3. 最終購入確定 (kw_170 ➔ kw_180.cgi 送信フォームのみを厳格に抽出)
+            form_180 = last_soup_170.find("form", {"action": "kw_180.cgi"})
+            if not form_180:
+                compact_err = " ".join(last_soup_170.get_text().split())[:200]
+                print(f"[IPATFast] [ERROR] 投票確定フォーム(kw_180.cgi)が見つかりません: {compact_err}")
+                return {"status": "failed", "step": "find_form_180", "error": f"投票確定フォームが見つかりませんでした: {compact_err}"}
+
+            confirm_data = {}
+            for inp in form_180.find_all("input"):
+                n, v = inp.get("name"), inp.get("value")
+                if n and v is not None:
+                    confirm_data[n] = v
+
             confirm_data["s"] = str(added_amount)
             confirm_data["tou"] = "投票"
 
@@ -259,17 +269,53 @@ class IPATFastClient:
 
             # 暗証番号再確認が求められた場合
             if "暗証番号" in f_text and "p" in [inp.get("name") for inp in BeautifulSoup(f_text, "html.parser").find_all("input")]:
-                pin_data = dict(self.session_data)
+                soup_pin = BeautifulSoup(f_text, "html.parser")
+                pin_form = soup_pin.find("form", {"action": "kw_180.cgi"}) or soup_pin.find("form")
+                pin_data = {}
+                if pin_form:
+                    for inp in pin_form.find_all("input"):
+                        n, v = inp.get("name"), inp.get("value")
+                        if n and v is not None:
+                            pin_data[n] = v
+                else:
+                    pin_data = dict(confirm_data)
                 pin_data["p"] = self.pin
                 r_final = self.session.post(f"{self.BASE_URL}/kw_180.cgi", data=pin_data, timeout=15)
                 r_final.encoding = "euc-jp"
                 f_text = r_final.text
 
-            m_rcpt = re.search(r"受付番号[^\d\n]*(\d+)", f_text)
-            receipt_no = m_rcpt.group(1) if m_rcpt else "受付完了"
+            # 4. 投票結果画面の厳格検証（Fail-Fast: 投票結果画面・受付番号が確認できない場合は絶対に成功としない）
+            soup_final = BeautifulSoup(f_text, "html.parser")
+            norm_text = re.sub(r"[\s\xa0\u3000]+", " ", soup_final.get_text())
+
+            is_completed_screen = ("【投票結果】" in norm_text) or ("ご投票ありがとうございました" in norm_text)
+            m_rcpt = re.search(r"受付番号\s*[:：]?\s*(\d{4,})", norm_text)
+
+            has_error = False
+            err_details = []
+            for err_word in ["正しくありません", "エラー", "再度、ログイン画面から", "受付時間外", "残高不足", "発売を終了"]:
+                if err_word in norm_text and not is_completed_screen:
+                    has_error = True
+                    err_details.append(err_word)
+
+            if not is_completed_screen or not m_rcpt or has_error:
+                compact_err = norm_text.strip()[:200]
+                reason = "投票結果画面（【投票結果】または受付番号）が確認できませんでした。"
+                if has_error:
+                    reason += f" 検知されたエラー: {', '.join(err_details)}."
+                elif not m_rcpt:
+                    reason += " 受付番号が取得できませんでした。"
+                print(f"[IPATFast] [ERROR] 投票不成立を検知: {reason} (画面内容: {compact_err})")
+                return {
+                    "status": "failed",
+                    "step": "verify_result",
+                    "error": f"{reason} 画面内容: {compact_err}"
+                }
+
+            receipt_no = m_rcpt.group(1)
             balance_after = max(0, current_balance - added_amount)
             self.last_balance = balance_after
-            print(f"[IPATFast] [SUCCESS] 投票完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
+            print(f"[IPATFast] [SUCCESS] 投票結果画面を検証完了！ 受付番号: {receipt_no} (合計: {added_amount:,}円)")
 
             return {
                 "status": "success",

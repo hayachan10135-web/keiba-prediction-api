@@ -33,7 +33,7 @@ def execute_manual_bet(
         return {"status": "skipped", "error": "投資総額が100円未満です"}
 
     client = BettingClientFactory.get_client(mode)
-    print(f"[ManualBetService] 🏇 マニュアル実機投票リクエスト: {venue_name}{race_no}R ({race_id}) {len(items)}件 計{total_amount:,}円 (モード: {client.platform_name}, dry_run={dry_run})")
+    print(f"[ManualBetService] [REQ] マニュアル実機投票リクエスト: {venue_name}{race_no}R ({race_id}) {len(items)}件 計{total_amount:,}円 (モード: {client.platform_name}, dry_run={dry_run})")
 
     # 1. クライアント経由で発注執行
     bet_res = client.execute_bets(venue_name, race_no, items, dry_run=dry_run)
@@ -54,9 +54,9 @@ def execute_manual_bet(
                 "bet_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             supabase.table("keiba_real_bets").insert(record).execute()
-            print(f"[ManualBetService] 💾 マニュアル投票台帳に記録完了 (is_manual_bet=True, 受付番号: {receipt_no})")
+            print(f"[ManualBetService] [SAVED] マニュアル投票台帳に記録完了 (is_manual_bet=True, 受付番号: {receipt_no})")
         except Exception as e:
-            print(f"[ManualBetService] ⚠️ 台帳永続化エラー (発注自体は完了): {e}", file=sys.stderr)
+            print(f"[ManualBetService] [WARN] 台帳永続化エラー (発注自体は完了): {e}", file=sys.stderr)
 
     return bet_res
 
