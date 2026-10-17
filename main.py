@@ -6943,7 +6943,7 @@ async def background_maintenance_loop():
                         if mins_to_post <= 6.5 and cur_stage < 5:
                             print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
                             try:
-                                pred_res = predict_race_core(r_id, force_refresh=True, force_final_odds=True, stage_tag="05m")
+                                pred_res = predict_race_core(r_id, True, True, "05m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 5})\
                                     .eq("race_id", r_id)\
@@ -7070,7 +7070,7 @@ async def background_maintenance_loop():
                         elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
                             print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
                             try:
-                                predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="15m")
+                                predict_race_core(r_id, True, False, "15m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 4})\
                                     .eq("race_id", r_id)\
@@ -7083,7 +7083,7 @@ async def background_maintenance_loop():
                         elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
                             print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
                             try:
-                                predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="30m")
+                                predict_race_core(r_id, True, False, "30m")
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_predicted": 3})\
                                     .eq("race_id", r_id)\
@@ -7095,7 +7095,7 @@ async def background_maintenance_loop():
                         # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重取得成功時のみstage=2へ進める)
                         elif 33.0 < mins_to_post <= 58.0 and cur_stage < 2:
                             try:
-                                pred_s2 = predict_race_core(r_id, force_refresh=True, force_final_odds=False, stage_tag="60m")
+                                pred_s2 = predict_race_core(r_id, True, False, "60m")
                                 has_w = any(h.get("horse_weight") is not None for h in (pred_s2 or {}).get("horses", []))
                                 if has_w:
                                     supabase.table("keiba_scheduled_races")\
@@ -7138,7 +7138,7 @@ async def background_maintenance_loop():
                         if now_dt >= trigger_settle_time:
                             settled_in_tick += 1
                             try:
-                                verify_race_result(r_id, bypass_cache=True, notify_fcm=False)
+                                verify_race_result(r_id, True, False)
                                 supabase.table("keiba_scheduled_races")\
                                     .update({"is_settled": 1})\
                                     .eq("race_id", r_id)\
