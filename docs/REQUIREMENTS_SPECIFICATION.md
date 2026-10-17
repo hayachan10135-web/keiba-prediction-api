@@ -186,48 +186,71 @@ Supabase（PostgreSQL）上に構成される主要テーブルおよびその�
 
 ```mermaid
 erDiagram
-    keiba_scheduled_races ||--o{ keiba_predictions : "1レースに対して各ステージ予想を保持"
-    keiba_scheduled_races ||--o{ keiba_real_bets : "実馬券発注履歴"
-    keiba_betting_settings ||--|| keiba_scheduled_races : "投票モード・残高管理"
+    keiba_scheduled_races ||--o{ keiba_predictions_cache : "1レースに対して予想JSONを保持"
+    keiba_scheduled_races ||--o{ keiba_race_results_cache : "確定結果JSON"
+    keiba_scheduled_races ||--o{ keiba_race_settlements : "確定収支・照合台帳"
+    keiba_scheduled_races ||--o{ keiba_real_bets : "実馬券発注台帳"
+    keiba_app_meta ||--|| keiba_scheduled_races : "運用メタ・残高設定"
 
     keiba_scheduled_races {
-        string race_id PK "例: 202605040811"
-        string race_date "開催日 (YYYY-MM-DD)"
-        string venue_name "競馬場名 (東京, 中山 等)"
-        int race_no "レース番号 (1〜12)"
-        string post_time "発走時刻 (HH:MM)"
-        string status "進行状態 (scheduled, done 等)"
+        varchar race_id PK "例: 202605040811"
+        date race_date "開催日 (YYYY-MM-DD)"
+        text race_name "レース名・番号情報"
+        timestamptz post_datetime "確定発走予定日時"
+        integer is_predicted "予想済みフラグ"
+        integer is_settled "確定照合済みフラグ"
+        integer retry_count "リトライ回数"
+        timestamptz created_at
     }
 
-    keiba_predictions {
-        bigint id PK
-        string race_id FK
-        string stage "推論ステージ (morning, 60m, 30m, 15m, 05m)"
-        jsonb prediction_data "出走馬全スコア・オッズ・買い目"
-        boolean is_real_bet_target "実馬券対象フラグ"
-        string strategy_name "適用戦略名 (StrategyA, B, C, A-2 等)"
-        timestamp created_at
+    keiba_predictions_cache {
+        varchar race_id PK
+        date race_date "開催日"
+        jsonb data_json "全頭AIスコア・オッズ・買い目"
+        timestamptz created_at
+    }
+
+    keiba_race_results_cache {
+        varchar race_id PK
+        text race_name
+        date race_date
+        jsonb result_json "公式確定着順・払戻金データ"
+        timestamptz created_at
+    }
+
+    keiba_race_settlements {
+        varchar race_id PK
+        date race_date "開催日"
+        text race_name
+        text strategy_type "採択戦略名 (strategy_b, a, c, a_hole, daily_top, skip)"
+        integer is_pass "見送りフラグ (1:見送り, 0:参戦)"
+        integer total_bet "総投資額"
+        integer total_payout "総払戻額"
+        integer is_hit "的中フラグ (1:的中, 0:不的中)"
+        integer actual_order "本命馬確定着順"
+        text hit_type "的中券種名"
+        jsonb bet_breakdown "券種別投資額"
+        jsonb payout_breakdown "券種別払戻額"
+        jsonb track_bias "トラックバイアス情報"
+        jsonb odds_alerts "オッズ急変アラート"
     }
 
     keiba_real_bets {
         bigint id PK
-        string race_id FK
-        string platform "発注先 (ipat または umaca)"
-        string receipt_no "JRA受付番号"
-        int total_amount "発注総額 (円)"
+        varchar race_id FK
+        varchar platform "発注先 (ipat または umaca)"
+        varchar receipt_no "JRA受付番号"
+        integer total_amount "発注総額 (円)"
         jsonb items "購入買い目詳細"
-        string status "発注結果 (success, aborted, failed)"
+        varchar status "発注結果 (success, aborted, failed)"
         boolean is_manual_bet "手動/実機テスト発注フラグ (集計完全除外)"
-        timestamp bet_time
+        timestamptz bet_time "発注日時"
     }
 
-    keiba_betting_settings {
-        int id PK
-        string platform "稼働モード (ipat / umaca)"
-        int max_bet_per_race "1レース上限額"
-        int last_balance "最終取得残高 (購入限度額)"
-        boolean dry_run "テストモードフラグ"
-        timestamp updated_at
+    keiba_app_meta {
+        varchar key PK "設定キー (betting_settings 等)"
+        jsonb value "設定値JSON"
+        timestamptz updated_at
     }
 ```
 

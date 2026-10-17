@@ -68,3 +68,4 @@ WHERE n.nspname = 'public'
       'keiba_app_meta'
   )
 ORDER BY c.relname;
+
