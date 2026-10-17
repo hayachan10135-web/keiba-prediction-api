@@ -168,3 +168,4 @@ def predict_race_endpoint(race_id: str, force_refresh: bool = Query(False, descr
     if not _predict_race_handler:
         raise HTTPException(status_code=500, detail="推論ハンドラーが未初期化です。")
     return _predict_race_handler(race_id=race_id, force_refresh=force_refresh)
+
