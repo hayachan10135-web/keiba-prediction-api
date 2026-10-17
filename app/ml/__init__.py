@@ -2,7 +2,7 @@
 """
 app.ml package
 
-機械学習推論、LightGBMカスケード、特徴量生成、リアルタイムトラックバイアス
+機械学習推論、LightGBMカスケード、特徴量生成、リアルタイムトラックバイアス、コア推論オーケストレーター
 """
 
 from app.ml.track_bias import (
@@ -35,6 +35,20 @@ from app.ml.model_loader import (
     save_stats_overlay_to_supabase,
     update_stats_from_race_settlement,
 )
+from app.ml.predictor import (
+    rank_min_desc,
+    rank_min_asc,
+    calculate_dynamic_bet,
+    calc_trio_odds,
+    compute_hybrid_rec_from_inputs,
+    apply_odds_anomaly_indicators,
+    build_prediction_and_recs,
+    predict_race_core,
+    set_predictor_dependencies,
+    ODDS_STAGE_ORDER,
+    ODDS_STAGE_RANK,
+    infer_odds_stage_from_minutes,
+)
 
 __all__ = [
     "evaluate_horse_bias_match",
@@ -63,4 +77,16 @@ __all__ = [
     "load_stats_overlay_from_supabase",
     "save_stats_overlay_to_supabase",
     "update_stats_from_race_settlement",
+    "rank_min_desc",
+    "rank_min_asc",
+    "calculate_dynamic_bet",
+    "calc_trio_odds",
+    "compute_hybrid_rec_from_inputs",
+    "apply_odds_anomaly_indicators",
+    "build_prediction_and_recs",
+    "predict_race_core",
+    "set_predictor_dependencies",
+    "ODDS_STAGE_ORDER",
+    "ODDS_STAGE_RANK",
+    "infer_odds_stage_from_minutes",
 ]

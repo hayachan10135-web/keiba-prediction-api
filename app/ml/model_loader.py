@@ -269,3 +269,4 @@ def update_stats_from_race_settlement(race_id: str, race_date: str, pred_data: d
         print(f"[StatsOverlay] レース {race_id} ({race_date}) より {updated_count}頭の統計を動的更新＆永続化しました。")
 
     return updated_count
+
