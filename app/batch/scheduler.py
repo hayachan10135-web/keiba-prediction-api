@@ -474,14 +474,17 @@ async def background_maintenance_loop():
                     res_all_sched = supabase.table("keiba_scheduled_races").select("race_id, post_datetime").eq("race_date", today_str).execute()
                     past_rids_today = []
                     for sr in (res_all_sched.data or []):
+                        sr_id = sr.get("race_id", "")
+                        if sr_id[4:6] not in {"04", "05", "08"}:
+                            continue
                         p_dt = _parse_post_datetime_fn(sr.get("post_datetime"), today_str) if _parse_post_datetime_fn else None
                         if p_dt and now_dt >= p_dt:
-                            past_rids_today.append(sr["race_id"])
+                            past_rids_today.append(sr_id)
                     if past_rids_today:
                         p_chk = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", past_rids_today).execute()
                         healed_cnt = 0
                         for prow in (p_chk.data or []):
-                            if healed_cnt >= 4:
+                            if healed_cnt >= 2:
                                 break
                             prid = prow.get("race_id")
                             pdj = prow.get("data_json") or {}
@@ -490,6 +493,7 @@ async def background_maintenance_loop():
                                 if _predict_race_core_fn:
                                     await asyncio.to_thread(_predict_race_core_fn, prid, False, False, None)
                                 healed_cnt += 1
+                                gc.collect()
                 except Exception as he_loop:
                     print(f"[Scheduler] 発走後馬体重補完チェック警告: {he_loop}")
 
@@ -506,8 +510,19 @@ async def background_maintenance_loop():
                         .execute()
                     unsettled_races = res_settle.data or []
 
+                    settled_count_this_loop = 0
+                    MAX_SETTLEMENTS_PER_LOOP = 2
+
                     for r in unsettled_races:
+                        if settled_count_this_loop >= MAX_SETTLEMENTS_PER_LOOP:
+                            break
+
                         r_id = r["race_id"]
+                        # 【最重要ガード】JRA公式の本日会場コード (04: 新潟, 05: 東京, 08: 京都) 以外の不正レースは除外
+                        venue_code = r_id[4:6] if len(r_id) == 12 else ""
+                        if venue_code not in {"04", "05", "08"}:
+                            continue
+
                         p_dt_str = r.get("post_datetime")
                         retries = r.get("retry_count", 0) or 0
                         post_dt = _parse_post_datetime_fn(p_dt_str, today_str) if _parse_post_datetime_fn else None
@@ -517,6 +532,7 @@ async def background_maintenance_loop():
                         # 初回は発走10分後、以降は3分間隔でリトライ
                         trigger_settle_time = post_dt + datetime.timedelta(minutes=10 + 3 * retries)
                         if now_dt >= trigger_settle_time:
+                            settled_count_this_loop += 1
                             try:
                                 if _verify_race_result_fn:
                                     await asyncio.to_thread(_verify_race_result_fn, r_id, True, False)
@@ -537,6 +553,8 @@ async def background_maintenance_loop():
                                         .update({"retry_count": retries + 1})\
                                         .eq("race_id", r_id)\
                                         .execute()
+                            finally:
+                                gc.collect()
                 except Exception as e:
                     print(f"[Scheduler] 照合ループエラー: {e}")
 
