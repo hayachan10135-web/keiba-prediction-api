@@ -13,6 +13,7 @@ app/batch/scheduler.py
 
 import asyncio
 import datetime
+import gc
 from typing import Optional, Callable, Dict, Any, List, Set
 
 from app.core.database import get_supabase_client
@@ -44,6 +45,7 @@ _period_checked_empty_dates_ref: Optional[Set[str]] = None
 _auto_betted_races_ref: Optional[Set[str]] = None
 _auto_betted_dates_ref: Optional[Set[str]] = None
 _venue_code_map_ref: Optional[Dict[str, str]] = None
+_last_stage2_check: Dict[str, float] = {}
 
 
 def set_scheduler_dependencies(
@@ -215,9 +217,9 @@ async def background_maintenance_loop():
                         .execute()
                     unpredicted_races = res_pred.data or []
 
-                    # 1ループあたりに実行する最大推論数を制限（メモリOOMバースト防止）
+                    # 1ループあたりに実行する最大推論数を制限（メモリOOMバースト・502根絶のため1推論/loop）
                     predicted_count_this_loop = 0
-                    MAX_PREDICTIONS_PER_LOOP = 2
+                    MAX_PREDICTIONS_PER_LOOP = 1
 
                     for r in unpredicted_races:
                         if predicted_count_this_loop >= MAX_PREDICTIONS_PER_LOOP:
@@ -407,9 +409,12 @@ async def background_maintenance_loop():
                                                     )
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
+                            finally:
+                                gc.collect()
 
                         # Stage 4: 発走 15分前 (6.5 < mins <= 17.0) -> 本馬場入場後オッズ更新
                         elif 6.5 < mins_to_post <= 17.0 and cur_stage < 4:
+                            predicted_count_this_loop += 1
                             print(f"[Auto-Predict Stage4: 15分前直前更新] {r_id} ({r.get('race_name')}) の15分前オッズ更新を実行します...")
                             try:
                                 if _predict_race_core_fn:
@@ -420,9 +425,12 @@ async def background_maintenance_loop():
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage4] 更新失敗 ({r_id}): {pe}")
+                            finally:
+                                gc.collect()
 
                         # Stage 3: 発走 30分前 (17.0 < mins <= 33.0) -> パドック後オッズ更新
                         elif 17.0 < mins_to_post <= 33.0 and cur_stage < 3:
+                            predicted_count_this_loop += 1
                             print(f"[Auto-Predict Stage3: 30分前パドック更新] {r_id} ({r.get('race_name')}) の30分前オッズ更新を実行します...")
                             try:
                                 if _predict_race_core_fn:
@@ -433,9 +441,17 @@ async def background_maintenance_loop():
                                     .execute()
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage3] 更新失敗 ({r_id}): {pe}")
+                            finally:
+                                gc.collect()
 
-                        # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重取得成功時のみstage=2へ進める)
+                        # Stage 2: 発走 58分前〜33分前 -> 馬体重反映・第1回再計算 (馬体重未発表時の毎ループ再試行を防止し最低5分間隔で実行)
                         elif 33.0 < mins_to_post <= 58.0 and cur_stage < 2:
+                            now_ts = now_dt.timestamp()
+                            last_chk = _last_stage2_check.get(r_id, 0.0)
+                            if now_ts - last_chk < 300.0:  # 5分以内にチェック済みならスキップ
+                                continue
+                            _last_stage2_check[r_id] = now_ts
+                            predicted_count_this_loop += 1
                             try:
                                 if _predict_race_core_fn:
                                     pred_s2 = await asyncio.to_thread(_predict_race_core_fn, r_id, True, False, "60m")
@@ -448,6 +464,8 @@ async def background_maintenance_loop():
                                         print(f"[Auto-Predict Stage2] {r_id}: 馬体重反映完了")
                             except Exception as we:
                                 print(f"[Auto-Predict Stage2] 馬体重更新チェック失敗 ({r_id}): {we}")
+                            finally:
+                                gc.collect()
                 except Exception as e:
                     print(f"[Scheduler] 予想ループエラー: {e}")
 

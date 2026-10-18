@@ -65,51 +65,77 @@ class ManualBetRequest(BaseModel):
 
 @router.get("/settings/betting-mode", response_model=BettingSettingsResponse)
 def get_betting_settings_endpoint():
-    """現在の自動投票設定を取得"""
-    settings = load_betting_settings_from_supabase()
-    cur_mode = settings.get("betting_mode", "off")
-    has_ipat_env = bool(os.getenv("IPAT_USER_NUM") and os.getenv("IPAT_PIN") and os.getenv("IPAT_PARS"))
-    has_umaca_env = UMACAClient().is_configured()
+    """現在の自動投票設定を取得 (Fail-Safe 耐障害性強化版)"""
+    try:
+        settings = load_betting_settings_from_supabase()
+        cur_mode = settings.get("betting_mode", "off")
+        has_ipat_env = bool(os.getenv("IPAT_USER_NUM") and os.getenv("IPAT_PIN") and os.getenv("IPAT_PARS"))
+        has_umaca_env = UMACAClient().is_configured()
 
-    modes = [
-        BettingModeItem(
-            id="off",
-            name="自動投票なし (OFF)",
-            enabled=True,
-            description="予想・買い目表示および通知のみ行い、自動投票は実行しません。"
-        ),
-        BettingModeItem(
-            id="ipat",
-            name="即PAT (IPAT)",
-            enabled=True,
-            description="発走5分前に「実馬券・勝負馬券」に該当した場合、即PATへ自動で買い目を投入します（事前手動入金残高内）。"
-        ),
-        BettingModeItem(
-            id="umaca",
-            name="UMACAスマート",
-            enabled=True,
-            description="発走5分前に「実馬券・勝負馬券」に該当した場合、UMACAスマートへ自動で買い目を投入します（投票用残高内）。"
+        modes = [
+            BettingModeItem(
+                id="off",
+                name="自動投票なし (OFF)",
+                enabled=True,
+                description="予想・買い目表示および通知のみ行い、自動投票は実行しません。"
+            ),
+            BettingModeItem(
+                id="ipat",
+                name="即PAT (IPAT)",
+                enabled=True,
+                description="発走5分前に「実馬券・勝負馬券」に該当した場合、即PATへ自動で買い目を投入します（事前手動入金残高内）。"
+            ),
+            BettingModeItem(
+                id="umaca",
+                name="UMACAスマート",
+                enabled=True,
+                description="発走5分前に「実馬券・勝負馬券」に該当した場合、UMACAスマートへ自動で買い目を投入します（投票用残高内）。"
+            )
+        ]
+
+        try:
+            rem_amt, rem_count, _ = calculate_remaining_real_bet_amount()
+        except Exception as ce:
+            print(f"[get_betting_settings] 投票予定額算出エラー: {ce}")
+            rem_amt, rem_count = 0, 0
+
+        last_bal = settings.get("last_balance") or 0
+        shortfall = max(0, rem_amt - last_bal) if (cur_mode in ("ipat", "umaca") and last_bal is not None) else 0
+
+        return BettingSettingsResponse(
+            betting_mode=cur_mode,
+            auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
+            available_modes=modes,
+            ipat_configured=(has_umaca_env if cur_mode == "umaca" else has_ipat_env),
+            umaca_configured=has_umaca_env,
+            last_balance=settings.get("last_balance"),
+            balance_status=settings.get("balance_status", "ok" if settings.get("last_balance") is not None else "unavailable"),
+            balance_message=settings.get("balance_message"),
+            remaining_bet_amount=rem_amt,
+            remaining_real_races_count=rem_count,
+            balance_shortfall=shortfall,
+            updated_at=settings.get("updated_at")
         )
-    ]
-
-    rem_amt, rem_count, _ = calculate_remaining_real_bet_amount()
-    last_bal = settings.get("last_balance") or 0
-    shortfall = max(0, rem_amt - last_bal) if (cur_mode in ("ipat", "umaca") and last_bal is not None) else 0
-
-    return BettingSettingsResponse(
-        betting_mode=cur_mode,
-        auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
-        available_modes=modes,
-        ipat_configured=(has_umaca_env if cur_mode == "umaca" else has_ipat_env),
-        umaca_configured=has_umaca_env,
-        last_balance=settings.get("last_balance"),
-        balance_status=settings.get("balance_status", "ok" if settings.get("last_balance") is not None else "unavailable"),
-        balance_message=settings.get("balance_message"),
-        remaining_bet_amount=rem_amt,
-        remaining_real_races_count=rem_count,
-        balance_shortfall=shortfall,
-        updated_at=settings.get("updated_at")
-    )
+    except Exception as e:
+        print(f"[get_betting_settings] 設定取得エラー: {e}")
+        return BettingSettingsResponse(
+            betting_mode="off",
+            auto_bet_real_only=True,
+            available_modes=[
+                BettingModeItem(id="off", name="自動投票なし (OFF)", enabled=True, description="予想・買い目表示および通知のみ行います。"),
+                BettingModeItem(id="ipat", name="即PAT (IPAT)", enabled=True, description="即PAT連携"),
+                BettingModeItem(id="umaca", name="UMACAスマート", enabled=True, description="UMACA連携")
+            ],
+            ipat_configured=False,
+            umaca_configured=False,
+            last_balance=None,
+            balance_status="unavailable",
+            balance_message="設定を一時的に読み込めませんでした",
+            remaining_bet_amount=0,
+            remaining_real_races_count=0,
+            balance_shortfall=0,
+            updated_at=None
+        )
 
 
 @router.post("/settings/betting-mode")
