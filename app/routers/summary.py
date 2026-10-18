@@ -64,6 +64,17 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
         try:
             res = supabase.table("keiba_race_settlements").select("*").eq("race_date", target_date).order("race_id", desc=False).execute()
             rows = res.data or []
+            # 当日公式開催スケジュール（東京:05, 京都:08, 新潟:04）以外の誤登録データを厳密に除外
+            if target_date == "2026-10-18":
+                rows = [r for r in rows if str(r.get("race_id") or "")[4:6] in {"05", "08", "04"}]
+            else:
+                try:
+                    sched_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", target_date).execute()
+                    valid_rids = {sr["race_id"] for sr in (sched_res.data or []) if sr.get("race_id")}
+                    if valid_rids:
+                        rows = [r for r in rows if r.get("race_id") in valid_rids]
+                except Exception:
+                    pass
         except Exception as e:
             print(f"Supabaseサマリー取得エラー: {e}")
 

@@ -302,6 +302,70 @@ def endpoint_reset_special_test_flags():
     return {"status": "success", "updated_races": updated}
 
 
+@router.get("/admin/cleanup-invalid-today-data")
+@router.post("/admin/cleanup-invalid-today-data")
+def endpoint_cleanup_invalid_today_data():
+    """当日 (2026-10-18) に誤登録された非公式開催場 (小倉など場コード05, 08, 04以外) のデータをDB全テーブルから完全削除"""
+    supabase = get_supabase_client()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase未接続")
+
+    deleted_counts = {}
+    valid_venues = {"05", "08", "04"}
+
+    # 1. keiba_race_settlements
+    try:
+        s_res = supabase.table("keiba_race_settlements").select("race_id").eq("race_date", "2026-10-18").execute()
+        bad_settled = [r["race_id"] for r in (s_res.data or []) if str(r.get("race_id") or "")[4:6] not in valid_venues]
+        for rid in bad_settled:
+            supabase.table("keiba_race_settlements").delete().eq("race_id", rid).execute()
+        deleted_counts["settlements"] = len(bad_settled)
+    except Exception as e:
+        deleted_counts["settlements_err"] = str(e)
+
+    # 2. keiba_predictions_cache
+    try:
+        p_res = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", "2026-10-18").execute()
+        bad_preds = [r["race_id"] for r in (p_res.data or []) if str(r.get("race_id") or "")[4:6] not in valid_venues]
+        for rid in bad_preds:
+            supabase.table("keiba_predictions_cache").delete().eq("race_id", rid).execute()
+        deleted_counts["predictions"] = len(bad_preds)
+    except Exception as e:
+        deleted_counts["predictions_err"] = str(e)
+
+    # 3. keiba_race_results_cache
+    try:
+        r_res = supabase.table("keiba_race_results_cache").select("race_id").eq("race_date", "2026-10-18").execute()
+        bad_results = [r["race_id"] for r in (r_res.data or []) if str(r.get("race_id") or "")[4:6] not in valid_venues]
+        for rid in bad_results:
+            supabase.table("keiba_race_results_cache").delete().eq("race_id", rid).execute()
+        deleted_counts["results"] = len(bad_results)
+    except Exception as e:
+        deleted_counts["results_err"] = str(e)
+
+    # 4. keiba_scheduled_races
+    try:
+        sc_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", "2026-10-18").execute()
+        bad_sched = [r["race_id"] for r in (sc_res.data or []) if str(r.get("race_id") or "")[4:6] not in valid_venues]
+        for rid in bad_sched:
+            supabase.table("keiba_scheduled_races").delete().eq("race_id", rid).execute()
+        deleted_counts["scheduled"] = len(bad_sched)
+    except Exception as e:
+        deleted_counts["scheduled_err"] = str(e)
+
+    # キャッシュクリア
+    try:
+        from app.schedule.races import _today_races_cache
+        _today_races_cache.clear()
+    except Exception:
+        pass
+    if _all_predictions_cache_ref is not None:
+        _all_predictions_cache_ref.clear()
+
+    return {"status": "ok", "deleted_counts": deleted_counts}
+
+
+
 
 class BatchUpsertPayload(BaseModel):
     predictions: Optional[List[dict]] = None
