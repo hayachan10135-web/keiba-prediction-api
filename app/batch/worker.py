@@ -139,32 +139,46 @@ def run_batch_worker(
             batch_status["message"] = "全対象レースの処理が完了しています（新規対象なし）。"
             return
 
-        for idx, (d_str, race_item, do_predict, do_settle) in enumerate(work_items, 1):
+        import concurrent.futures
+        import threading
+
+        lock = threading.Lock()
+        processed_count = 0
+
+        def _process_single_item(item):
+            nonlocal processed_count
+            d_str, race_item, do_predict, do_settle = item
             r_id = race_item["race_id"]
-            batch_status["current"] = idx
-            batch_status["message"] = f"処理中 ({idx}/{len(work_items)}件: 予想{batch_status['predicted']}件 / 検証{batch_status['settled']}件)"
 
             if do_predict and _predict_race_core_fn:
                 try:
                     _predict_race_core_fn(r_id, force_refresh=force_predict, is_auto_final=False)
-                    batch_status["predicted"] += 1
-                    predicted_ids.add(r_id)
+                    with lock:
+                        batch_status["predicted"] += 1
+                        predicted_ids.add(r_id)
                 except Exception as pe:
                     print(f"[Batch] 予想スキップ/エラー ({r_id}): {pe}")
 
             if do_settle and _verify_race_result_fn:
                 try:
                     _verify_race_result_fn(r_id, is_19h_settle=is_19h_settle)
-                    batch_status["settled"] += 1
-                    settled_ids.add(r_id)
+                    with lock:
+                        batch_status["settled"] += 1
+                        settled_ids.add(r_id)
                 except Exception:
                     pass
 
-            import gc, time
-            time.sleep(0.3)
-            gc.collect()
+            with lock:
+                processed_count += 1
+                batch_status["current"] = processed_count
+                batch_status["message"] = f"並列処理中 ({processed_count}/{len(work_items)}件: 予想{batch_status['predicted']}件 / 検証{batch_status['settled']}件)"
 
-        batch_status["message"] = f"完了: 対象{len(work_items)}R処理 (新規予想{batch_status['predicted']}件 / 新規検証{batch_status['settled']}件)"
+        max_workers = min(6, len(work_items))
+        print(f"[Batch] 🚀 マルチスレッド並列処理を開始します (ワーカー数: {max_workers}, 対象: {len(work_items)}R)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(_process_single_item, work_items))
+
+        batch_status["message"] = f"完了: 対象{len(work_items)}R並列処理完了 (新規予想{batch_status['predicted']}件 / 新規検証{batch_status['settled']}件)"
 
     except Exception as e:
         batch_status["message"] = f"エラー終了: {e}"

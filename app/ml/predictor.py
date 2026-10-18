@@ -628,8 +628,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         try:
             n_win = model_win.num_feature()
             n_top3 = model_top3.num_feature()
-            w_scores = model_win.predict([r[:n_win] for r in feature_rows])
-            t_scores = model_top3.predict([r[:n_top3] for r in feature_rows])
+            w_scores = model_win.predict([r[:n_win] for r in feature_rows], num_threads=4)
+            t_scores = model_top3.predict([r[:n_top3] for r in feature_rows], num_threads=4)
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(w_scores[idx]), 4)
                 h["prob_top3"] = round(float(t_scores[idx]), 4)
@@ -639,7 +639,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     elif model:
         try:
             n_mod = model.num_feature()
-            scores = model.predict([r[:n_mod] for r in feature_rows])
+            scores = model.predict([r[:n_mod] for r in feature_rows], num_threads=4)
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(scores[idx]), 4)
                 h["prob_top3"] = round(float(scores[idx]), 4)
@@ -756,7 +756,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         raise RuntimeError(f"model_gachi がロードされていないため、レース {race_id} のガチ度を推論できません。")
     try:
         n_g = model_gachi.num_feature()
-        prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]])[0]), 4)
+        prob_gachi = round(float(model_gachi.predict([race_feat_row[:n_g]], num_threads=2)[0]), 4)
     except Exception as e:
         raise RuntimeError(f"model_gachi 推論エラー ({race_id}): {e}")
 
@@ -764,7 +764,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         raise RuntimeError(f"model_himo がロードされていないため、レース {race_id} の混戦度を推論できません。")
     try:
         n_h = model_himo.num_feature()
-        prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]])[0]), 4)
+        prob_himo = round(float(model_himo.predict([race_feat_row[:n_h]], num_threads=2)[0]), 4)
     except Exception as e:
         raise RuntimeError(f"model_himo 推論エラー ({race_id}): {e}")
 

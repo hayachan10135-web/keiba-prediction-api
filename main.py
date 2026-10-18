@@ -529,7 +529,14 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
             "race_date": race_date,
             "data_json": data_dict
         }).execute()
-        _all_predictions_cache.pop(race_date, None)
+        # インメモリ全予想キャッシュをインクリメンタル更新（全体破棄によるDB再取得スパイクを防止しゼロレイテンシー維持）
+        if race_date in _all_predictions_cache:
+            ts, payload = _all_predictions_cache[race_date]
+            if isinstance(payload, dict) and "predictions" in payload:
+                payload["predictions"][race_id] = data_dict
+                _all_predictions_cache[race_date] = (time.time(), payload)
+        else:
+            _all_predictions_cache.pop(race_date, None)
         _today_races_cache.pop(race_date, None)
     except Exception as e:
         print(f"Supabase予想保存エラー ({race_id}): {e}")
@@ -618,7 +625,7 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
 
     now_ts = time.time()
     today_str = today_jst_str()
-    all_cache_ttl = 30.0 if target_date == today_str else 3600.0
+    all_cache_ttl = 300.0 if target_date == today_str else 3600.0
     cached_all = _all_predictions_cache.get(target_date)
     if cached_all and (now_ts - cached_all[0] < all_cache_ttl):
         return cached_all[1]

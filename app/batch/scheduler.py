@@ -218,9 +218,9 @@ async def background_maintenance_loop():
                         .execute()
                     unpredicted_races = res_pred.data or []
 
-                    # 1ループあたりに実行する最大推論数を制限（メモリOOMバースト・502根絶のため1推論/loop）
+                    # 1ループあたりに実行する最大推論数をPCスペック(10コア/16GB)に合わせて引き上げ (直前推論の遅延・滞留を完全根絶)
                     predicted_count_this_loop = 0
-                    MAX_PREDICTIONS_PER_LOOP = 1
+                    MAX_PREDICTIONS_PER_LOOP = 6
 
                     for r in unpredicted_races:
                         if predicted_count_this_loop >= MAX_PREDICTIONS_PER_LOOP:
@@ -498,7 +498,7 @@ async def background_maintenance_loop():
                     unsettled_races = res_settle.data or []
 
                     settled_count_this_loop = 0
-                    MAX_SETTLEMENTS_PER_LOOP = 2
+                    MAX_SETTLEMENTS_PER_LOOP = 6
 
                     for r in unsettled_races:
                         if settled_count_this_loop >= MAX_SETTLEMENTS_PER_LOOP:
