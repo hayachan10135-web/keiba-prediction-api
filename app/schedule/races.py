@@ -6,6 +6,7 @@ app/schedule/races.py
 """
 
 import re
+import gc
 import time
 import datetime
 from typing import Optional, Callable, Dict, Any, List, Set, Tuple
@@ -177,8 +178,18 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
     settled_map = {}
     supabase = get_supabase_client()
     if supabase:
+        # 当日会場のレースID（通常36件）のみに絞り込み、全272件の巨大JSON一括取得によるOOM（502）を物理根絶
+        venue_race_ids = [
+            r["race_id"]
+            for v in venues
+            for r in v.get("races", [])
+            if r.get("race_id")
+        ]
+        if not venue_race_ids:
+            return venues
+
         try:
-            p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
+            p_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", venue_race_ids).execute()
             for row in (p_res.data or []):
                 d_json = row.get("data_json") or {}
                 raw_preds_cache[row["race_id"]] = d_json
@@ -203,7 +214,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
         try:
             s_res = supabase.table("keiba_race_settlements").select(
                 "race_id, is_hit, is_pass, total_payout, total_bet, is_real_bet_target, is_virtual_bet_target, bet_details, strategy_type"
-            ).eq("race_date", formatted_date).execute()
+            ).in_("race_id", venue_race_ids).execute()
             for s_row in (s_res.data or []):
                 is_hit_val = 1 if (s_row.get("is_hit") == 1 and s_row.get("is_pass") == 0) else 0
                 is_real_val = bool(s_row.get("is_real_bet_target"))
@@ -267,7 +278,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
             if _ensure_daily_single_real_bet_fn:
                 _ensure_daily_single_real_bet_fn(formatted_date)
             try:
-                p_res2 = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", formatted_date).execute()
+                p_res2 = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", venue_race_ids).execute()
                 for row in (p_res2.data or []):
                     d_json = row.get("data_json") or {}
                     h_rec = d_json.get("hybrid_recommendation")
@@ -443,6 +454,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                             except Exception:
                                 pass
 
+    gc.collect()
     return venues
 
 
@@ -483,19 +495,25 @@ def get_today_races(
         else:
             target_date = available_dates[-1]
 
-    venues = fetch_venues_for_date_raw(target_date, force_refresh=force_refresh)
-    if venues:
-        if target_date not in available_dates:
-            available_dates = sorted(list(set(available_dates + [target_date])))
-        venues = attach_prediction_badges_to_venues(target_date, venues)
-        resp = {
-            "date": target_date,
-            "available_dates": available_dates[-6:],
-            "is_waiting_period": False,
-            "venues": venues
-        }
-        _today_races_cache[target_date] = (now_ts, resp)
-        return resp
+    try:
+        venues = fetch_venues_for_date_raw(target_date, force_refresh=force_refresh)
+        if venues:
+            if target_date not in available_dates:
+                available_dates = sorted(list(set(available_dates + [target_date])))
+            venues = attach_prediction_badges_to_venues(target_date, venues)
+            resp = {
+                "date": target_date,
+                "available_dates": available_dates[-6:],
+                "is_waiting_period": False,
+                "venues": venues
+            }
+            _today_races_cache[target_date] = (now_ts, resp)
+            return resp
+    except Exception as e:
+        print(f"[get_today_races] レース情報取得例外 ({target_date}): {e}")
+        c_val = _today_races_cache.get(target_date)
+        if c_val:
+            return c_val[1]
 
     resp_empty = {
         "date": target_date,
