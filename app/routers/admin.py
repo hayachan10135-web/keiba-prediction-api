@@ -248,6 +248,48 @@ def endpoint_process_date(date: str = Query(..., description="対象日付 (YYYY
     return sync_and_process_target_dates([date])
 
 
+@router.get("/admin/reset-special-test-flags")
+@router.post("/admin/reset-special-test-flags")
+def endpoint_reset_special_test_flags():
+    """テスト用に一時付与された特別実馬券フラグをDBキャッシュおよびメモリキャッシュから完全に消去し、本来の見送りに戻す"""
+    supabase = get_supabase_client()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase未接続")
+
+    target_rids = ["202604040201", "202608040701", "202605040702", "202608040705"]
+    updated = []
+
+    res = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", target_rids).execute()
+    for row in (res.data or []):
+        r_id = row.get("race_id")
+        dj = row.get("data_json") or {}
+        hr = dj.get("hybrid_recommendation") or {}
+
+        hr["is_real_bet_target"] = False
+        hr["real_bet_badge"] = None
+        hr["real_bet_level"] = "none"
+        if hr.get("strategy_type") == "skip" or dj.get("recommendation", {}).get("is_pass"):
+            hr["total_amount"] = 0
+            hr["tansho_bets"] = []
+            hr["fukusho_bets"] = []
+            hr["umatan_bets"] = []
+            hr["umaren_bets"] = []
+            hr["trio_bets"] = []
+            hr["sanrentan_bets"] = []
+
+        supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", r_id).execute()
+        updated.append(r_id)
+
+    try:
+        from app.schedule.races import _today_races_cache
+        _today_races_cache.clear()
+    except Exception:
+        pass
+
+    return {"status": "success", "updated_races": updated}
+
+
+
 class BatchUpsertPayload(BaseModel):
     predictions: Optional[List[dict]] = None
     settlements: Optional[List[dict]] = None

@@ -542,9 +542,10 @@ def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: O
     if not h_rec or not isinstance(h_rec, dict):
         return pred_data
     target_d = race_date or today_jst_str()
-    # 当日未確定レースで既にリアル勝負枠の場合は同期不要
+    # 当日未確定レースで既にリアル勝負枠の場合は同期不要 (ただし見送り判定なのにフラグが残っている不整合は解除へ進める)
     if h_rec.get("is_real_bet_target") and target_d >= today_jst_str() and not pred_data.get("is_settled"):
-        return pred_data
+        if h_rec.get("strategy_type") != "skip" or (h_rec.get("total_amount") or 0) > 0:
+            return pred_data
 
     def _apply_venue_race_sync(r_item: dict):
         if r_item.get("is_real_bet_target"):
