@@ -100,12 +100,12 @@ class StrategyArbiter:
         )
         edge_ratio = round(win_edge, 2)
 
-        # トラックバイアス判定 (本命馬)
+        # トラックバイアス判定 (表示用タグのみ維持し、賭け金ブーストは一旦停止)
         w0_bias = str(w0.get("bias_match") or "")
         is_bias_favorable = any(fav in w0_bias for fav in ("絶好バイアス", "有利", "合致"))
         is_bias_adverse = "逆風" in w0_bias
-        bias_boost_mult = 1.5 if is_bias_favorable else 1.0
-        bias_tag = " [⚡バイアス追い風×1.5倍]" if is_bias_favorable else (" [⚠️逆風激走期待]" if is_bias_adverse else "")
+        bias_boost_mult = 1.0  # トラックバイアスによる金額変更を停止 (元: 1.5 if is_bias_favorable else 1.0)
+        bias_tag = " [⚡バイアス追い風]" if is_bias_favorable else (" [⚠️逆風]" if is_bias_adverse else "")
 
         # 確定オッズ・発走前判定 (Stage 5)
         is_final_odds = force_final_odds
@@ -199,51 +199,21 @@ class StrategyArbiter:
 
         # -------------------------------------------------------------
         # ガードレール 1: スリッページ停止しきい値判定 (FR-STR-07)
-        # 発走5分前時点で期待回収率が 105.0% 未満に急落した場合は見送り退避
+        # ※直前オッズ急変による予想変更・見送りを一旦停止（モデル本来の予想を維持）
         # -------------------------------------------------------------
-        if decision.is_real_bet_target and is_final_odds:
-            # 期待回収率 (ROI) = (win_edge) * 100
-            expected_roi = edge_ratio * 100.0
-            if expected_roi < settings.SLIPPAGE_ROI_BORDER:
-                slip_reason = f"スリッページ停止 (期待回収率 {expected_roi:.1f}% < しきい値 {settings.SLIPPAGE_ROI_BORDER:.1f}% のため自動見送り)"
-                decision.is_participate = False
-                decision.is_real_bet_target = False
-                decision.assigned_tier = None
-                decision.strategy_type = "skip"
-                decision.strategy_name = "見送り推奨 (スリッページ検知)"
-                decision.real_bet_badge = None
-                decision.real_bet_level = "none"
-                decision.skip_reason = slip_reason
-                decision.tickets = []
-                decision.total_amount = 0
-                decision.summary = f"見送り推奨 ({slip_reason})"
-                decision.reason = slip_reason
+        # if decision.is_real_bet_target and is_final_odds:
+        #     expected_roi = edge_ratio * 100.0
+        #     if expected_roi < settings.SLIPPAGE_ROI_BORDER:
+        #         slip_reason = f"スリッページ停止 (期待回収率 {expected_roi:.1f}% < しきい値 {settings.SLIPPAGE_ROI_BORDER:.1f}% のため自動見送り)"
+        #         ...
 
         # -------------------------------------------------------------
         # ガードレール 2: トリガミ検知 ＆ 券種間引き (FR-STR-08)
+        # ※トリガミ防止による買い目間引きを一旦停止（戦略本来の全買い目をそのまま採用）
         # -------------------------------------------------------------
-        if decision.is_real_bet_target and decision.tickets:
-            pruned_tickets, pruned_logs = TrigamiPruner.prune(decision.tickets, decision.total_amount)
-            if not pruned_tickets:
-                # 全券種がトリガミになった場合 -> 見送り
-                trigami_reason = "トリガミ全除外見送り (全買い目が投資総額を下回るため見送り)"
-                decision.is_participate = False
-                decision.is_real_bet_target = False
-                decision.assigned_tier = None
-                decision.strategy_type = "skip"
-                decision.strategy_name = "見送り推奨 (トリガミ)"
-                decision.real_bet_badge = None
-                decision.real_bet_level = "none"
-                decision.skip_reason = trigami_reason
-                decision.tickets = []
-                decision.total_amount = 0
-                decision.summary = f"見送り推奨 ({trigami_reason})"
-                decision.reason = trigami_reason
-            elif len(pruned_tickets) < len(decision.tickets):
-                # 一部のトリガミ券種を間引き
-                decision.tickets = pruned_tickets
-                decision.total_amount = sum(t.amount for t in pruned_tickets)
-                decision.summary += f" [⚠️トリガミ間引き適用: {len(pruned_logs)}件除外 / 最終投資{decision.total_amount:,}円]"
+        # if decision.is_real_bet_target and decision.tickets:
+        #     pruned_tickets, pruned_logs = TrigamiPruner.prune(decision.tickets, decision.total_amount)
+        #     ...
 
         # 券種別リストの分解
         tansho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "単勝"]

@@ -77,60 +77,11 @@ class StrategyB(BaseBettingStrategy):
         ))
 
         # 2. 馬単 相手3頭の選定
-        # (1) 過剰人気馬(overbet)の排除
-        # (2) 逆風馬(adverse)のヒモ除外
-        # (3) 妙味穴(value_gap)、連続急落穴、絶好バイアス穴(4.0〜50倍)の優先昇格
+        # ※直前オッズ上下やトラックバイアスによる買い目改変を停止し、
+        #   モデル本来のAI勝率スコア順で選定
         s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
         candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
-        non_overbet_opps = [h for h in candidate_opps if h.get("odds_trend") != "overbet"]
-        base_pool = non_overbet_opps if len(non_overbet_opps) >= 3 else candidate_opps
-
-        non_adverse_opps = [h for h in base_pool if "逆風" not in str(h.get("bias_match") or "")]
-        candidate_pool = non_adverse_opps if len(non_adverse_opps) >= 3 else base_pool
-
-        boosted_opps = []
-        normal_opps = []
-        for h in candidate_pool:
-            o_val = float(h.get("odds") or 0.0)
-            is_val_gap = (h.get("odds_trend") == "value_gap")
-            alert_txt = str(h.get("odds_alert") or "")
-            b_match = str(h.get("bias_match") or "")
-            is_cont_plunge = ("連続急落" in alert_txt) and (3.5 <= o_val <= 35.0)
-            is_bias_sweet = ("絶好バイアス" in b_match) and (4.0 <= o_val <= 50.0)
-
-            if is_val_gap or is_cont_plunge or is_bias_sweet:
-                if is_val_gap:
-                    tag_reason = "💎妙味穴"
-                elif is_bias_sweet:
-                    tag_reason = "🎯絶好穴"
-                else:
-                    tag_reason = "🔥連続急落"
-                boosted_opps.append((h, tag_reason))
-            else:
-                normal_opps.append(h)
-
-        selected_opps = []
-        selected_u_set = set()
-        for h, reason in boosted_opps[:2]:
-            u_n = int(h["umaban"])
-            selected_opps.append((h, reason))
-            selected_u_set.add(u_n)
-
-        for h in normal_opps:
-            u_n = int(h["umaban"])
-            if u_n not in selected_u_set:
-                selected_opps.append((h, "AI本線"))
-                selected_u_set.add(u_n)
-            if len(selected_opps) >= 3:
-                break
-
-        for h in candidate_pool:
-            u_n = int(h["umaban"])
-            if u_n not in selected_u_set:
-                selected_opps.append((h, "AI本線"))
-                selected_u_set.add(u_n)
-            if len(selected_opps) >= 3:
-                break
+        selected_opps = [(h, "AI本線") for h in candidate_opps[:3]]
 
         for h_opp, tag in selected_opps[:3]:
             opp = int(h_opp["umaban"])
