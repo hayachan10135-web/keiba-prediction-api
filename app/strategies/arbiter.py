@@ -13,6 +13,9 @@ import numpy as np
 from app.core.config import settings
 from app.core.timezone import now_jst_naive, today_jst_str
 from app.strategies.base import BaseBettingStrategy
+from app.strategies.strategy_super import StrategySuper
+from app.strategies.strategy_real import StrategyReal
+from app.strategies.strategy_virtual import StrategyVirtual
 from app.strategies.strategy_b import StrategyB
 from app.strategies.strategy_a import StrategyA
 from app.strategies.strategy_c import StrategyC
@@ -24,17 +27,15 @@ from app.strategies.models import StrategyDecision, BetTicket
 
 class StrategyArbiter:
     """
-    全買い目戦略を統括する調停オーケストレーター
+    全買い目戦略を統括する調停オーケストレーター (3段階レース区分: 勝負R / 実勝負 / 仮想 + 見送り)
     """
 
     def __init__(self):
-        # 優先度順に登録
+        # 3段階区分戦略を優先度順に登録
         self.strategies: List[BaseBettingStrategy] = [
-            StrategyB(),
-            StrategyA(),
-            StrategyC(),
-            StrategyAHole(),
-            DailyPromotionStrategy(),
+            StrategySuper(),           # 1. ⭐【勝負R】 (最優先: 芝オッズ妙味帯・馬単3点)
+            StrategyReal(),            # 2. 🎯【実勝負】 (各場1R保証枠 または 高安定本命・単複)
+            StrategyVirtual(),         # 3. 🎮【仮想】   (各場3R保証枠 または 観戦枠・3連複6点)
         ]
 
     def evaluate_race(
@@ -53,9 +54,12 @@ class StrategyArbiter:
         real_trio_odds: Optional[dict] = None,
         track_bias_data: Optional[dict] = None,
         is_daily_top_race: bool = False,
+        is_real_guarantee: bool = False,
+        is_virtual_guarantee: bool = False,
     ) -> Dict[str, Any]:
         """
         compute_hybrid_rec_from_inputs と完全互換のハイブリッド推奨辞書を生成
+        (3段階レース区分: 勝負R / 実勝負 / 仮想 + 見送り)
         """
         course_details_str = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
         if "障害" in race_name or "障" in course_details_str:
@@ -104,7 +108,7 @@ class StrategyArbiter:
         w0_bias = str(w0.get("bias_match") or "")
         is_bias_favorable = any(fav in w0_bias for fav in ("絶好バイアス", "有利", "合致"))
         is_bias_adverse = "逆風" in w0_bias
-        bias_boost_mult = 1.0  # トラックバイアスによる金額変更を停止 (元: 1.5 if is_bias_favorable else 1.0)
+        bias_boost_mult = 1.0
         bias_tag = " [⚡バイアス追い風]" if is_bias_favorable else (" [⚠️逆風]" if is_bias_adverse else "")
 
         # 確定オッズ・発走前判定 (Stage 5)
@@ -139,12 +143,14 @@ class StrategyArbiter:
             "surface_type": surface_type,
             "prob_gachi": prob_gachi,
             "is_daily_top_race": is_daily_top_race,
+            "is_real_guarantee": is_real_guarantee,
+            "is_virtual_guarantee": is_virtual_guarantee,
         }
 
         decision: Optional[StrategyDecision] = None
 
         if is_valid_race_type:
-            # カスケード順に戦略を評価
+            # 優先度順に戦略を評価 (勝負R -> 実勝負 -> 仮想)
             for strat in self.strategies:
                 if strat.evaluate_eligibility(
                     race_info=race_info,
@@ -177,15 +183,18 @@ class StrategyArbiter:
             elif is_shinba:
                 s_reason = "新馬戦除外 (過去走データなしのため見送り)"
             else:
-                s_reason = "カスケード条件不一致 (資金保全のため見送り)"
+                s_reason = "3区分選定基準不一致 (資金保全のため見送り)"
 
             decision = StrategyDecision(
                 is_participate=False,
                 is_real_bet_target=False,
+                is_virtual_bet=False,
+                bet_category="skip",
                 assigned_tier=None,
                 strategy_type="skip",
                 strategy_name="見送り推奨 (資金保全)",
                 real_bet_badge=None,
+                badge_text="見送り推奨",
                 real_bet_level="none",
                 skip_reason=s_reason,
                 tickets=[],
@@ -197,92 +206,59 @@ class StrategyArbiter:
                 reason=s_reason
             )
 
-        # -------------------------------------------------------------
-        # ガードレール 1: スリッページ停止しきい値判定 (FR-STR-07)
-        # ※直前オッズ急変による予想変更・見送りを一旦停止（モデル本来の予想を維持）
-        # -------------------------------------------------------------
-        # if decision.is_real_bet_target and is_final_odds:
-        #     expected_roi = edge_ratio * 100.0
-        #     if expected_roi < settings.SLIPPAGE_ROI_BORDER:
-        #         slip_reason = f"スリッページ停止 (期待回収率 {expected_roi:.1f}% < しきい値 {settings.SLIPPAGE_ROI_BORDER:.1f}% のため自動見送り)"
-        #         ...
-
-        # -------------------------------------------------------------
-        # ガードレール 2: トリガミ検知 ＆ 券種間引き (FR-STR-08)
-        # ※トリガミ防止による買い目間引きを一旦停止（戦略本来の全買い目をそのまま採用）
-        # -------------------------------------------------------------
-        # if decision.is_real_bet_target and decision.tickets:
-        #     pruned_tickets, pruned_logs = TrigamiPruner.prune(decision.tickets, decision.total_amount)
-        #     ...
-
         # 券種別リストの分解
         tansho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "単勝"]
         fukusho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "複勝"]
         umatan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬単"]
+        umaren_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬連"]
+        trio_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連複"]
+        sanrentan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連単"]
 
         tan_amt = sum(b["amount"] for b in tansho_bets)
         fuku_amt = sum(b["amount"] for b in fukusho_bets)
         utan_amt = sum(b["amount"] for b in umatan_bets)
-        total_amt = tan_amt + fuku_amt + utan_amt
+        total_amt = decision.total_amount
 
-        # 仮想馬券 (Tier 2 観戦枠 / 単100円 + 複100円)
+        # 仮想馬券 (総合台帳用) の生成
         virtual_bets = []
         virtual_total_amount = 0
         virtual_strategy_name = None
         virtual_badge = None
 
-        if decision.is_real_bet_target:
-            virtual_bets = tansho_bets + fukusho_bets + umatan_bets
+        if decision.bet_category in ("super", "real"):
+            # 実投票対象 (勝負R または 実勝負) -> 総合台帳にもそのまま反映
+            virtual_bets = [t.to_dict() for t in decision.tickets]
             virtual_total_amount = total_amt
             virtual_strategy_name = decision.strategy_name
             virtual_badge = decision.real_bet_badge
-        elif w0_u > 0:
-            est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-            virtual_strategy_name = "🎮 仮想観戦枠: 安定単複 (単100円＋複100円)"
-            virtual_badge = None
-            virtual_bets = [
-                {
-                    "ticket_type": "単勝",
-                    "combination": [w0_u],
-                    "combination_str": f"{w0_u}",
-                    "amount": 100,
-                    "odds": w0_odds,
-                    "expected_payout": int(round(100 * w0_odds)),
-                    "is_real_odds": True,
-                    "memo": f"単勝 {w0_u} ({w0_name}) 100円"
-                },
-                {
-                    "ticket_type": "複勝",
-                    "combination": [w0_u],
-                    "combination_str": f"{w0_u}",
-                    "amount": 100,
-                    "odds": est_fuku_odds,
-                    "expected_payout": int(round(100 * est_fuku_odds)),
-                    "is_real_odds": False,
-                    "memo": f"複勝 {w0_u} ({w0_name}) 100円"
-                }
-            ]
-            virtual_total_amount = 200
+        elif decision.bet_category == "virtual":
+            # 仮想観戦枠 -> 3連複チケットを仮想馬券として登録
+            virtual_bets = trio_bets
+            virtual_total_amount = total_amt
+            virtual_strategy_name = decision.strategy_name
+            virtual_badge = decision.real_bet_badge
 
-        all_active_bets = tansho_bets + fukusho_bets + umatan_bets
+        all_active_bets = [t.to_dict() for t in decision.tickets]
 
         return {
             "is_participate": decision.is_participate,
             "strategy_name": decision.strategy_name,
             "strategy_type": decision.strategy_type,
+            "bet_category": decision.bet_category,
+            "badge_text": decision.badge_text,
             "total_amount": total_amt,
             "summary": decision.summary,
             "tansho_bets": tansho_bets,
             "fukusho_bets": fukusho_bets,
             "umatan_bets": umatan_bets,
+            "umaren_bets": umaren_bets,
+            "trio_bets": trio_bets,
+            "sanrentan_bets": sanrentan_bets,
             "tansho_amount": tan_amt,
             "fukusho_amount": fuku_amt,
             "umatan_amount": utan_amt,
-            "umaren_bets": [],
-            "sanrentan_bets": [],
             "hypothetical_umaren_bets": [],
-            "trio_bets": [],
-            "trio_bet": None,
+            "trio_bet": trio_bets[0] if trio_bets else None,
             "reason": decision.reason,
             "is_real_odds_applied": any(b.get("is_real_odds", False) for b in all_active_bets),
             "total_expected_payout": sum(b.get("expected_payout", 0) for b in all_active_bets),
@@ -292,12 +268,13 @@ class StrategyArbiter:
             "synth_odds": round(w0_odds, 1),
             "confidence_score": confidence_score,
             "is_real_bet_target": decision.is_real_bet_target,
+            "is_virtual_bet": decision.is_virtual_bet,
             "real_bet_badge": decision.real_bet_badge,
             "real_bet_level": decision.real_bet_level,
             "is_final_odds": is_final_odds,
             # 仮想馬券フィールド
-            "is_virtual_bet_target": decision.is_real_bet_target,
-            "virtual_bet_slot": None,
+            "is_virtual_bet_target": (decision.bet_category in ("super", "real", "virtual")),
+            "virtual_bet_slot": decision.bet_category if decision.bet_category in ("super", "real", "virtual") else None,
             "virtual_strategy_name": virtual_strategy_name,
             "virtual_badge": virtual_badge,
             "virtual_bets": virtual_bets,

@@ -152,7 +152,9 @@ def calc_period_stat(title: str, key: str, rows: list) -> dict:
         if r.get("is_pass") == 0:
             bd = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
             rbm = bd.get("real_bet_meta") or {}
-            if rbm.get("is_real_bet_target"):
+            b_cat = bd.get("bet_category") or rbm.get("bet_category")
+            is_rb = (b_cat in ("super", "real")) or bool(rbm.get("is_real_bet_target"))
+            if is_rb:
                 rb_races += 1
                 if r.get("is_hit") == 1:
                     rb_hits += 1

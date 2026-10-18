@@ -107,9 +107,14 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
         rb_meta = b_det.get("real_bet_meta") or {}
         sc_info = sched_map.get(r["race_id"], {})
 
+        # 3段階区分 (勝負R / 実勝負 / 仮想)
+        b_cat = h_rec.get("bet_category") or b_det.get("bet_category") or rb_meta.get("bet_category") or "skip"
+        r["bet_category"] = b_cat
+
         # 実戦推奨情報を付与
         is_real = bool(
-            h_rec.get("is_real_bet_target")
+            b_cat in ("super", "real")
+            or h_rec.get("is_real_bet_target")
             or rb_meta.get("is_real_bet_target")
             or sc_info.get("is_real_bet_target")
             or (rb_meta.get("real_bet_level") in ["high", "standard"])
@@ -117,10 +122,9 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
         )
         r["is_real_bet_target"] = is_real
 
-        badge_val = h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge") or sc_info.get("real_bet_badge")
-        if badge_val and isinstance(badge_val, str):
-            badge_val = badge_val.replace("🎯", "⭐")
+        badge_val = h_rec.get("badge_text") or rb_meta.get("badge_text") or h_rec.get("real_bet_badge") or rb_meta.get("real_bet_badge") or sc_info.get("real_bet_badge")
         r["real_bet_badge"] = badge_val
+        r["badge_text"] = badge_val
         if r.get("strategy_name") and isinstance(r["strategy_name"], str):
             r["strategy_name"] = r["strategy_name"].replace("🎯", "⭐")
         r["real_bet_level"] = h_rec.get("real_bet_level") or rb_meta.get("real_bet_level") or sc_info.get("real_bet_level") or "none"
@@ -128,7 +132,10 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
         r["is_final_odds"] = h_rec.get("is_final_odds", rb_meta.get("is_final_odds", False))
 
         is_virt = bool(
-            sc_info.get("is_virtual_bet_target")
+            b_cat == "virtual"
+            or h_rec.get("is_virtual_bet")
+            or b_det.get("is_virtual_bet")
+            or sc_info.get("is_virtual_bet_target")
             or h_rec.get("is_virtual_bet_target")
             or rb_meta.get("is_virtual_bet_target")
             or r.get("real_bet_level") == "virtual"

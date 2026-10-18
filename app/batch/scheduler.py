@@ -255,9 +255,10 @@ async def background_maintenance_loop():
                                 print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
 
                                 h_rec = pred_res.get("hybrid_recommendation") or {}
-                                is_bet_target = bool(h_rec.get("is_real_bet_target"))
+                                b_cat = h_rec.get("bet_category", "skip")
+                                is_bet_target = bool(h_rec.get("is_real_bet_target")) and (b_cat in ("super", "real"))
                                 if is_bet_target:
-                                    badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
+                                    badge = h_rec.get("badge_text") or h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
                                     edge = h_rec.get("edge_ratio", 0.0)
                                     target_u = pred_res.get("recommendation", {}).get("target_umaban")
                                     if not target_u:

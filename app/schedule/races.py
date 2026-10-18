@@ -168,6 +168,9 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
                 race["virtual_badge"] = None
+                race["bet_category"] = "skip"
+                race["is_virtual_bet"] = False
+                race["badge_text"] = None
                 race["is_recommended"] = False
                 race["recommendation_badge"] = ""
                 race["real_bet_summary"] = None
@@ -198,12 +201,15 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 if h_rec:
                     cached_preds_map[row["race_id"]] = {
                         "is_real_bet_target": h_rec.get("is_real_bet_target", False),
-                        "real_bet_badge": h_rec.get("real_bet_badge"),
+                        "real_bet_badge": h_rec.get("badge_text") or h_rec.get("real_bet_badge"),
                         "real_bet_level": h_rec.get("real_bet_level", "none"),
                         "edge_ratio": h_rec.get("edge_ratio"),
                         "is_final_odds": h_rec.get("is_final_odds", False),
                         "confidence_score": float(h_rec.get("confidence_score") or 0.0),
-                        "is_virtual_bet_target": h_rec.get("is_virtual_bet_target", False),
+                        "is_virtual_bet_target": h_rec.get("is_virtual_bet", False) or h_rec.get("is_virtual_bet_target", False),
+                        "is_virtual_bet": h_rec.get("is_virtual_bet", False),
+                        "bet_category": h_rec.get("bet_category", "skip"),
+                        "badge_text": h_rec.get("badge_text"),
                         "virtual_bet_slot": h_rec.get("virtual_bet_slot"),
                         "virtual_badge": h_rec.get("virtual_badge"),
                         "race_name": r_name
@@ -364,6 +370,9 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["confidence_score"] = info.get("confidence_score", 0.0)
                 race["is_virtual_bet_target"] = info.get("is_virtual_bet_target", False)
                 race["virtual_bet_slot"] = info.get("virtual_bet_slot")
+                race["bet_category"] = info.get("bet_category", "skip")
+                race["is_virtual_bet"] = info.get("is_virtual_bet", False)
+                race["badge_text"] = info.get("badge_text") or badge_str
             else:
                 race["is_settled"] = 0
                 race["is_hit"] = 0
@@ -376,6 +385,9 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["confidence_score"] = 0.0
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
+                race["bet_category"] = "skip"
+                race["is_virtual_bet"] = False
+                race["badge_text"] = None
 
             # 確定済み見送りレース (is_settled == 1 かつ (is_pass == 1 または total_bet == 0)) の場合は実馬券対象外を徹底
             if race.get("is_settled") == 1 and (race.get("is_pass") == 1 or race.get("total_bet", 0) == 0):

@@ -808,19 +808,28 @@ def process_settlement_calculation(
 
     real_bet_meta = {
         "is_real_bet_target": bool((hybrid_rec or {}).get("is_real_bet_target", False)),
-        "real_bet_badge": (hybrid_rec or {}).get("real_bet_badge"),
+        "real_bet_badge": (hybrid_rec or {}).get("badge_text") or (hybrid_rec or {}).get("real_bet_badge"),
         "real_bet_level": (hybrid_rec or {}).get("real_bet_level", "none"),
-        "is_virtual_bet_target": bool((hybrid_rec or {}).get("is_virtual_bet_target", False)),
+        "is_virtual_bet_target": bool((hybrid_rec or {}).get("is_virtual_bet_target", False) or (hybrid_rec or {}).get("is_virtual_bet", False)),
         "virtual_bet_slot": (hybrid_rec or {}).get("virtual_bet_slot"),
+        "bet_category": (hybrid_rec or {}).get("bet_category", "skip"),
+        "badge_text": (hybrid_rec or {}).get("badge_text"),
         "edge_ratio": (hybrid_rec or {}).get("edge_ratio"),
         "is_final_odds": bool((hybrid_rec or {}).get("is_final_odds", False))
     }
 
     # ハイブリッド推奨を最優先で照合（見送りレース または 仮想馬券レース）
     if not hybrid_rec or not hybrid_rec.get("is_participate", False):
-        is_real = bool(real_bet_meta.get("is_real_bet_target") or real_bet_meta.get("real_bet_level") in ["high", "standard"])
+        b_cat = (hybrid_rec or {}).get("bet_category", "skip")
+        is_real = bool(
+            b_cat in ("super", "real")
+            or real_bet_meta.get("is_real_bet_target")
+            or real_bet_meta.get("real_bet_level") in ["high", "standard"]
+        )
         is_virt = bool(
-            (hybrid_rec or {}).get("is_virtual_bet_target")
+            b_cat == "virtual"
+            or (hybrid_rec or {}).get("is_virtual_bet")
+            or (hybrid_rec or {}).get("is_virtual_bet_target")
             or real_bet_meta.get("is_virtual_bet_target")
             or real_bet_meta.get("real_bet_level") == "virtual"
             or (real_bet_meta.get("real_bet_badge") and "仮想" in str(real_bet_meta.get("real_bet_badge")))
@@ -1165,7 +1174,10 @@ def process_settlement_calculation(
             "sanrentan_bets": sanrentan_bets,
             "trio_bets": trio_bets,
             "trio_bet": trio_bet,
-            "real_bet_meta": real_bet_meta
+            "real_bet_meta": real_bet_meta,
+            "bet_category": hybrid_rec.get("bet_category", "skip"),
+            "is_virtual_bet": hybrid_rec.get("is_virtual_bet", False),
+            "badge_text": hybrid_rec.get("badge_text")
         },
         "payout_details": all_hits,
         "mark_orders": mark_orders,

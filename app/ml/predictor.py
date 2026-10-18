@@ -182,7 +182,9 @@ def compute_hybrid_rec_from_inputs(
     force_final_odds: bool = False,
     real_trio_odds: Optional[dict] = None,
     track_bias_data: Optional[dict] = None,
-    is_daily_top_race: bool = False
+    is_daily_top_race: bool = False,
+    is_real_guarantee: bool = False,
+    is_virtual_guarantee: bool = False
 ) -> dict:
     """買い目戦略・調停・トリガミ防止・スリッページ停止判定を app/strategies/arbiter.py へ委任"""
     return _strategy_arbiter.evaluate_race(
@@ -199,7 +201,9 @@ def compute_hybrid_rec_from_inputs(
         force_final_odds=force_final_odds,
         real_trio_odds=real_trio_odds,
         track_bias_data=track_bias_data,
-        is_daily_top_race=is_daily_top_race
+        is_daily_top_race=is_daily_top_race,
+        is_real_guarantee=is_real_guarantee,
+        is_virtual_guarantee=is_virtual_guarantee
     )
 
 
@@ -890,6 +894,14 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
 
     r_date_str = (course_meta or {}).get("race_date") or today_jst_str()
     force_final_flag = bool((course_meta or {}).get("force_final_odds", False))
+    is_real_guarantee = bool((course_meta or {}).get("is_real_guarantee", False))
+    is_virtual_guarantee = bool((course_meta or {}).get("is_virtual_guarantee", False))
+    if not is_real_guarantee and not is_virtual_guarantee and race_id:
+        try:
+            from app.strategies.venue_guarantee import get_race_guarantee_status
+            is_real_guarantee, is_virtual_guarantee = get_race_guarantee_status(race_id, r_date_str)
+        except Exception:
+            pass
 
     c_det = (race_details or {}).get("course_details", "") if isinstance(race_details, dict) else ""
     surf_str = "芝" if "芝" in c_det else ("ダート" if "ダ" in c_det else "障害")
@@ -914,7 +926,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         force_final_odds=force_final_flag,
         real_trio_odds=trio_real_map,
         track_bias_data=track_bias_data,
-        is_daily_top_race=is_daily_top_race
+        is_daily_top_race=is_daily_top_race,
+        is_real_guarantee=is_real_guarantee,
+        is_virtual_guarantee=is_virtual_guarantee
     )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])
@@ -925,8 +939,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         f_amt = hybrid_rec.get("fukusho_amount", 0)
         tot_amt = hybrid_rec.get("total_amount", 0)
         st_type = hybrid_rec.get("strategy_type", "skip")
-        grd = "S" if st_type == "strategy_b" else ("A" if st_type == "strategy_a" else ("B" if st_type == "strategy_c" else "D"))
-        clabel = "超勝負R" if st_type == "strategy_b" else ("芝厳選" if st_type == "strategy_a" else ("ダート本命" if st_type == "strategy_c" else "見送り推奨"))
+        b_cat = hybrid_rec.get("bet_category", "skip")
+        grd = "S" if b_cat == "super" else ("A" if b_cat == "real" else ("B" if b_cat == "virtual" else "D"))
+        clabel = hybrid_rec.get("badge_text") or ("⭐勝負R" if b_cat == "super" else ("🎯実勝負" if b_cat == "real" else ("🎮仮想" if b_cat == "virtual" else "見送り推奨")))
         recommendation = {
             "target_umaban": u0 if is_p else (honmei_horse["umaban"] if honmei_horse else None),
             "horse_name": honmei_horse["horse_name"] if honmei_horse else None,
@@ -936,7 +951,10 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             "tansho_amount": t_amt,
             "fukusho_amount": f_amt,
             "total_amount": tot_amt,
-            "summary": hybrid_rec.get("summary", "")
+            "summary": hybrid_rec.get("summary", ""),
+            "bet_category": b_cat,
+            "is_virtual_bet": hybrid_rec.get("is_virtual_bet", False),
+            "badge_text": clabel
         }
 
     return {

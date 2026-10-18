@@ -7,6 +7,14 @@ app.strategies package
 
 from app.strategies.models import StrategyDecision, BetTicket
 from app.strategies.base import BaseBettingStrategy
+from app.strategies.strategy_super import StrategySuper
+from app.strategies.strategy_real import StrategyReal
+from app.strategies.strategy_virtual import StrategyVirtual
+from app.strategies.venue_guarantee import (
+    resolve_venue_guarantees_for_date,
+    get_race_guarantee_status,
+    invalidate_venue_guarantee_cache,
+)
 from app.strategies.strategy_b import StrategyB
 from app.strategies.strategy_a import StrategyA
 from app.strategies.strategy_c import StrategyC
@@ -27,6 +35,12 @@ __all__ = [
     "StrategyDecision",
     "BetTicket",
     "BaseBettingStrategy",
+    "StrategySuper",
+    "StrategyReal",
+    "StrategyVirtual",
+    "resolve_venue_guarantees_for_date",
+    "get_race_guarantee_status",
+    "invalidate_venue_guarantee_cache",
     "StrategyB",
     "StrategyA",
     "StrategyC",
