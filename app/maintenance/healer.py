@@ -419,10 +419,18 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
 
     now_dt = _now_jst_naive_fn() if _now_jst_naive_fn else datetime.datetime.now()
     sched_res = supabase.table("keiba_scheduled_races").select("*").eq("race_date", t_date).order("race_id").execute()
-    sched_rows = sched_res.data or []
+    raw_sched_rows = sched_res.data or []
+    # 【最重要ガード】JRA公式会場コード (04: 新潟, 05: 東京, 08: 京都) の正規レースのみを処理
+    sched_rows = [
+        sr for sr in raw_sched_rows
+        if len(sr.get("race_id", "")) == 12 and sr.get("race_id", "")[4:6] in {"04", "05", "08"}
+    ]
+    valid_rids = [sr["race_id"] for sr in sched_rows]
 
-    pred_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", t_date).execute()
-    pred_map = {r["race_id"]: (r.get("data_json") or {}) for r in (pred_res.data or []) if r.get("race_id")}
+    pred_map = {}
+    if valid_rids:
+        pred_res = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", valid_rids).execute()
+        pred_map = {r["race_id"]: (r.get("data_json") or {}) for r in (pred_res.data or []) if r.get("race_id")}
 
     settle_res = supabase.table("keiba_race_settlements").select("race_id, actual_order, is_pass, target_umaban").eq("race_date", t_date).execute()
     settle_rows = settle_res.data or []
@@ -491,6 +499,8 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
     if _today_races_cache_ref is not None:
         _today_races_cache_ref.pop(t_date, None)
     invalidate_summary_caches()
+    del pred_map
+    gc.collect()
 
     return {
         "status": "ok",

@@ -5,6 +5,7 @@ app/routers/summary.py
 日次収支サマリー、累計収支サマリー、開催日一覧 API ルーター
 """
 
+import gc
 from typing import List, Optional
 from fastapi import APIRouter, Query
 
@@ -66,20 +67,23 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
         except Exception as e:
             print(f"Supabaseサマリー取得エラー: {e}")
 
-    # 結果キャッシュと予想キャッシュを一括取得
+    # 結果キャッシュと予想キャッシュを一括取得 (確定済みの rows に含まれる race_id のみに限定し、OOMと42703エラーを完全根絶)
     res_cache_map = {}
     pred_cache_map = {}
     sched_map = {}
     if supabase and rows:
-        try:
-            res_cache = supabase.table("keiba_race_results_cache").select("race_id, result_json").eq("race_date", target_date).execute()
-            res_cache_map = {item["race_id"]: item.get("result_json", {}) for item in (res_cache.data or [])}
-            pred_cache = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
-            pred_cache_map = {item["race_id"]: item.get("data_json", {}) for item in (pred_cache.data or [])}
-            sched_res = supabase.table("keiba_scheduled_races").select("race_id, is_virtual_bet_target, virtual_bet_slot, real_bet_badge, real_bet_level, is_real_bet_target").eq("race_date", target_date).execute()
-            sched_map = {item["race_id"]: item for item in (sched_res.data or [])}
-        except Exception as e:
-            print(f"Supabaseサマリー用キャッシュ取得エラー: {e}")
+        settled_rids = [r["race_id"] for r in rows if r.get("race_id")]
+        if settled_rids:
+            try:
+                res_cache = supabase.table("keiba_race_results_cache").select("race_id, result_json").in_("race_id", settled_rids).execute()
+                res_cache_map = {item["race_id"]: item.get("result_json", {}) for item in (res_cache.data or [])}
+            except Exception as e:
+                print(f"Supabaseサマリー用結果キャッシュ取得エラー: {e}")
+            try:
+                pred_cache = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", settled_rids).execute()
+                pred_cache_map = {item["race_id"]: item.get("data_json", {}) for item in (pred_cache.data or [])}
+            except Exception as e:
+                print(f"Supabaseサマリー用予想キャッシュ取得エラー: {e}")
 
     pass_benefit_total = 0
     pass_avoided_losses = 0
@@ -348,7 +352,10 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="�
     umaren_payout_total = sum((r.get("umaren_payout") or 0) for r in rows if r.get("is_pass") == 0)
     trio_payout_total = sum((r.get("trio_payout") or 0) for r in rows if r.get("is_pass") == 0)
     umaren_rec = round((umaren_payout_total / umaren_bet_total) * 100.0, 2) if umaren_bet_total > 0 else 0.0
-    trio_rec = round((trio_payout_total / trio_bet_total) * 100.0, 2) if trio_bet_total > 0 else 0.0
+    del res_cache_map
+    del pred_cache_map
+    del sched_map
+    gc.collect()
 
     return DailySummary(
         target_date=target_date,
