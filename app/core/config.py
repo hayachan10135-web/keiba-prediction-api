@@ -9,6 +9,31 @@ import os
 from typing import Optional
 
 
+def _load_dotenv():
+    """ローカル起動時に .env ファイルから環境変数を読み込む"""
+    env_paths = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),
+        ".env"
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+
+_load_dotenv()
+
+
 class Settings:
     # 実行環境
     ENV: str = os.environ.get("ENV", "production")
