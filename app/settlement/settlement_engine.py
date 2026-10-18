@@ -34,6 +34,7 @@ _get_prediction_handler: Optional[Callable[[str], Optional[dict]]] = None
 _predict_race_core_handler: Optional[Callable[[str], dict]] = None
 _sync_virtual_badge_handler: Optional[Callable[[str, dict, Optional[str]], dict]] = None
 _period_venues_cache_ref: Optional[Dict[str, Any]] = None
+_notified_settlement_races: set = set()
 
 
 def set_settlement_engine_dependencies(
@@ -1179,9 +1180,25 @@ def process_settlement_calculation(
         except Exception:
             pass
 
-    # 実戦推奨レースの結果確定プッシュ通知
+    # 実戦推奨レースの結果確定プッシュ通知 (1レースにつき1回のみ送信・二重通知を物理根絶)
     is_today_race = (race_date == today_jst_str())
-    if not from_cache and is_today_race and hybrid_rec.get("is_real_bet_target") and _send_fcm_handler:
+    already_notified = (race_id in _notified_settlement_races)
+    if not already_notified and supabase and not bypass_cache:
+        try:
+            cached_s = get_cached_settlement(race_id)
+            if cached_s:
+                b_det_c = cached_s.get("bet_details") or {}
+                if isinstance(b_det_c, dict) and b_det_c.get("is_fcm_notified"):
+                    already_notified = True
+                    _notified_settlement_races.add(race_id)
+        except Exception:
+            pass
+
+    if not already_notified and not from_cache and is_today_race and hybrid_rec.get("is_real_bet_target") and _send_fcm_handler:
+        _notified_settlement_races.add(race_id)
+        if isinstance(settlement.get("bet_details"), dict):
+            settlement["bet_details"]["is_fcm_notified"] = True
+            save_settlement(settlement)
         try:
             if is_hit:
                 _send_fcm_handler(

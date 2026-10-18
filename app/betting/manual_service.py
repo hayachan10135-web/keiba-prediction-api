@@ -58,5 +58,24 @@ def execute_manual_bet(
         except Exception as e:
             print(f"[ManualBetService] [WARN] 台帳永続化エラー (発注自体は完了): {e}", file=sys.stderr)
 
+    # 3. 手動実機テスト投票完了プッシュ通知の配信
+    if not dry_run and bet_res.get("status") == "success":
+        try:
+            from main import send_fcm_notification
+            receipt_no = bet_res.get("receipt_no", "")
+            send_fcm_notification(
+                title=f"🎫【{client.platform_name}実機投票完了】{venue_name}{race_no}R",
+                body=f"受付番号:{receipt_no} / {len(items)}点 計{total_amount:,}円 投票完了！\n残高より正常に引き落とされました。",
+                data={
+                    "type": "MANUAL_BET_SUCCESS",
+                    "race_id": race_id,
+                    "receipt_no": str(receipt_no),
+                    "amount": str(total_amount),
+                    "mode": mode or "ipat"
+                }
+            )
+        except Exception as fe:
+            print(f"[ManualBetService] [WARN] FCM通知エラー: {fe}", file=sys.stderr)
+
     return bet_res
 
