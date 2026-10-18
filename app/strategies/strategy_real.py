@@ -125,3 +125,4 @@ class StrategyReal(BaseBettingStrategy):
             summary=summary,
             reason=reason_text
         )
+

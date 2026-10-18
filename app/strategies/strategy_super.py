@@ -111,3 +111,4 @@ class StrategySuper(BaseBettingStrategy):
             summary=summary,
             reason=f"【勝負R】採択 (芝好配当帯・Conf {confidence_score:.2f} >= 0.70 & EV {win_edge:.2f} >= 1.05)"
         )
+

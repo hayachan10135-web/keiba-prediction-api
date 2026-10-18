@@ -138,3 +138,4 @@ def get_race_guarantee_status(race_id: str, target_date: str) -> Tuple[bool, boo
 
     real_set, virt_set = resolve_venue_guarantees_for_date(target_date)
     return (race_id in real_set), (race_id in virt_set)
+
