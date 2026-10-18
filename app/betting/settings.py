@@ -57,17 +57,32 @@ def save_betting_settings_to_supabase(new_settings: dict) -> bool:
         return False
 
 
+import time
+
+_remaining_bet_cache = {
+    "timestamp": 0.0,
+    "target_date": None,
+    "result": (0, 0, [])
+}
+
+
 def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tuple[int, int, List[dict]]:
     """
     指定日（または本日/次回開催日）の未発走・未確定レースのうち、
     実馬券・勝負馬券に該当するレースの残り投票予定合計金額を計算する。
     戻り値: (残り合計金額, 該当レース数, 該当レース詳細リスト)
+    高速応答のために30秒間のインメモリキャッシュを持つ
     """
+    global _remaining_bet_cache
+    now_ts = time.time()
+    t_date = target_date or today_jst_str()
+    if _remaining_bet_cache["target_date"] == t_date and (now_ts - _remaining_bet_cache["timestamp"]) < 30.0:
+        return _remaining_bet_cache["result"]
+
     supabase = get_supabase_client()
     if not supabase:
         return 0, 0, []
 
-    t_date = target_date or today_jst_str()
     now_d = now_jst_naive()
 
     # 【重要ガード】朝08:30の一括事前予想前は、当日・未来日の投票予定額は未定（0円・0レース）とする
@@ -119,7 +134,7 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             dj = p_row.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             rid = p_row.get("race_id")
-            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and active_date == "2026-10-18")
+            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and t_date == "2026-10-18")
             if h_rec.get("is_real_bet_target") or is_special:
                 amt = int(h_rec.get("total_amount") or 0)
                 if amt == 0 and is_special:
@@ -134,7 +149,11 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
                         "badge": badge
                     })
 
-        return total_remaining_amount, len(real_target_races), real_target_races
+        res_val = (total_remaining_amount, len(real_target_races), real_target_races)
+        _remaining_bet_cache["timestamp"] = time.time()
+        _remaining_bet_cache["target_date"] = t_date
+        _remaining_bet_cache["result"] = res_val
+        return res_val
     except Exception as e:
         print(f"[RemainingBetAmount] 計算エラー: {e}")
         return 0, 0, []
