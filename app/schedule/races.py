@@ -345,7 +345,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_settled"] = 0
                 race["is_hit"] = 0
                 if formatted_date == "2026-10-18":
-                    race["is_real_bet_target"] = (rid in {"202604040201", "202608040701", "202605040702"})
+                    race["is_real_bet_target"] = (rid in {"202604040201", "202608040701", "202605040702", "202608040705"})
                 else:
                     race["is_real_bet_target"] = info.get("is_real_bet_target", False)
                 badge_str = info.get("real_bet_badge")
@@ -372,7 +372,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["virtual_bet_slot"] = None
 
             # 本日実機投票テスト対象レースの特別バッジ付与 (朝08:30以降)
-            if rid in {"202604040201", "202608040701", "202605040702"} and formatted_date == "2026-10-18" and not race.get("is_settled"):
+            if rid in {"202604040201", "202608040701", "202605040702", "202608040705"} and formatted_date == "2026-10-18" and not race.get("is_settled"):
                 if not race.get("is_real_bet_target"):
                     race["is_real_bet_target"] = True
                     race["real_bet_badge"] = "🧪【実機投票テスト】特別対象枠"

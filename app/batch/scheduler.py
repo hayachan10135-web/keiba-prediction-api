@@ -255,7 +255,7 @@ async def background_maintenance_loop():
                                 print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
 
                                 h_rec = pred_res.get("hybrid_recommendation") or {}
-                                is_special_test = (r_id in {"202604040201", "202608040701", "202605040702"} and today_str == "2026-10-18")
+                                is_special_test = (r_id in {"202604040201", "202608040701", "202605040702", "202608040705"} and today_str == "2026-10-18")
                                 if today_str == "2026-10-18":
                                     is_bet_target = is_special_test
                                 else:

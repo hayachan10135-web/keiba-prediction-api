@@ -124,7 +124,7 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             return 0, 0, []
 
         if active_date == "2026-10-18":
-            test_rids = {"202604040201", "202608040701", "202605040702"}
+            test_rids = {"202604040201", "202608040701", "202605040702", "202608040705"}
             unrun_rids = [r["race_id"] for r in unrun_races if r["race_id"] in test_rids]
         else:
             unrun_rids = [r["race_id"] for r in unrun_races]
@@ -148,7 +148,7 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             dj = p_row.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             rid = p_row.get("race_id")
-            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and active_date == "2026-10-18")
+            is_special = (rid in {"202604040201", "202608040701", "202605040702", "202608040705"} and active_date == "2026-10-18")
             if active_date == "2026-10-18":
                 is_target = is_special
                 amt = 100

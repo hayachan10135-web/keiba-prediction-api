@@ -995,7 +995,7 @@ def predict_race_core(
         else:
             try:
                 # 【重要軽量化】レース予想時に毎回36レース全件をSupabaseからフェッチする重い日次厳選処理を抑制
-                if target_race_date == "2026-10-18" and race_id in {"202604040201", "202608040701", "202605040702"}:
+                if target_race_date == "2026-10-18" and race_id in {"202604040201", "202608040701", "202605040702", "202608040705"}:
                     hr = resp_data.get("hybrid_recommendation")
                     if hr and isinstance(hr, dict):
                         hr["is_real_bet_target"] = True
