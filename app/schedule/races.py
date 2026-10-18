@@ -202,7 +202,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
 
         try:
             s_res = supabase.table("keiba_race_settlements").select(
-                "race_id, is_hit, is_pass, total_payout, total_bet, real_bet_badge, real_bet_level, is_real_bet_target, is_virtual_bet_target, bet_details, strategy_type"
+                "race_id, is_hit, is_pass, total_payout, total_bet, is_real_bet_target, is_virtual_bet_target, bet_details, strategy_type"
             ).eq("race_date", formatted_date).execute()
             for s_row in (s_res.data or []):
                 is_hit_val = 1 if (s_row.get("is_hit") == 1 and s_row.get("is_pass") == 0) else 0

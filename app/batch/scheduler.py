@@ -215,8 +215,20 @@ async def background_maintenance_loop():
                         .execute()
                     unpredicted_races = res_pred.data or []
 
+                    # 1ループあたりに実行する最大推論数を制限（メモリOOMバースト防止）
+                    predicted_count_this_loop = 0
+                    MAX_PREDICTIONS_PER_LOOP = 2
+
                     for r in unpredicted_races:
+                        if predicted_count_this_loop >= MAX_PREDICTIONS_PER_LOOP:
+                            break
+
                         r_id = r["race_id"]
+                        # 【最重要ガード】JRA公式の本日会場コード (04: 新潟, 05: 東京, 08: 京都) 以外の不正・過去レースは除外
+                        venue_code = r_id[4:6] if len(r_id) == 12 else ""
+                        if venue_code not in {"04", "05", "08"}:
+                            continue
+
                         p_dt_str = r.get("post_datetime")
                         cur_stage = int(r.get("is_predicted") or 0)
                         post_dt = _parse_post_datetime_fn(p_dt_str, today_str) if _parse_post_datetime_fn else None
@@ -229,6 +241,7 @@ async def background_maintenance_loop():
 
                         # Stage 5: 発走 5分前 (0 < mins <= 6.5) -> 最終オッズ推論 ＆ 確定通知
                         if mins_to_post <= 6.5 and cur_stage < 5:
+                            predicted_count_this_loop += 1
                             print(f"[Auto-Predict Stage5: 5分前最終確定] {r_id} ({r.get('race_name')}) の最終推論＆買い目確定を実行します...")
                             try:
                                 pred_res = await asyncio.to_thread(_predict_race_core_fn, r_id, True, True, "05m") if _predict_race_core_fn else {}
