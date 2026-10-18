@@ -160,6 +160,10 @@ def run_batch_worker(
                 except Exception:
                     pass
 
+            import gc, time
+            time.sleep(0.3)
+            gc.collect()
+
         batch_status["message"] = f"完了: 対象{len(work_items)}R処理 (新規予想{batch_status['predicted']}件 / 新規検証{batch_status['settled']}件)"
 
     except Exception as e:
