@@ -326,12 +326,14 @@ class UMACAClient(BaseBettingClient):
                 }
 
             # 4. 最終投票確定 (pw_742_i.cgi)
-            for i, nb_val in enumerate(active_nbs):
-                form_741[f"{i + 1:03d}"] = nb_val
+            # JRA公式 SendNB() と ToSend() を完全再現
+            for i in range(255):
+                key = f"{i + 1:03d}"
+                form_741[key] = active_nbs[i] if i < len(active_nbs) else "0"
             form_741["l"] = str(encoded_amount)
             form_741["s"] = str(encoded_amount)
-            form_741["p"] = self.pin
-            form_741["tou"] = "投票"
+            form_741.pop("p", None)
+            form_741.pop("tou", None)
 
             r_742 = self.session.post(
                 f"{self.BASE_URL}/pw_742_i.cgi",
