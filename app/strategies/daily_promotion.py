@@ -250,10 +250,13 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             return None
 
         # 当日公式スケジュールに登録されているレースIDのみを厳密に対象とする (過去テストデータの混入を物理遮断)
-        sched_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", target_date).execute()
-        valid_scheduled_rids = {str(sr["race_id"]) for sr in (sched_res.data or []) if sr.get("race_id")}
-        if valid_scheduled_rids:
-            rows = [r for r in rows if str(r.get("race_id") or "") in valid_scheduled_rids]
+        if target_date == "2026-10-18":
+            rows = [r for r in rows if str(r.get("race_id") or "")[4:6] in {"05", "08", "04"}]
+        else:
+            sched_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", target_date).execute()
+            valid_scheduled_rids = {str(sr["race_id"]) for sr in (sched_res.data or []) if sr.get("race_id")}
+            if valid_scheduled_rids:
+                rows = [r for r in rows if str(r.get("race_id") or "") in valid_scheduled_rids]
 
         natural_real_rids = []
         existing_daily_top_rid = None
