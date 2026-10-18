@@ -167,5 +167,13 @@ def predict_race_endpoint(race_id: str, force_refresh: bool = Query(False, descr
         raise HTTPException(status_code=400, detail="レースIDは12桁の数字で指定してください。")
     if not _predict_race_handler:
         raise HTTPException(status_code=500, detail="推論ハンドラーが未初期化です。")
-    return _predict_race_handler(race_id=race_id, force_refresh=force_refresh)
+    res = _predict_race_handler(race_id=race_id, force_refresh=force_refresh)
+    if isinstance(res, dict):
+        hr = res.get("hybrid_recommendation")
+        if hr and isinstance(hr, dict):
+            if hr.get("strategy_type") == "skip" or (hr.get("total_amount") or 0) == 0 or res.get("recommendation", {}).get("is_pass"):
+                hr["is_real_bet_target"] = False
+                hr["real_bet_badge"] = None
+                hr["real_bet_level"] = "none"
+    return res
 

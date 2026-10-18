@@ -744,6 +744,15 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                         hr["real_bet_badge"] = None
                         hr["virtual_badge"] = None
 
+        # 【整合性絶対保証】見送りレース (strategy_type == 'skip' または total_amount == 0 または recommendation.is_pass) は絶対に実馬券対象外にする
+        for p_obj in preds.values():
+            hr = p_obj.get("hybrid_recommendation")
+            if hr and isinstance(hr, dict):
+                if hr.get("strategy_type") == "skip" or (hr.get("total_amount") or 0) == 0 or p_obj.get("recommendation", {}).get("is_pass"):
+                    hr["is_real_bet_target"] = False
+                    hr["real_bet_badge"] = None
+                    hr["real_bet_level"] = "none"
+
         result_payload = {
             "date": target_date,
             "count": len(preds),

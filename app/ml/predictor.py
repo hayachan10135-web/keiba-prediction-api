@@ -927,7 +927,16 @@ def predict_race_core(
             return cached_pred
 
         if _sync_virtual_badge_handler:
-            return _sync_virtual_badge_handler(race_id, cached_pred, r_d_str)
+            cached_pred = _sync_virtual_badge_handler(race_id, cached_pred, r_d_str)
+
+        # 【整合性絶対保証】見送りレース (strategy_type == 'skip' または total_amount == 0) は絶対に実馬券対象外にする
+        hr_c = cached_pred.get("hybrid_recommendation")
+        if hr_c and isinstance(hr_c, dict):
+            if hr_c.get("strategy_type") == "skip" or (hr_c.get("total_amount") or 0) == 0:
+                hr_c["is_real_bet_target"] = False
+                hr_c["real_bet_badge"] = None
+                hr_c["real_bet_level"] = "none"
+
         return cached_pred
 
     # 出馬表スクレイピング
@@ -1027,7 +1036,16 @@ def predict_race_core(
                 pass
 
         if not is_before_morning_prediction(target_race_date) and _sync_virtual_badge_handler:
-            return _sync_virtual_badge_handler(race_id, resp_data, target_race_date)
+            resp_data = _sync_virtual_badge_handler(race_id, resp_data, target_race_date)
+
+        # 【整合性絶対保証】見送りレース (strategy_type == 'skip' または total_amount == 0) は絶対に実馬券対象外にする
+        hr_final = resp_data.get("hybrid_recommendation")
+        if hr_final and isinstance(hr_final, dict):
+            if hr_final.get("strategy_type") == "skip" or (hr_final.get("total_amount") or 0) == 0:
+                hr_final["is_real_bet_target"] = False
+                hr_final["real_bet_badge"] = None
+                hr_final["real_bet_level"] = "none"
+
         return resp_data
     except HTTPException:
         raise

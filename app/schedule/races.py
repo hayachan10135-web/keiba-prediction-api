@@ -377,6 +377,13 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
 
+            # 見送りレース (is_pass == 1 または total_bet == 0) の場合は実馬券対象外を徹底
+            if race.get("is_pass") == 1 or race.get("total_bet", 0) == 0:
+                race["is_real_bet_target"] = False
+                if race.get("real_bet_level") != "virtual":
+                    race["real_bet_level"] = "none"
+                    race["real_bet_badge"] = None
+
         # 過去日（昨日以前）の場合は既にレース結果が確定しているため、動的な仮想枠再選考・上書きはスキップ！
         if formatted_date < today_jst_str():
             continue
