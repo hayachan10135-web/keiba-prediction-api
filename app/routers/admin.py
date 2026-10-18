@@ -280,6 +280,19 @@ def endpoint_reset_special_test_flags():
         supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", r_id).execute()
         updated.append(r_id)
 
+    # 2. keiba_race_settlements の bet_details もクリーンアップ
+    s_res = supabase.table("keiba_race_settlements").select("race_id, bet_details").in_("race_id", target_rids).execute()
+    for s_row in (s_res.data or []):
+        r_id = s_row.get("race_id")
+        b_det = s_row.get("bet_details") or {}
+        if isinstance(b_det, dict) and "real_bet_meta" in b_det:
+            rb_meta = b_det["real_bet_meta"]
+            if isinstance(rb_meta, dict):
+                rb_meta["is_real_bet_target"] = False
+                rb_meta["real_bet_badge"] = None
+                rb_meta["real_bet_level"] = "none"
+            supabase.table("keiba_race_settlements").update({"bet_details": b_det}).eq("race_id", r_id).execute()
+
     try:
         from app.schedule.races import _today_races_cache
         _today_races_cache.clear()

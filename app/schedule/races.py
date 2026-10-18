@@ -250,11 +250,20 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                         is_virt_val = True
                         is_real_val = False
                         rb_level_val = "virtual"
-                    elif any(k in rb_badge_val for k in ["本日厳選", "勝負", "本線", "厳選", "推奨"]):
+                    elif "見送り" in rb_badge_val:
+                        is_real_val = False
+                    elif any(k in rb_badge_val for k in ["本日厳選", "勝負", "本線", "厳選", "実戦推奨"]):
                         is_real_val = True
                         is_virt_val = False
                         if rb_level_val == "none":
                             rb_level_val = "standard"
+
+                # 見送りレースまたは投票額0円の場合は絶対に実馬券対象外
+                if s_row.get("is_pass") == 1 or (s_row.get("total_bet") or 0) == 0:
+                    is_real_val = False
+                    if not is_virt_val:
+                        rb_level_val = "none"
+                        rb_badge_val = None
 
                 settled_map[s_row["race_id"]] = {
                     "is_settled": 1,
