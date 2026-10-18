@@ -618,8 +618,26 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
 
         js_key = f"{j_clean_str}_{surface_type}"
         jockey_surf_val = float(stats_dict.get("jockey_surface_stats", {}).get(js_key, 0.25))
-
         p1_class_diff_val = float(stat.get("prev1_class_diff", 0.0)) if stat else 0.0
+
+        # 前走道中押し上げ幅 (position_gain)
+        last_c1 = float(stat.get("last_corner_first", 8.0)) if stat else 8.0
+        last_cf = float(stat.get("last_corner_final", 8.0)) if stat else 8.0
+        prev1_pos_gain_val = float(last_c1 - last_cf)
+
+        extra10_feats = [
+            float(jt_rate_val),
+            float(kinryo_diff_prev_val),
+            float(p1_time_diff_val),
+            float(prev_time_diff_min_val),
+            float(p1_pop_order_diff_val),
+            float(p1_l3f_rank_val),
+            float(prev1_pos_gain_val),
+            float(horse_surf_val),
+            float(jockey_surf_val),
+            float(p1_class_diff_val),
+        ]
+        row58 = row48 + extra10_feats
 
         row50 = [
             float(fd["w"]), float(fd["u"]), float(k_val), float(venue_code), float(surface_type), float(distance), float(fd["dist_diff"]), float(condition_code),
@@ -636,7 +654,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             float(horse_surf_val), float(prev_time_diff_min_val), float(jockey_surf_val), float(p1_class_diff_val)
         ]
 
-        if expected_num_features == 50:
+        if expected_num_features == 58:
+            feature_rows.append(row58)
+        elif expected_num_features == 50:
             feature_rows.append(row50)
         elif expected_num_features == 48:
             feature_rows.append(row48)
@@ -649,7 +669,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         elif expected_num_features == 19:
             feature_rows.append(row25[:19])
         else:
-            feature_rows.append(row50[:expected_num_features] if len(row50) >= expected_num_features else row48[:expected_num_features])
+            feature_rows.append(row58[:expected_num_features] if len(row58) >= expected_num_features else row48[:expected_num_features])
 
     # 3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) 推論
     if model_win and model_top3:

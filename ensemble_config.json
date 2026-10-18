@@ -1,5 +1,6 @@
 {
-  "version": "1.0",
+  "version": "2.0_58features",
+  "num_features": 58,
   "features": [
     "wakuban",
     "umaban",
@@ -48,27 +49,37 @@
     "is_female_only",
     "kinryo_std_in_race",
     "sex_code",
-    "age"
+    "age",
+    "jockey_trainer_top3_rate",
+    "kinryo_diff_from_prev",
+    "prev1_time_diff",
+    "prev_time_diff_min",
+    "prev1_pop_order_diff",
+    "prev1_last_3f_rank",
+    "prev1_position_gain",
+    "horse_surface_top3_rate",
+    "jockey_surface_top3_rate",
+    "prev1_class_diff"
   ],
   "models": {
     "win": {
       "lightgbm": {
         "path": "lgb_win_model.txt",
-        "weight": 0.3
+        "weight": 0.4
       },
       "catboost": {
         "path": "cb_win_model.cbm",
-        "weight": 0.2
+        "weight": 0.3
       },
       "xgboost": {
         "path": "xgb_win_model.json",
-        "weight": 0.5
+        "weight": 0.3
       }
     },
     "top3": {
       "lightgbm": {
         "path": "lgb_top3_model.txt",
-        "weight": 0.2
+        "weight": 0.25
       },
       "catboost": {
         "path": "cb_top3_model.cbm",
@@ -76,12 +87,12 @@
       },
       "xgboost": {
         "path": "xgb_top3_model.json",
-        "weight": 0.5
+        "weight": 0.45
       }
     }
   },
   "evaluation_2026": {
-    "win_auc": 0.7894,
-    "top3_auc": 0.7847
+    "win_auc": 0.7921,
+    "top3_auc": 0.7873
   }
 }
