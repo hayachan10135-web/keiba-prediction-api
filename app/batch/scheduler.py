@@ -128,6 +128,7 @@ async def background_maintenance_loop():
     last_17h_settle_date = None
     last_19h_settle_date = None
     last_830_predict_date = None
+    healed_post_weight_rids = set()
 
     while True:
         try:
@@ -475,7 +476,7 @@ async def background_maintenance_loop():
                     past_rids_today = []
                     for sr in (res_all_sched.data or []):
                         sr_id = sr.get("race_id", "")
-                        if sr_id[4:6] not in {"04", "05", "08"}:
+                        if sr_id in healed_post_weight_rids or sr_id[4:6] not in {"04", "05", "08"}:
                             continue
                         p_dt = _parse_post_datetime_fn(sr.get("post_datetime"), today_str) if _parse_post_datetime_fn else None
                         if p_dt and now_dt >= p_dt:
@@ -484,16 +485,17 @@ async def background_maintenance_loop():
                         p_chk = supabase.table("keiba_predictions_cache").select("race_id, data_json").in_("race_id", past_rids_today).execute()
                         healed_cnt = 0
                         for prow in (p_chk.data or []):
-                            if healed_cnt >= 2:
-                                break
                             prid = prow.get("race_id")
                             pdj = prow.get("data_json") or {}
                             phorses = pdj.get("horses", [])
-                            if phorses and not any(h.get("horse_weight") is not None for h in phorses):
-                                if _predict_race_core_fn:
+                            if phorses and any(h.get("horse_weight") is not None for h in phorses):
+                                healed_post_weight_rids.add(prid)
+                            elif phorses:
+                                if healed_cnt < 2 and _predict_race_core_fn:
                                     await asyncio.to_thread(_predict_race_core_fn, prid, False, False, None)
-                                healed_cnt += 1
-                                gc.collect()
+                                    healed_cnt += 1
+                                    healed_post_weight_rids.add(prid)
+                                    gc.collect()
                 except Exception as he_loop:
                     print(f"[Scheduler] 発走後馬体重補完チェック警告: {he_loop}")
 

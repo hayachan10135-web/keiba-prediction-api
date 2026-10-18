@@ -5,6 +5,7 @@ app/maintenance/healer.py
 データ修復・自己回復・スキーマバージョン管理・過去開催一括同期エンジン
 """
 
+import gc
 import re
 import datetime
 from typing import Optional, Callable, Dict, Any, List, Set
@@ -240,8 +241,13 @@ def check_and_apply_db_migration():
         print(f"[DB Migration] バージョン確認エラー: {e}")
 
 
+_dates_normalized = False
+
 def normalize_mislabeled_dates():
     """2026-10-13等のフォールバック日および新潟0401の誤認日(2026-10-03)を正規の開催日へ修正"""
+    global _dates_normalized
+    if _dates_normalized:
+        return {"status": "ok", "message": "Already normalized"}
     supabase = get_supabase_client()
     if not supabase:
         print("[NormalizeDates] Supabase未接続のためスキップします。")
@@ -302,6 +308,7 @@ def normalize_mislabeled_dates():
         if migrated_settlements > 0 or migrated_results > 0 or migrated_predictions > 0:
             invalidate_summary_caches()
 
+        _dates_normalized = True
         msg = f"日付正規化完了: settlements={migrated_settlements}件, results={migrated_results}件, predictions={migrated_predictions}件"
         print(f"[NormalizeDates] {msg}")
         return {"status": "ok", "message": msg}

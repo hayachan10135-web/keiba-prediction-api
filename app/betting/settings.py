@@ -105,7 +105,10 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
         active_date = rows[0]["race_date"]
         if is_before_morning_prediction(active_date):
             return 0, 0, []
-        active_races = [r for r in rows if r["race_date"] == active_date]
+        active_races = [
+            r for r in rows
+            if r["race_date"] == active_date and len(r.get("race_id", "")) == 12 and r.get("race_id", "")[4:6] in {"04", "05", "08"}
+        ]
 
         unrun_races = []
         for r in active_races:
