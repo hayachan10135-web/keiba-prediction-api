@@ -995,22 +995,13 @@ def predict_race_core(
         else:
             try:
                 # 【重要軽量化】レース予想時に毎回36レース全件をSupabaseからフェッチする重い日次厳選処理を抑制
-                if target_race_date == "2026-10-18" and race_id in {"202604040201", "202608040701", "202605040702", "202608040705"}:
-                    hr = resp_data.get("hybrid_recommendation")
-                    if hr and isinstance(hr, dict):
-                        hr["is_real_bet_target"] = True
-                        hr["real_bet_badge"] = "🧪【実機投票テスト】特別対象枠"
-                        hr["real_bet_level"] = "standard"
-                        if int(hr.get("total_amount") or 0) == 0:
-                            hr["total_amount"] = 100
-                elif target_race_date != "2026-10-18":
-                    top_rid = get_or_select_daily_top_race_id(target_race_date)
-                    if top_rid == race_id:
-                        promoted_rid = ensure_daily_single_real_bet(target_race_date)
-                        if promoted_rid == race_id and not (resp_data.get("hybrid_recommendation") or {}).get("is_real_bet_target"):
-                            reloaded = _get_cached_pred_handler(race_id) if _get_cached_pred_handler else None
-                            if reloaded:
-                                resp_data = reloaded
+                top_rid = get_or_select_daily_top_race_id(target_race_date)
+                if top_rid == race_id:
+                    promoted_rid = ensure_daily_single_real_bet(target_race_date)
+                    if promoted_rid == race_id and not (resp_data.get("hybrid_recommendation") or {}).get("is_real_bet_target"):
+                        reloaded = _get_cached_pred_handler(race_id) if _get_cached_pred_handler else None
+                        if reloaded:
+                            resp_data = reloaded
             except Exception as de:
                 print(f"[predict_race_core] daily_top同期警告 ({race_id}): {de}")
             finally:

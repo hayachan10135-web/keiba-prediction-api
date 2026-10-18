@@ -255,13 +255,9 @@ async def background_maintenance_loop():
                                 print(f"[Auto-Predict Stage5] 確定完了: {r_id}")
 
                                 h_rec = pred_res.get("hybrid_recommendation") or {}
-                                is_special_test = (r_id in {"202604040201", "202608040701", "202605040702", "202608040705"} and today_str == "2026-10-18")
-                                if today_str == "2026-10-18":
-                                    is_bet_target = is_special_test
-                                else:
-                                    is_bet_target = bool(h_rec.get("is_real_bet_target"))
+                                is_bet_target = bool(h_rec.get("is_real_bet_target"))
                                 if is_bet_target:
-                                    badge = ("🧪【実機投票テスト】特別対象枠" if is_special_test else h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)"))
+                                    badge = h_rec.get("real_bet_badge", "🔥 実戦推奨(確定)")
                                     edge = h_rec.get("edge_ratio", 0.0)
                                     target_u = pred_res.get("recommendation", {}).get("target_umaban")
                                     if not target_u:
@@ -280,18 +276,7 @@ async def background_maintenance_loop():
                                         + (h_rec.get("trio_bets") or [])
                                         + (h_rec.get("sanrentan_bets") or [])
                                     )
-                                    if not all_tickets and is_special_test and target_u:
-                                        all_tickets = [
-                                            {
-                                                "ticket_type": "単勝",
-                                                "combination": [target_u],
-                                                "combination_str": f"{target_u}",
-                                                "amount": 100
-                                            }
-                                        ]
-                                        tot_amt = 100
-                                    else:
-                                        tot_amt = h_rec.get("total_amount", 0)
+                                    tot_amt = h_rec.get("total_amount", 0)
 
                                     bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])
 

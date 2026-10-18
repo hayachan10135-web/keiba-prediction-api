@@ -123,11 +123,7 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
         if not unrun_races:
             return 0, 0, []
 
-        if active_date == "2026-10-18":
-            test_rids = {"202604040201", "202608040701", "202605040702", "202608040705"}
-            unrun_rids = [r["race_id"] for r in unrun_races if r["race_id"] in test_rids]
-        else:
-            unrun_rids = [r["race_id"] for r in unrun_races]
+        unrun_rids = [r["race_id"] for r in unrun_races]
 
         if not unrun_rids:
             res_val = (0, 0, [])
@@ -148,15 +144,9 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             dj = p_row.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             rid = p_row.get("race_id")
-            is_special = (rid in {"202604040201", "202608040701", "202605040702", "202608040705"} and active_date == "2026-10-18")
-            if active_date == "2026-10-18":
-                is_target = is_special
-                amt = 100
-                badge = "🧪【実機投票テスト】特別対象枠"
-            else:
-                is_target = bool(h_rec.get("is_real_bet_target"))
-                amt = int(h_rec.get("total_amount") or 0)
-                badge = h_rec.get("real_bet_badge", "実戦推奨")
+            is_target = bool(h_rec.get("is_real_bet_target"))
+            amt = int(h_rec.get("total_amount") or 0)
+            badge = h_rec.get("real_bet_badge", "実戦推奨")
 
             if is_target and amt > 0:
                 total_remaining_amount += amt
