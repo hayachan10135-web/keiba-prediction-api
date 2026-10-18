@@ -333,8 +333,10 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 # 未確定レース: 予測キャッシュから反映
                 race["is_settled"] = 0
                 race["is_hit"] = 0
-                race["is_pass"] = 0
-                race["is_real_bet_target"] = info.get("is_real_bet_target", False)
+                if formatted_date == "2026-10-18":
+                    race["is_real_bet_target"] = (rid in {"202604040201", "202608040701", "202605040702"})
+                else:
+                    race["is_real_bet_target"] = info.get("is_real_bet_target", False)
                 badge_str = info.get("real_bet_badge")
                 if badge_str and isinstance(badge_str, str):
                     badge_str = badge_str.replace("🎯", "⭐")

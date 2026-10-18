@@ -120,7 +120,18 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
         if not unrun_races:
             return 0, 0, []
 
-        unrun_rids = [r["race_id"] for r in unrun_races]
+        if active_date == "2026-10-18":
+            test_rids = {"202604040201", "202608040701", "202605040702"}
+            unrun_rids = [r["race_id"] for r in unrun_races if r["race_id"] in test_rids]
+        else:
+            unrun_rids = [r["race_id"] for r in unrun_races]
+
+        if not unrun_rids:
+            res_val = (0, 0, [])
+            _remaining_bet_cache["timestamp"] = time.time()
+            _remaining_bet_cache["target_date"] = t_date
+            _remaining_bet_cache["result"] = res_val
+            return res_val
 
         p_res = supabase.table("keiba_predictions_cache")\
             .select("race_id, data_json")\
@@ -134,20 +145,24 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             dj = p_row.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             rid = p_row.get("race_id")
-            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and t_date == "2026-10-18")
-            if h_rec.get("is_real_bet_target") or is_special:
+            is_special = (rid in {"202604040201", "202608040701", "202605040702"} and active_date == "2026-10-18")
+            if active_date == "2026-10-18":
+                is_target = is_special
+                amt = 100
+                badge = "🧪【実機投票テスト】特別対象枠"
+            else:
+                is_target = bool(h_rec.get("is_real_bet_target"))
                 amt = int(h_rec.get("total_amount") or 0)
-                if amt == 0 and is_special:
-                    amt = 100
-                if amt > 0:
-                    total_remaining_amount += amt
-                    badge = ("🧪【実機投票テスト】特別対象枠" if is_special and not h_rec.get("is_real_bet_target") else h_rec.get("real_bet_badge", "実戦推奨"))
-                    real_target_races.append({
-                        "race_id": p_row["race_id"],
-                        "race_name": dj.get("race_name", p_row["race_id"]),
-                        "amount": amt,
-                        "badge": badge
-                    })
+                badge = h_rec.get("real_bet_badge", "実戦推奨")
+
+            if is_target and amt > 0:
+                total_remaining_amount += amt
+                real_target_races.append({
+                    "race_id": p_row["race_id"],
+                    "race_name": dj.get("race_name", p_row["race_id"]),
+                    "amount": amt,
+                    "badge": badge
+                })
 
         res_val = (total_remaining_amount, len(real_target_races), real_target_races)
         _remaining_bet_cache["timestamp"] = time.time()
