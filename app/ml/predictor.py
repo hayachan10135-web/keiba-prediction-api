@@ -15,6 +15,8 @@ import math
 import re
 import time
 import datetime
+import numpy as np
+import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple, Callable
 from fastapi import HTTPException
 
@@ -26,6 +28,11 @@ from app.ml.model_loader import (
     model_top3,
     model_gachi,
     model_himo,
+    model_cb_win,
+    model_cb_top3,
+    model_xgb_win,
+    model_xgb_top3,
+    ensemble_config,
     stats_dict,
 )
 from app.ml.track_bias import compute_track_bias_and_matches
@@ -37,6 +44,27 @@ from app.strategies import (
 )
 
 _strategy_arbiter = StrategyArbiter()
+
+DEFAULT_FEATURES_48 = [
+    "wakuban", "umaban", "kinryo",
+    "venue_code", "surface_type", "distance", "distance_diff", "condition_code",
+    "career_races", "career_top3_rate",
+    "prev1_order", "prev1_pop", "prev1_odds", "prev2_order", "days_since_prev",
+    "jockey_top3_rate", "jockey_course_top3_rate",
+    "trainer_top3_rate", "trainer_course_top3_rate",
+    "head_count", "relative_umaban", "kinryo_diff_from_mean",
+    "jockey_rank_in_race", "trainer_rank_in_race", "prev1_order_rank_in_race",
+    "is_blinker", "is_first_blinker",
+    "is_turf_to_dirt", "is_dirt_to_turf",
+    "is_dist_shorten_200m", "is_dist_lengthen_200m",
+    "is_tataki_2nd",
+    "prev1_last_3f", "prev1_corner_final",
+    "prev1_is_front", "prev1_is_closer",
+    "horse_weight", "weight_diff", "abs_weight_diff", "weight_ratio",
+    "turn_type", "is_turn_change",
+    "race_num", "race_class_code", "is_female_only", "kinryo_std_in_race",
+    "sex_code", "age"
+]
 
 ODDS_STAGE_ORDER = ["0830", "60m", "30m", "15m", "05m"]
 ODDS_STAGE_RANK = {"0830": 1, "60m": 2, "30m": 3, "15m": 4, "05m": 5}
@@ -623,19 +651,66 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             feature_rows.append(row50[:expected_num_features] if len(row50) >= expected_num_features else row48[:expected_num_features])
 
-    # Model B (Win/Top3) 推論
+    # 3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) 推論
     if model_win and model_top3:
         try:
             n_win = model_win.num_feature()
             n_top3 = model_top3.num_feature()
-            w_scores = model_win.predict([r[:n_win] for r in feature_rows], num_threads=4)
-            t_scores = model_top3.predict([r[:n_top3] for r in feature_rows], num_threads=4)
+            inp_win = [r[:n_win] for r in feature_rows]
+            inp_top3 = [r[:n_top3] for r in feature_rows]
+
+            # 1. LightGBM 推論
+            w_lgb = np.array(model_win.predict(inp_win, num_threads=4))
+            t_lgb = np.array(model_top3.predict(inp_top3, num_threads=4))
+
+            # 重み設定 (ensemble_config または デフォルト)
+            cfg_win = (ensemble_config or {}).get("models", {}).get("win", {})
+            wt_lgb_w = float(cfg_win.get("lightgbm", {}).get("weight", 0.30))
+            wt_cb_w = float(cfg_win.get("catboost", {}).get("weight", 0.20))
+            wt_xgb_w = float(cfg_win.get("xgboost", {}).get("weight", 0.50))
+
+            cfg_top3 = (ensemble_config or {}).get("models", {}).get("top3", {})
+            wt_lgb_t = float(cfg_top3.get("lightgbm", {}).get("weight", 0.20))
+            wt_cb_t = float(cfg_top3.get("catboost", {}).get("weight", 0.30))
+            wt_xgb_t = float(cfg_top3.get("xgboost", {}).get("weight", 0.50))
+
+            # 2. CatBoost 推論
+            if model_cb_win and model_cb_top3:
+                w_cb = np.array(model_cb_win.predict_proba(inp_win)[:, 1])
+                t_cb = np.array(model_cb_top3.predict_proba(inp_top3)[:, 1])
+            else:
+                w_cb, t_cb = w_lgb, t_lgb
+                wt_lgb_w += wt_cb_w
+                wt_lgb_t += wt_cb_t
+                wt_cb_w = 0.0
+                wt_cb_t = 0.0
+
+            # 3. XGBoost 推論
+            if model_xgb_win and model_xgb_top3:
+                import xgboost as xgb
+                feat_names = (ensemble_config or {}).get("features", DEFAULT_FEATURES_48)
+                df_win = pd.DataFrame(inp_win, columns=feat_names[:n_win])
+                df_top3 = pd.DataFrame(inp_top3, columns=feat_names[:n_top3])
+                d_win = xgb.DMatrix(df_win)
+                d_top3 = xgb.DMatrix(df_top3)
+                w_xgb = np.array(model_xgb_win.predict(d_win))
+                t_xgb = np.array(model_xgb_top3.predict(d_top3))
+            else:
+                w_xgb, t_xgb = w_lgb, t_lgb
+                wt_lgb_w += wt_xgb_w
+                wt_lgb_t += wt_xgb_t
+                wt_xgb_w = 0.0
+                wt_xgb_t = 0.0
+
+            w_scores = wt_lgb_w * w_lgb + wt_cb_w * w_cb + wt_xgb_w * w_xgb
+            t_scores = wt_lgb_t * t_lgb + wt_cb_t * t_cb + wt_xgb_t * t_xgb
+
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(w_scores[idx]), 4)
                 h["prob_top3"] = round(float(t_scores[idx]), 4)
                 h["score"] = h["prob_win"]
         except Exception as e:
-            raise RuntimeError(f"AIモデル(Win/Top3)推論エラー ({race_id}): {e}")
+            raise RuntimeError(f"AIアンサンブル推論エラー ({race_id}): {e}")
     elif model:
         try:
             n_mod = model.num_feature()

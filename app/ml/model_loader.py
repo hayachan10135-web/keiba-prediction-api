@@ -22,6 +22,11 @@ MAIDEN_WIN_MODEL_PATH = "lgb_maiden_win_model.txt"
 MAIDEN_TOP3_MODEL_PATH = "lgb_maiden_top3_model.txt"
 GACHI_MODEL_PATH = "lgb_gachi_model.txt"
 HIMO_MODEL_PATH = "lgb_himo_model.txt"
+CB_WIN_MODEL_PATH = "cb_win_model.cbm"
+CB_TOP3_MODEL_PATH = "cb_top3_model.cbm"
+XGB_WIN_MODEL_PATH = "xgb_win_model.json"
+XGB_TOP3_MODEL_PATH = "xgb_top3_model.json"
+ENSEMBLE_CONFIG_PATH = "ensemble_config.json"
 DICT_PATH = "stats_dict.json"
 
 # --- グローバルモデルインスタンス ---
@@ -32,6 +37,13 @@ model_maiden_win: Optional[lgb.Booster] = None
 model_maiden_top3: Optional[lgb.Booster] = None
 model_gachi: Optional[lgb.Booster] = None
 model_himo: Optional[lgb.Booster] = None
+
+# 3大GBDTアンサンブルモデル
+model_cb_win: Optional[Any] = None
+model_cb_top3: Optional[Any] = None
+model_xgb_win: Optional[Any] = None
+model_xgb_top3: Optional[Any] = None
+ensemble_config: Optional[dict] = None
 
 stats_dict: Dict[str, Any] = {
     "jockey_stats": {},
@@ -101,6 +113,42 @@ def load_all_models():
             print("中波乱判定メタモデル (m_himo) を正常にロードしました。")
         except Exception as e:
             print(f"中波乱判定メタモデルロード失敗: {e}")
+
+    # CatBoost モデルのロード
+    global model_cb_win, model_cb_top3
+    if os.path.exists(CB_WIN_MODEL_PATH) and os.path.exists(CB_TOP3_MODEL_PATH):
+        try:
+            from catboost import CatBoostClassifier
+            model_cb_win = CatBoostClassifier()
+            model_cb_win.load_model(CB_WIN_MODEL_PATH)
+            model_cb_top3 = CatBoostClassifier()
+            model_cb_top3.load_model(CB_TOP3_MODEL_PATH)
+            print("CatBoostアンサンブルモデル (cb_win / cb_top3) を正常にロードしました。")
+        except Exception as e:
+            print(f"CatBoostモデルロード失敗: {e}")
+
+    # XGBoost モデルのロード
+    global model_xgb_win, model_xgb_top3
+    if os.path.exists(XGB_WIN_MODEL_PATH) and os.path.exists(XGB_TOP3_MODEL_PATH):
+        try:
+            import xgboost as xgb
+            model_xgb_win = xgb.Booster()
+            model_xgb_win.load_model(XGB_WIN_MODEL_PATH)
+            model_xgb_top3 = xgb.Booster()
+            model_xgb_top3.load_model(XGB_TOP3_MODEL_PATH)
+            print("XGBoostアンサンブルモデル (xgb_win / xgb_top3) を正常にロードしました。")
+        except Exception as e:
+            print(f"XGBoostモデルロード失敗: {e}")
+
+    # アンサンブル設定 (ensemble_config.json) のロード
+    global ensemble_config
+    if os.path.exists(ENSEMBLE_CONFIG_PATH):
+        try:
+            with open(ENSEMBLE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                ensemble_config = json.load(f)
+            print("アンサンブル設定 (ensemble_config.json) を正常にロードしました。")
+        except Exception as e:
+            print(f"アンサンブル設定ロード失敗: {e}")
 
     if os.path.exists(DICT_PATH):
         try:
