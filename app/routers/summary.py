@@ -352,6 +352,7 @@ def get_daily_summary_endpoint(date: Optional[str] = Query(None, description="é›
     umaren_payout_total = sum((r.get("umaren_payout") or 0) for r in rows if r.get("is_pass") == 0)
     trio_payout_total = sum((r.get("trio_payout") or 0) for r in rows if r.get("is_pass") == 0)
     umaren_rec = round((umaren_payout_total / umaren_bet_total) * 100.0, 2) if umaren_bet_total > 0 else 0.0
+    trio_rec = round((trio_payout_total / trio_bet_total) * 100.0, 2) if trio_bet_total > 0 else 0.0
     del res_cache_map
     del pred_cache_map
     del sched_map
