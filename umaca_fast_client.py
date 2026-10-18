@@ -366,7 +366,12 @@ class UMACAFastClient:
             if encoded_count == 0:
                 return {"status": "failed", "step": "encode_tickets", "error": "有効な買い目がありません"}
 
-            r_741 = self.session.post(f"{self.BASE_URL}/pw_741_i.cgi", data=form_s, timeout=12)
+            r_741 = self.session.post(
+                f"{self.BASE_URL}/pw_741_i.cgi",
+                data=form_s,
+                headers={"Referer": f"{self.BASE_URL}/pw_740_i.cgi"},
+                timeout=12
+            )
             html_741 = self._decode_euc(r_741)
 
             # 確認画面の Nb 配列を検証 (先頭文字 '1' = 正常発売中, '2' = 締切, '3' = 取消)
@@ -403,8 +408,15 @@ class UMACAFastClient:
                 form_741[f"{i + 1:03d}"] = nb_val
             form_741["l"] = str(encoded_amount)
             form_741["s"] = str(encoded_amount)
+            form_741["p"] = self.pin
+            form_741["tou"] = "投票"
 
-            r_742 = self.session.post(f"{self.BASE_URL}/pw_742_i.cgi", data=form_741, timeout=15)
+            r_742 = self.session.post(
+                f"{self.BASE_URL}/pw_742_i.cgi",
+                data=form_741,
+                headers={"Referer": f"{self.BASE_URL}/pw_741_i.cgi"},
+                timeout=15
+            )
             html_742 = self._decode_euc(r_742)
 
             if "エラー" in html_742 and "受け付けました" not in html_742:
