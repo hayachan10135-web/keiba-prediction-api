@@ -377,8 +377,8 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 race["is_virtual_bet_target"] = False
                 race["virtual_bet_slot"] = None
 
-            # 見送りレース (is_pass == 1 または total_bet == 0) の場合は実馬券対象外を徹底
-            if race.get("is_pass") == 1 or race.get("total_bet", 0) == 0:
+            # 確定済み見送りレース (is_settled == 1 かつ (is_pass == 1 または total_bet == 0)) の場合は実馬券対象外を徹底
+            if race.get("is_settled") == 1 and (race.get("is_pass") == 1 or race.get("total_bet", 0) == 0):
                 race["is_real_bet_target"] = False
                 if race.get("real_bet_level") != "virtual":
                     race["real_bet_level"] = "none"
