@@ -513,7 +513,8 @@ async def background_maintenance_loop():
                     past_rids_today = []
                     for sr in (res_all_sched.data or []):
                         sr_id = sr.get("race_id", "")
-                        if sr_id in healed_post_weight_rids or sr_id[4:6] not in {"04", "05", "08"}:
+                        v_code = sr_id[4:6] if len(sr_id) == 12 else ""
+                        if sr_id in healed_post_weight_rids or not (v_code.isdigit() and 1 <= int(v_code) <= 10):
                             continue
                         p_dt = _parse_post_datetime_fn(sr.get("post_datetime"), today_str) if _parse_post_datetime_fn else None
                         if p_dt and now_dt >= p_dt:
@@ -557,9 +558,9 @@ async def background_maintenance_loop():
                             break
 
                         r_id = r["race_id"]
-                        # 【最重要ガード】JRA公式の本日会場コード (04: 新潟, 05: 東京, 08: 京都) 以外の不正レースは除外
+                        # 【安全ガード】JRA公式会場コード (01〜10) 以外の不正レースは除外
                         venue_code = r_id[4:6] if len(r_id) == 12 else ""
-                        if venue_code not in {"04", "05", "08"}:
+                        if not (venue_code.isdigit() and 1 <= int(venue_code) <= 10):
                             continue
 
                         p_dt_str = r.get("post_datetime")

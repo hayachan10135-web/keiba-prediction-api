@@ -427,10 +427,10 @@ def heal_today_weights_and_results(target_date: Optional[str] = None, force_rese
     now_dt = _now_jst_naive_fn() if _now_jst_naive_fn else datetime.datetime.now()
     sched_res = supabase.table("keiba_scheduled_races").select("*").eq("race_date", t_date).order("race_id").execute()
     raw_sched_rows = sched_res.data or []
-    # 【最重要ガード】JRA公式会場コード (04: 新潟, 05: 東京, 08: 京都) の正規レースのみを処理
+    # 【安全ガード】JRA公式会場コード (01〜10) の正規レースのみを処理
     sched_rows = [
         sr for sr in raw_sched_rows
-        if len(sr.get("race_id", "")) == 12 and sr.get("race_id", "")[4:6] in {"04", "05", "08"}
+        if len(sr.get("race_id", "")) == 12 and sr.get("race_id", "")[4:6].isdigit() and 1 <= int(sr.get("race_id", "")[4:6]) <= 10
     ]
     valid_rids = [sr["race_id"] for sr in sched_rows]
 

@@ -449,10 +449,16 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                             except Exception as ue:
                                 print(f"仮想枠キャッシュ同期エラー ({vr_id}): {ue}")
 
-        # 会場内でトップ3から漏れた全レース（新馬・障害含む）の仮想枠ステータスを「見送り(none)」に完全整合 (未確定レース対象)
+        # 会場内でトップ3から漏れたレースのうち、自然適格枠でも実馬券でもないレースのみ「見送り(none)」に整合 (未確定レース対象)
         for other_r in races_in_venue:
             or_id = other_r.get("race_id")
-            if or_id and or_id not in top3_virtual_ids and not other_r.get("is_real_bet_target") and not other_r.get("is_settled"):
+            if (
+                or_id
+                and or_id not in top3_virtual_ids
+                and not other_r.get("is_real_bet_target")
+                and not other_r.get("is_settled")
+                and other_r.get("bet_category") != "virtual"
+            ):
                 other_r["is_virtual_bet_target"] = False
                 other_r["virtual_bet_slot"] = None
                 other_r["real_bet_level"] = "none"
@@ -460,7 +466,7 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 if or_id in raw_preds_cache:
                     c_d = raw_preds_cache[or_id]
                     c_hrec = c_d.get("hybrid_recommendation")
-                    if c_hrec and (
+                    if c_hrec and c_hrec.get("bet_category") != "virtual" and (
                         c_hrec.get("real_bet_level") == "virtual"
                         or c_hrec.get("is_virtual_bet_target")
                         or c_hrec.get("virtual_badge") is not None

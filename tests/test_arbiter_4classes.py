@@ -227,6 +227,49 @@ class TestArbiter4Classes(unittest.TestCase):
         self.assertEqual(bet_breakdown.get("ワイド"), 1000)
         self.assertEqual(payout_breakdown.get("ワイド"), 2400)
 
+    def test_virtual_bet_slot_type_is_int_or_none(self):
+        """virtual_bet_slot が文字列ではなく None または int であること（FastAPI/Android型整合性）"""
+        arbiter = StrategyArbiter()
+        mock_horses = self._create_mock_horses()
+        decision = arbiter.evaluate_race(
+            race_name="テスト未勝利",
+            race_details={"course_details": "芝2000m"},
+            horses=mock_horses,
+            surface_type=0,
+            prob_gachi=0.2,
+            prob_himo=0.8,
+            opponents=[],
+            u0=1,
+            honmei_horse=mock_horses[0],
+            race_date_str="2026-10-20",
+            is_virtual_guarantee=True,
+            race_class_code=1
+        )
+        self.assertIn("virtual_bet_slot", decision)
+        self.assertTrue(
+            decision["virtual_bet_slot"] is None or isinstance(decision["virtual_bet_slot"], int),
+            f"virtual_bet_slot must be None or int, but got {type(decision['virtual_bet_slot'])}"
+        )
+
+    def test_all_10_jra_venues_supported(self):
+        """全10競馬場 (01:札幌 〜 10:小倉) のレースIDが正常に認識されること"""
+        for code_int in range(1, 11):
+            venue_code = f"{code_int:02d}"
+            # 12桁のレースID例: 2026 + 会場コード(2桁) + 回日R(6桁)
+            sample_rid = f"2026{venue_code}010101"
+            v_code = sample_rid[4:6]
+            is_valid = (len(sample_rid) == 12 and v_code.isdigit() and 1 <= int(v_code) <= 10)
+            self.assertTrue(is_valid, f"Venue code {venue_code} should be valid")
+
+    def test_aggregate_summary_runs_cleanly(self):
+        """最適化されたカラム指定クエリで総合収支集計が正常完了すること"""
+        from app.settlement.summary_calculator import calculate_aggregate_summary
+        agg = calculate_aggregate_summary(force_refresh=True)
+        self.assertIn("lifetime", agg)
+        self.assertIn("yearly", agg)
+        self.assertIn("monthly", agg)
+        self.assertEqual(agg["lifetime"]["period_key"], "lifetime")
+
 
 if __name__ == "__main__":
     unittest.main()

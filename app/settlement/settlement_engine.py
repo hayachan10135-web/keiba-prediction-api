@@ -598,13 +598,9 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 except Exception as t3e:
                     print(f"[Settlement Top3 Sync Warning] {race_id}: {t3e}")
 
-            is_virtual_or_pass = bool(
-                d.get("is_pass")
-                or d.get("strategy_type") == "virtual"
-                or (d.get("hit_type") and "仮想" in str(d.get("hit_type")))
-            )
+            is_pass_race = bool(d.get("is_pass") == 1 or d.get("is_pass") is True)
 
-            if is_virtual_or_pass:
+            if is_pass_race:
                 if pred_cache and res_cache:
                     h_rec = pred_cache.get("hybrid_recommendation") if pred_cache else None
                     expected_target_u = (pred_cache.get("recommendation") or {}).get("target_umaban")

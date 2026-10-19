@@ -295,7 +295,7 @@ class StrategyArbiter:
             "is_final_odds": is_final_odds,
             # 仮想馬券フィールド
             "is_virtual_bet_target": (decision.bet_category in ("super", "real", "virtual")),
-            "virtual_bet_slot": decision.bet_category if decision.bet_category in ("super", "real", "virtual") else None,
+            "virtual_bet_slot": None,
             "virtual_strategy_name": virtual_strategy_name,
             "virtual_badge": virtual_badge,
             "virtual_bets": virtual_bets,

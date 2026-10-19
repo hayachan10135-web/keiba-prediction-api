@@ -207,7 +207,7 @@ def calculate_aggregate_summary(force_refresh: bool = False) -> dict:
             page_size = 1000
             while True:
                 cum_res = supabase.table("keiba_race_settlements").select(
-                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details, bet_category, is_real_bet_target, is_virtual_bet"
+                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_category, is_real_bet_target, is_virtual_bet"
                 ).range(page * page_size, (page + 1) * page_size - 1).execute()
                 batch = cum_res.data or []
                 cum_rows.extend(batch)

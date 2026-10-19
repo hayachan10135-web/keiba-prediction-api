@@ -108,7 +108,7 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
             return 0, 0, []
         active_races = [
             r for r in rows
-            if r["race_date"] == active_date and len(r.get("race_id", "")) == 12 and r.get("race_id", "")[4:6] in {"04", "05", "08"}
+            if r["race_date"] == active_date and len(r.get("race_id", "")) == 12 and r.get("race_id", "")[4:6].isdigit() and 1 <= int(r.get("race_id", "")[4:6]) <= 10
         ]
 
         unrun_races = []
