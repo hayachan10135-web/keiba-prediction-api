@@ -138,8 +138,27 @@ class StrategyArbiter:
             month_num = now_jst_naive().month
         is_summer = 1 if 6 <= month_num <= 9 else 0
 
+        # レースクラス判定 (新馬:0, 未勝利:1, 1勝C:2, 2勝C:3, 3勝C:4, オープン:5)
+        def infer_race_class_code(r_name: str) -> int:
+            if any(w in r_name for w in ["新馬", "メイクデビュー"]):
+                return 0
+            elif "未勝利" in r_name:
+                return 1
+            elif any(w in r_name for w in ["1勝", "１勝", "500万"]):
+                return 2
+            elif any(w in r_name for w in ["2勝", "２勝", "1000万"]):
+                return 3
+            elif any(w in r_name for w in ["3勝", "３勝", "1600万"]):
+                return 4
+            elif any(w in r_name for w in ["オープン", "OP", "ＯＰ", "G1", "Ｇ１", "G2", "Ｇ２", "G3", "Ｇ３", "重賞", "ステークス", "(L)", "特別", "記念", "カップ"]):
+                return 5
+            return 2  # デフォルト1勝C
+
+        race_class_code = infer_race_class_code(race_name)
+
         race_info = {
             "race_name": race_name,
+            "race_class_code": race_class_code,
             "surface_type": surface_type,
             "prob_gachi": prob_gachi,
             "is_daily_top_race": is_daily_top_race,

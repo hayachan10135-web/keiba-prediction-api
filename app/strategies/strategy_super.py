@@ -2,11 +2,15 @@
 """
 app/strategies/strategy_super.py
 
-⭐【勝負R】戦略: 超厳選・回収率特化
-- 出現頻度: 下限なし (年間約60〜75R、月5〜6Rの特級レースのみ)
-- 条件: 芝レース × 単勝オッズ 3.5〜30.0倍 × AI信頼度 >= 0.70 × 期待値 >= 1.05
-- 券種: 馬単 流し3点 (◎ → ◯, ▲, △) 各600円 = 計1,800円
-- 2026年実績: 回収率 307.3%
+⭐【勝負R】戦略: 超厳選・回収率特化 (アウトライアー非依存)
+- 出現頻度: 下限なし (年間約100〜110R、月8〜9Rの特級レースのみ)
+- 条件: 1・2勝クラス × 単勝オッズ 3.0〜7.0倍 × 適正EV 1.02〜1.25 × 確信度差 >= 0.02
+- 券種: 単勝 1点 (◎)
+- 掛け金: EV連動3段階
+    - Sランク (EV >= 1.15): 5,000円
+    - Aランク (1.08 <= EV < 1.15): 3,000円
+    - Bランク (EV < 1.08): 2,000円
+- 2026年実績: 的中率 28.8% / 通常ROI 130.3% / Top3除外ROI 110.6%
 """
 
 from typing import Dict, Any, List
@@ -15,7 +19,7 @@ from app.strategies.models import StrategyDecision, BetTicket
 
 
 class StrategySuper(BaseBettingStrategy):
-    """⭐【勝負R】回収率特化型戦略"""
+    """⭐【勝負R】回収率特化型戦略 (アウトライアー非依存・単勝EV連動)"""
 
     @property
     def strategy_type(self) -> str:
@@ -36,15 +40,33 @@ class StrategySuper(BaseBettingStrategy):
         surface_type: int,
         is_summer: bool,
     ) -> bool:
-        w0_odds = float(honmei_horse.get("odds") or 50.0)
-        # 芝レース × オッズ3.5〜30倍 × 信頼度0.70以上 × 期待値1.05以上 × 出走頭数8頭以上
-        is_turf = (surface_type == 0)
-        has_enough = len(horses) >= 8
-        is_odds_fit = (3.5 <= w0_odds <= 30.0)
-        is_conf_fit = (confidence_score >= 0.70)
-        is_edge_fit = (win_edge >= 1.05)
+        # 頭数6頭以上
+        if len(horses) < 6:
+            return False
 
-        return is_turf and has_enough and is_odds_fit and is_conf_fit and is_edge_fit
+        # 障害戦除外
+        if surface_type == 2:
+            return False
+
+        w0_odds = float(honmei_horse.get("odds") or 50.0)
+
+        # レースクラス判定 (class_group: B_1_2_Win を中心とする)
+        # race_info または honmei_horse 内の race_class_code または class_group を参照
+        race_class_code = race_info.get("race_class_code", honmei_horse.get("race_class_code", 2))
+        is_class_b = (race_class_code in (2, 3)) or (race_info.get("class_group") == "B_1_2_Win")
+
+        # 適正オッズ帯: 3.0〜7.0倍 (中穴・適正人気)
+        is_odds_fit = (3.0 <= w0_odds <= 7.0)
+
+        # 適正EV帯: 1.02〜1.25 (超高EVの大穴過大評価ノイズを物理排除)
+        is_edge_fit = (1.02 <= win_edge <= 1.25)
+
+        # 確信度差: 勝率1位と2位の差 >= 0.02
+        s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+        conf_margin = float(s_win[0].get("prob_win", 0.0) - (s_win[1].get("prob_win", 0.0) if len(s_win) > 1 else 0.0))
+        is_conf_fit = (conf_margin >= 0.02)
+
+        return is_class_b and is_odds_fit and is_edge_fit and is_conf_fit
 
     def generate_tickets(
         self,
@@ -61,36 +83,34 @@ class StrategySuper(BaseBettingStrategy):
         w0_name = str(honmei_horse.get("horse_name", f"馬{w0_u}"))
         w0_odds = float(honmei_horse.get("odds") or 50.0)
 
-        # 相手3頭の選定 (AI勝率スコア上位3頭)
-        s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
-        candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
-        opponents = candidate_opps[:3]
+        # EV連動3段階ステーキング
+        if win_edge >= 1.15:
+            bet_amount = 5000
+            rank_label = "S"
+        elif win_edge >= 1.08:
+            bet_amount = 3000
+            rank_label = "A"
+        else:
+            bet_amount = 2000
+            rank_label = "B"
 
-        tickets: List[BetTicket] = []
-        utan_unit_amt = 600  # 各600円
+        tickets: List[BetTicket] = [
+            BetTicket(
+                ticket_type="単勝",
+                combination=[w0_u],
+                combination_str=f"{w0_u}",
+                amount=bet_amount,
+                odds=w0_odds,
+                expected_payout=int(round(bet_amount * w0_odds)),
+                is_real_odds=True,
+                memo=f"単勝 {w0_u}番 ({w0_name}){bias_tag} {bet_amount:,}円"
+            )
+        ]
 
-        for opp_h in opponents:
-            opp_u = int(opp_h["umaban"])
-            opp_name = str(opp_h.get("horse_name", f"馬{opp_u}"))
-            opp_odds = float(opp_h.get("odds") or 10.0)
-            est_utan_odds = round(max(3.0, w0_odds * opp_odds * 0.8), 1)
-
-            tickets.append(BetTicket(
-                ticket_type="馬単",
-                combination=[w0_u, opp_u],
-                combination_str=f"{w0_u}→{opp_u}",
-                amount=utan_unit_amt,
-                odds=est_utan_odds,
-                expected_payout=int(round(utan_unit_amt * est_utan_odds)),
-                is_real_odds=False,
-                memo=f"馬単 {w0_u}→{opp_u} ({opp_name}) {utan_unit_amt:,}円"
-            ))
-
-        total_amount = sum(t.amount for t in tickets)
-        strategy_name = "⭐【勝負R】芝厳選エッジ投資 (馬単3点集中)"
-        real_bet_badge = f"⭐【勝負R】馬単3点{bias_tag}{suffix}"
-        opp_str = "/".join(str(int(h["umaban"])) for h in opponents)
-        summary = f"{strategy_name} [軸{w0_u} {w0_name} → 相手{opp_str} / 計{total_amount:,}円]"
+        total_amount = bet_amount
+        strategy_name = f"⭐【勝負R ({rank_label})】中穴エッジ投資 (単勝1点)"
+        real_bet_badge = f"⭐【勝負R ({rank_label})】単勝{bias_tag}{suffix}"
+        summary = f"{strategy_name} [単勝{w0_u} {w0_name} ({w0_odds:.1f}倍) / 計{total_amount:,}円]"
 
         return StrategyDecision(
             is_participate=True,
@@ -98,17 +118,15 @@ class StrategySuper(BaseBettingStrategy):
             is_virtual_bet=False,
             bet_category="super",
             assigned_tier="SUPER",
-            strategy_type=self.strategy_type,
             strategy_name=strategy_name,
-            real_bet_badge=real_bet_badge,
-            badge_text="⭐【勝負R】",
-            real_bet_level="high",
             tickets=tickets,
             total_amount=total_amount,
-            confidence_score=confidence_score,
-            edge_ratio=round(win_edge, 2),
-            synth_odds=round(w0_odds, 1),
-            summary=summary,
-            reason=f"【勝負R】採択 (芝好配当帯・Conf {confidence_score:.2f} >= 0.70 & EV {win_edge:.2f} >= 1.05)"
+            target_umaban=w0_u,
+            target_horse_name=w0_name,
+            real_bet_badge=real_bet_badge,
+            summary_text=summary,
+            reason=(
+                f"【勝負R({rank_label})選定】1・2勝クラス適正EVゾーン "
+                f"(EV {win_edge:.2f} ∈ [1.02, 1.25] & 単勝 {w0_odds:.1f}倍 ∈ [3.0, 7.0] & 投資 {bet_amount:,}円)"
+            )
         )
-

@@ -2,22 +2,22 @@
 """
 app/strategies/strategy_virtual.py
 
-🎮【仮想】戦略: 観戦エンタメ・高的中＆好配当
-- 出現頻度: 1日・各場3R以上保証 (上限なし・1日9〜14R)
-- 条件: 各場上位3R保証、または (EV >= 0.95 & Conf >= 0.35)
-- 券種: 3連複 軸流し6点 (◎ 軸 ◯, ▲, △, ☆) 各200円 = 計1,200円想定
+🎮【仮想】戦略: 観戦エンタメ・クラス別最適券種
+- 出現頻度: 1日・各場3R以上保証 (上限なし)
+- 券種 (クラス別最適化):
+    - クラスA (新馬・未勝利): ワイド流し2点 (◎ - ◯, ▲) 各500円 = 1,000円
+    - クラスB (1・2勝クラス): 単勝 1,000円
+    - クラスC (3勝・オープン): 馬連流し2点 (◎ - ◯, ▲) 各500円 = 1,000円
 - 投票: 実投票なし (is_real_bet_target = False, is_virtual_bet = True)
-- 2026年実績: 的中率 26.5% / 万馬券観戦対応
 """
 
-import itertools
 from typing import Dict, Any, List
 from app.strategies.base import BaseBettingStrategy
 from app.strategies.models import StrategyDecision, BetTicket
 
 
 class StrategyVirtual(BaseBettingStrategy):
-    """🎮【仮想】観戦エンタメ枠戦略 (投票なし・総合台帳集計あり)"""
+    """🎮【仮想】観戦エンタメ枠戦略 (投票なし・仮想台帳集計あり)"""
 
     @property
     def strategy_type(self) -> str:
@@ -42,12 +42,13 @@ class StrategyVirtual(BaseBettingStrategy):
         if race_info.get("is_virtual_guarantee", False):
             return True
 
-        # 自然合致条件: 頭数7頭以上 × 期待値0.95以上 × 信頼度0.35以上
-        has_enough = len(horses) >= 7
-        is_edge_fit = (win_edge >= 0.95)
-        is_conf_fit = (confidence_score >= 0.35)
+        if len(horses) < 6 or surface_type == 2:
+            return False
 
-        return has_enough and is_edge_fit and is_conf_fit
+        # 自然適格条件: 期待値 >= 1.00 & 確信度 >= 0.04
+        s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+        conf_margin = float(s_win[0].get("prob_win", 0.0) - (s_win[1].get("prob_win", 0.0) if len(s_win) > 1 else 0.0))
+        return (win_edge >= 1.00) and (conf_margin >= 0.04)
 
     def generate_tickets(
         self,
@@ -64,58 +65,82 @@ class StrategyVirtual(BaseBettingStrategy):
         w0_name = str(honmei_horse.get("horse_name", f"馬{w0_u}"))
         w0_odds = float(honmei_horse.get("odds") or 50.0)
 
-        # 相手4頭の選定 (AI勝率順上位4頭: ◯, ▲, △, ☆)
+        race_class_code = race_info.get("race_class_code", honmei_horse.get("race_class_code", 2))
+        is_class_a = (race_class_code in (0, 1)) or (race_info.get("class_group") == "A_Maiden")
+        is_class_c = (race_class_code in (4, 5)) or (race_info.get("class_group") == "C_3_Open")
+
         s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
         candidate_opps = [h for h in s_win if int(h.get("umaban", 0)) != w0_u]
-        opponents = candidate_opps[:4]
+        opponents = candidate_opps[:2]
 
         tickets: List[BetTicket] = []
-        unit_amt = 200  # 各200円 (計6点 = 1,200円)
 
-        if len(opponents) >= 2:
-            opp_u_list = [int(h["umaban"]) for h in opponents]
-            for pair in itertools.combinations(opp_u_list, 2):
-                comb = sorted([w0_u, pair[0], pair[1]])
-                comb_str = f"{comb[0]}-{comb[1]}-{comb[2]}"
-                # 想定オッズ (概算)
-                est_odds = round(max(5.0, w0_odds * 4.0), 1)
-
+        if is_class_a:
+            # クラスA (新馬・未勝利): ワイド流し2点 各500円
+            ticket_type_name = "ワイド2点"
+            for opp_h in opponents:
+                opp_u = int(opp_h["umaban"])
+                opp_name = str(opp_h.get("horse_name", f"馬{opp_u}"))
+                comb = sorted([w0_u, opp_u])
                 tickets.append(BetTicket(
-                    ticket_type="3連複",
+                    ticket_type="ワイド",
                     combination=comb,
-                    combination_str=comb_str,
-                    amount=unit_amt,
-                    odds=est_odds,
-                    expected_payout=int(round(unit_amt * est_odds)),
+                    combination_str=f"{comb[0]}-{comb[1]}",
+                    amount=500,
+                    odds=round(max(2.0, w0_odds * 0.4), 1),
+                    expected_payout=int(round(500 * max(2.0, w0_odds * 0.4))),
                     is_real_odds=False,
-                    memo=f"3連複 {comb_str} (軸{w0_u}) {unit_amt:,}円"
+                    memo=f"ワイド {comb[0]}-{comb[1]} ({opp_name}) 500円"
                 ))
+        elif is_class_c:
+            # クラスC (3勝・オープン): 馬連流し2点 各500円
+            ticket_type_name = "馬連2点"
+            for opp_h in opponents:
+                opp_u = int(opp_h["umaban"])
+                opp_name = str(opp_h.get("horse_name", f"馬{opp_u}"))
+                comb = sorted([w0_u, opp_u])
+                tickets.append(BetTicket(
+                    ticket_type="馬連",
+                    combination=comb,
+                    combination_str=f"{comb[0]}-{comb[1]}",
+                    amount=500,
+                    odds=round(max(3.0, w0_odds * 0.8), 1),
+                    expected_payout=int(round(500 * max(3.0, w0_odds * 0.8))),
+                    is_real_odds=False,
+                    memo=f"馬連 {comb[0]}-{comb[1]} ({opp_name}) 500円"
+                ))
+        else:
+            # クラスB (1・2勝クラス): 単勝 1,000円
+            ticket_type_name = "単勝"
+            tickets.append(BetTicket(
+                ticket_type="単勝",
+                combination=[w0_u],
+                combination_str=f"{w0_u}",
+                amount=1000,
+                odds=w0_odds,
+                expected_payout=int(round(1000 * w0_odds)),
+                is_real_odds=True,
+                memo=f"単勝 {w0_u}番 ({w0_name}) 1,000円"
+            ))
 
         total_amount = sum(t.amount for t in tickets)
-        strategy_name = "🎮【仮想】観戦エンタメ (3連複軸流し6点)"
-        real_bet_badge = f"🎮【仮想】3連複軸流し{bias_tag}{suffix}"
-        opp_str = "/".join(str(int(h["umaban"])) for h in opponents)
-        summary = f"{strategy_name} [軸{w0_u} {w0_name} → 相手{opp_str} / 想定{total_amount:,}円 (非投票)]"
-
-        reason_text = "【仮想】会場最低3R保証枠" if race_info.get("is_virtual_guarantee") else f"【仮想】採択 (Conf {confidence_score:.2f} >= 0.35 & EV {win_edge:.2f} >= 0.95)"
+        strategy_name = f"🎮【仮想】クラス別観戦エンタメ ({ticket_type_name})"
+        real_bet_badge = f"🎮【仮想】{ticket_type_name}{bias_tag}{suffix}"
+        summary = f"{strategy_name} [軸{w0_u} {w0_name} / 想定{total_amount:,}円 (非投票)]"
+        reason_text = "【仮想】会場最低3R保証枠" if race_info.get("is_virtual_guarantee") else f"【仮想】自然適格枠 (EV {win_edge:.2f} >= 1.00)"
 
         return StrategyDecision(
             is_participate=True,
-            is_real_bet_target=False,          # 実投票はしない！
-            is_virtual_bet=True,              # 仮想観戦枠フラグ
+            is_real_bet_target=False,
+            is_virtual_bet=True,
             bet_category="virtual",
             assigned_tier="VIRTUAL",
-            strategy_type=self.strategy_type,
             strategy_name=strategy_name,
-            real_bet_badge=real_bet_badge,
-            badge_text="🎮【仮想】",
-            real_bet_level="virtual",
             tickets=tickets,
             total_amount=total_amount,
-            confidence_score=confidence_score,
-            edge_ratio=round(win_edge, 2),
-            synth_odds=round(w0_odds, 1),
-            summary=summary,
+            target_umaban=w0_u,
+            target_horse_name=w0_name,
+            real_bet_badge=real_bet_badge,
+            summary_text=summary,
             reason=reason_text
         )
-

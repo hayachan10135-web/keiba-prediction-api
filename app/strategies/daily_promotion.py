@@ -387,51 +387,29 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
 
         tansho_bets = []
         fukusho_bets = []
-        if is_dirt:
-            d_tan = 700
-            d_fuku = 300
-            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】ダート適性単複 (0R時昇格)"
-        elif w0_odds >= 5.0:
-            d_tan = 500
-            d_fuku = 500
-            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝妙味単複 (0R時昇格)"
-        else:
-            d_tan = 700
-            d_fuku = 300
-            h_rec["strategy_name"] = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            h_rec["real_bet_badge"] = "⭐【本日厳選No.1】芝本命単複 (0R時昇格)"
+        bet_amount = 300
+        h_rec["strategy_name"] = f"🔰【実勝負(保証)】日次1R参加・少額防衛 (複勝{bet_amount:,}円)"
+        h_rec["real_bet_badge"] = "🔰【実勝負(保証)】複勝 (0R時昇格)"
 
-        tansho_bets.append({
-            "ticket_type": "単勝",
-            "combination": [w0_u],
-            "combination_str": f"{w0_u}",
-            "amount": d_tan,
-            "odds": w0_odds,
-            "expected_payout": int(round(d_tan * w0_odds)),
-            "is_real_odds": True,
-            "memo": f"単勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_tan}円"
-        })
         est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
         fukusho_bets.append({
             "ticket_type": "複勝",
             "combination": [w0_u],
             "combination_str": f"{w0_u}",
-            "amount": d_fuku,
+            "amount": bet_amount,
             "odds": est_fuku_odds,
-            "expected_payout": int(round(d_fuku * est_fuku_odds)),
+            "expected_payout": int(round(bet_amount * est_fuku_odds)),
             "is_real_odds": False,
-            "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}) {d_fuku}円"
+            "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}) {bet_amount:,}円"
         })
 
-        h_rec["tansho_bets"] = tansho_bets
+        h_rec["tansho_bets"] = []
         h_rec["fukusho_bets"] = fukusho_bets
-        h_rec["tansho_amount"] = d_tan
-        h_rec["fukusho_amount"] = d_fuku
+        h_rec["tansho_amount"] = 0
+        h_rec["fukusho_amount"] = bet_amount
         h_rec["umatan_amount"] = 0
-        h_rec["total_amount"] = d_tan + d_fuku
-        h_rec["summary"] = f"{h_rec['strategy_name']}：単勝{d_tan}円＋複勝{d_fuku}円 計{d_tan+d_fuku}円"
+        h_rec["total_amount"] = bet_amount
+        h_rec["summary"] = f"{h_rec['strategy_name']}：複勝{bet_amount:,}円"
         h_rec["is_virtual_bet_target"] = True
         h_rec["virtual_bets"] = tansho_bets + fukusho_bets
         h_rec["virtual_total_amount"] = d_tan + d_fuku

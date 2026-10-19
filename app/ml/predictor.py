@@ -32,6 +32,13 @@ from app.ml.model_loader import (
     model_cb_top3,
     model_xgb_win,
     model_xgb_top3,
+    model_class_a_win,
+    model_class_a_top3,
+    model_class_b_win,
+    model_class_b_top3,
+    model_class_c_win,
+    model_class_c_top3,
+    calibration_table,
     ensemble_config,
     stats_dict,
 )
@@ -728,6 +735,40 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
 
             w_scores = wt_lgb_w * w_lgb + wt_cb_w * w_cb + wt_xgb_w * w_xgb
             t_scores = wt_lgb_t * t_lgb + wt_cb_t * t_cb + wt_xgb_t * t_xgb
+
+            # クラス別特化モデル (A/B/C) がロードされている場合はクラス別推論 & キャリブレーションで上書き
+            target_class_code = race_class_code
+            m_cls_w, m_cls_t, cls_key = None, None, None
+            if target_class_code in (0, 1) and model_class_a_win and model_class_a_top3:
+                m_cls_w, m_cls_t, cls_key = model_class_a_win, model_class_a_top3, "class_a"
+            elif target_class_code in (2, 3) and model_class_b_win and model_class_b_top3:
+                m_cls_w, m_cls_t, cls_key = model_class_b_win, model_class_b_top3, "class_b"
+            elif target_class_code in (4, 5) and model_class_c_win and model_class_c_top3:
+                m_cls_w, m_cls_t, cls_key = model_class_c_win, model_class_c_top3, "class_c"
+
+            if m_cls_w and m_cls_t:
+                try:
+                    n_cw = m_cls_w.num_feature()
+                    n_ct = m_cls_t.num_feature()
+                    inp_cw = [r[:n_cw] for r in feature_rows]
+                    inp_ct = [r[:n_ct] for r in feature_rows]
+                    raw_cw = np.array(m_cls_w.predict(inp_cw, num_threads=4))
+                    raw_ct = np.array(m_cls_t.predict(inp_ct, num_threads=4))
+
+                    # キャリブレーション補正
+                    cal_info = (calibration_table or {}).get(cls_key, {})
+                    w_cal_tab = cal_info.get("win_calib", [])
+                    t_cal_tab = cal_info.get("top3_calib", [])
+
+                    def _calib(val, tab):
+                        if not tab: return val
+                        diffs = [abs(e.get("pred", 0.0) - val) for e in tab]
+                        return float(tab[int(np.argmin(diffs))].get("calib", val))
+
+                    w_scores = np.array([_calib(v, w_cal_tab) for v in raw_cw])
+                    t_scores = np.array([_calib(v, t_cal_tab) for v in raw_ct])
+                except Exception as ex_cls:
+                    print(f"クラス別モデル推論フォールバック ({cls_key}): {ex_cls}")
 
             for idx, h in enumerate(horses):
                 h["prob_win"] = round(float(w_scores[idx]), 4)

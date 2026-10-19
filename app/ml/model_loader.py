@@ -15,19 +15,30 @@ import lightgbm as lgb
 from app.core.database import get_supabase_client
 from app.core.timezone import today_jst_str, now_jst
 
-MODEL_PATH = "lgb_model.txt"
-WIN_MODEL_PATH = "lgb_win_model.txt"
-TOP3_MODEL_PATH = "lgb_top3_model.txt"
-MAIDEN_WIN_MODEL_PATH = "lgb_maiden_win_model.txt"
-MAIDEN_TOP3_MODEL_PATH = "lgb_maiden_top3_model.txt"
-GACHI_MODEL_PATH = "lgb_gachi_model.txt"
-HIMO_MODEL_PATH = "lgb_himo_model.txt"
-CB_WIN_MODEL_PATH = "cb_win_model.cbm"
-CB_TOP3_MODEL_PATH = "cb_top3_model.cbm"
-XGB_WIN_MODEL_PATH = "xgb_win_model.json"
-XGB_TOP3_MODEL_PATH = "xgb_top3_model.json"
-ENSEMBLE_CONFIG_PATH = "ensemble_config.json"
-DICT_PATH = "stats_dict.json"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+MODEL_PATH = os.path.join(BASE_DIR, "lgb_model.txt")
+WIN_MODEL_PATH = os.path.join(BASE_DIR, "lgb_win_model.txt")
+TOP3_MODEL_PATH = os.path.join(BASE_DIR, "lgb_top3_model.txt")
+MAIDEN_WIN_MODEL_PATH = os.path.join(BASE_DIR, "lgb_maiden_win_model.txt")
+MAIDEN_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "lgb_maiden_top3_model.txt")
+GACHI_MODEL_PATH = os.path.join(BASE_DIR, "lgb_gachi_model.txt")
+HIMO_MODEL_PATH = os.path.join(BASE_DIR, "lgb_himo_model.txt")
+CB_WIN_MODEL_PATH = os.path.join(BASE_DIR, "cb_win_model.cbm")
+CB_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "cb_top3_model.cbm")
+XGB_WIN_MODEL_PATH = os.path.join(BASE_DIR, "xgb_win_model.json")
+XGB_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "xgb_top3_model.json")
+ENSEMBLE_CONFIG_PATH = os.path.join(BASE_DIR, "ensemble_config.json")
+DICT_PATH = os.path.join(BASE_DIR, "stats_dict.json")
+
+# クラス別特化モデル (A:新馬未勝利, B:1・2勝C, C:3勝オープン)
+CLASS_A_WIN_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_a_win.txt")
+CLASS_A_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_a_top3.txt")
+CLASS_B_WIN_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_b_win.txt")
+CLASS_B_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_b_top3.txt")
+CLASS_C_WIN_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_c_win.txt")
+CLASS_C_TOP3_MODEL_PATH = os.path.join(BASE_DIR, "models", "lgb_class_c_top3.txt")
+CALIBRATION_TABLE_PATH = os.path.join(BASE_DIR, "models", "calibration_table.json")
 
 # --- グローバルモデルインスタンス ---
 model: Optional[lgb.Booster] = None
@@ -37,6 +48,15 @@ model_maiden_win: Optional[lgb.Booster] = None
 model_maiden_top3: Optional[lgb.Booster] = None
 model_gachi: Optional[lgb.Booster] = None
 model_himo: Optional[lgb.Booster] = None
+
+# クラス別特化モデル
+model_class_a_win: Optional[lgb.Booster] = None
+model_class_a_top3: Optional[lgb.Booster] = None
+model_class_b_win: Optional[lgb.Booster] = None
+model_class_b_top3: Optional[lgb.Booster] = None
+model_class_c_win: Optional[lgb.Booster] = None
+model_class_c_top3: Optional[lgb.Booster] = None
+calibration_table: Dict[str, Any] = {}
 
 # 3大GBDTアンサンブルモデル
 model_cb_win: Optional[Any] = None
@@ -157,6 +177,25 @@ def load_all_models():
             print("統計辞書を正常にロードしました。")
         except Exception as e:
             print(f"統計辞書ロード失敗: {e}")
+
+    # クラス別特化モデル (A/B/C) のロード
+    global model_class_a_win, model_class_a_top3, model_class_b_win, model_class_b_top3, model_class_c_win, model_class_c_top3, calibration_table
+    try:
+        if os.path.exists(CLASS_A_WIN_MODEL_PATH):
+            model_class_a_win = lgb.Booster(model_file=CLASS_A_WIN_MODEL_PATH)
+            model_class_a_top3 = lgb.Booster(model_file=CLASS_A_TOP3_MODEL_PATH)
+        if os.path.exists(CLASS_B_WIN_MODEL_PATH):
+            model_class_b_win = lgb.Booster(model_file=CLASS_B_WIN_MODEL_PATH)
+            model_class_b_top3 = lgb.Booster(model_file=CLASS_B_TOP3_MODEL_PATH)
+        if os.path.exists(CLASS_C_WIN_MODEL_PATH):
+            model_class_c_win = lgb.Booster(model_file=CLASS_C_WIN_MODEL_PATH)
+            model_class_c_top3 = lgb.Booster(model_file=CLASS_C_TOP3_MODEL_PATH)
+        if os.path.exists(CALIBRATION_TABLE_PATH):
+            with open(CALIBRATION_TABLE_PATH, "r", encoding="utf-8") as f:
+                calibration_table = json.load(f)
+        print("クラス別特化モデル (A/B/C) およびキャリブレーション辞書を正常にロードしました。")
+    except Exception as e:
+        print(f"クラス別モデルロード警告: {e}")
 
 
 # モジュールインポート時に自動ロード
