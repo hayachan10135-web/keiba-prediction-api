@@ -57,6 +57,9 @@ class Settings:
     FIREBASE_KEY_PATH: str = os.environ.get("FIREBASE_KEY_PATH", "firebase_service_account.json")
     FIREBASE_SERVICE_ACCOUNT_KEY: str = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", "")
 
+    # API 認証設定
+    API_KEY: str = os.environ.get("API_KEY", "")
+
     # 安全ガードレール定数（決定済み仕様）
     SLIPPAGE_ROI_BORDER: float = 105.0        # 期待回収率 105.0% 未満でスリッページ停止
     MAX_DELAY_MINUTES: int = 30               # 当初発走時刻から30分以上の遅延で自動投票中止

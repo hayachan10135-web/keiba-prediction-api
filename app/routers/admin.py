@@ -28,7 +28,6 @@ from app.scrapers import (
 from app.maintenance import (
     CURRENT_DB_VERSION,
     clear_all_database,
-    fix_mislabeled_20261011_races,
     normalize_mislabeled_dates,
     sync_and_process_target_dates,
     heal_settlement_marks,
@@ -220,32 +219,9 @@ def endpoint_clear_db(sync_today: bool = False):
     return res
 
 
-@router.post("/admin/fix-20261011")
-def endpoint_fix_20261011():
-    return fix_mislabeled_20261011_races()
-
-
-def sync_and_process_1003_1004():
-    return sync_and_process_target_dates(["2026-10-03", "2026-10-04"])
-
-
-def sync_and_process_0926_0927():
-    return sync_and_process_target_dates(["2026-09-26", "2026-09-27"])
-
-
 @router.post("/admin/normalize-dates")
 def endpoint_normalize_dates():
     return normalize_mislabeled_dates()
-
-
-@router.post("/admin/process-1003-1004")
-def endpoint_process_1003_1004():
-    return sync_and_process_1003_1004()
-
-
-@router.post("/admin/process-0926-0927")
-def endpoint_process_0926_0927():
-    return sync_and_process_0926_0927()
 
 
 @router.post("/admin/process-date")

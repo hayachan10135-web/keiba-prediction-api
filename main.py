@@ -18,7 +18,7 @@ import numpy as np
 import lightgbm as lgb
 import traceback
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Depends
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
@@ -27,6 +27,7 @@ from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
 from umaca_fast_client import UMACAFastClient
 
+from app.core.security import verify_api_key
 from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_post_datetime, is_before_morning_prediction
 from app.strategies import (
     StrategyArbiter,
@@ -188,14 +189,20 @@ from app.scrapers import (
 
 _strategy_arbiter = StrategyArbiter()
 
-app = FastAPI(title="Keiba Prediction & Verification API")
+app = FastAPI(
+    title="Keiba Prediction & Verification API",
+    description="競馬AI予想 ＆ 自律型自動投票システム API",
+    version="2.0.0"
+)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-app.include_router(betting_router)
-app.include_router(admin_router)
-app.include_router(summary_router)
-app.include_router(batch_router)
-app.include_router(settlement_router)
-app.include_router(prediction_router)
+
+# 全ルーターに X-API-Key 認証ガードを適用
+app.include_router(betting_router, dependencies=[Depends(verify_api_key)])
+app.include_router(admin_router, dependencies=[Depends(verify_api_key)])
+app.include_router(summary_router, dependencies=[Depends(verify_api_key)])
+app.include_router(batch_router, dependencies=[Depends(verify_api_key)])
+app.include_router(settlement_router, dependencies=[Depends(verify_api_key)])
+app.include_router(prediction_router, dependencies=[Depends(verify_api_key)])
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
@@ -392,8 +399,8 @@ def check_and_notify_balance_shortfall():
 
 
 
-@app.get("/notify/test")
-@app.post("/notify/test")
+@app.get("/notify/test", dependencies=[Depends(verify_api_key)])
+@app.post("/notify/test", dependencies=[Depends(verify_api_key)])
 def trigger_test_notification():
     """テスト用のプッシュ通知をFirebaseトピック (keiba_real_bet) へ送信"""
     if not firebase_app:
