@@ -163,10 +163,22 @@ def sync_orders_marks(
                 pass
 
     synced_top3 = []
-    for t in (top3_orders or []):
-        t_copy = dict(t)
-        try:
+    for idx, t in enumerate(top3_orders or []):
+        if isinstance(t, dict):
+            t_copy = dict(t)
             u = int(t_copy.get("umaban", 0))
+            rank = t_copy.get("order", idx + 1)
+        elif isinstance(t, (int, str)):
+            try:
+                u = int(t)
+            except Exception:
+                u = 0
+            rank = idx + 1
+            t_copy = {"order": rank, "order_text": f"{rank}着", "umaban": u}
+        else:
+            continue
+
+        try:
             if u in h_map:
                 m = h_map[u].get("mark", "-")
                 if m in ("〇", "○"):
@@ -174,18 +186,42 @@ def sync_orders_marks(
                 t_copy["mark"] = m
                 if h_map[u].get("horse_name"):
                     t_copy["horse_name"] = h_map[u]["horse_name"]
+            if not t_copy.get("horse_name"):
+                t_copy["horse_name"] = f"馬{u}"
+            if not t_copy.get("order_text"):
+                t_copy["order_text"] = f"{rank}着"
         except Exception:
             pass
         synced_top3.append(t_copy)
 
     order_info_by_umaban = {}
-    for mo in (mark_orders or []):
-        try:
-            u = int(mo.get("umaban", 0))
-            if u:
-                order_info_by_umaban[u] = mo
-        except Exception:
-            pass
+    if isinstance(mark_orders, dict):
+        for k, v in mark_orders.items():
+            try:
+                u = int(k)
+                ord_val = int(v) if v is not None and str(v).isdigit() else None
+                order_info_by_umaban[u] = {
+                    "umaban": u,
+                    "order": ord_val,
+                    "order_text": f"{ord_val}着" if ord_val else "着外"
+                }
+            except Exception:
+                pass
+    elif isinstance(mark_orders, list):
+        for mo in mark_orders:
+            if isinstance(mo, dict):
+                try:
+                    u = int(mo.get("umaban", 0))
+                    if u:
+                        order_info_by_umaban[u] = mo
+                except Exception:
+                    pass
+            elif isinstance(mo, (int, str)):
+                try:
+                    u = int(mo)
+                    order_info_by_umaban[u] = {"umaban": u}
+                except Exception:
+                    pass
 
     synced_marks = []
     target_marks = ["◎", "◯", "▲"]
@@ -208,7 +244,10 @@ def sync_orders_marks(
                 pass
 
     if not synced_marks and mark_orders:
-        synced_marks = mark_orders
+        if isinstance(mark_orders, list):
+            synced_marks = mark_orders
+        elif isinstance(mark_orders, dict):
+            synced_marks = list(order_info_by_umaban.values())
 
     return synced_top3, synced_marks
 
