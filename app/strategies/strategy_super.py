@@ -108,8 +108,8 @@ class StrategySuper(BaseBettingStrategy):
         ]
 
         total_amount = bet_amount
-        strategy_name = f"⭐【勝負R ({rank_label})】中穴エッジ投資 (単勝1点)"
-        real_bet_badge = f"⭐【勝負R ({rank_label})】単勝{bias_tag}{suffix}"
+        strategy_name = f"🔥【勝負R ({rank_label})】中穴エッジ投資 (単勝1点)"
+        real_bet_badge = f"🔥【勝負R ({rank_label})】単勝{bias_tag}{suffix}"
         summary = f"{strategy_name} [単勝{w0_u} {w0_name} ({w0_odds:.1f}倍) / 計{total_amount:,}円]"
 
         return StrategyDecision(
@@ -121,7 +121,7 @@ class StrategySuper(BaseBettingStrategy):
             strategy_type=self.strategy_type,
             strategy_name=strategy_name,
             real_bet_badge=real_bet_badge,
-            badge_text="⭐勝負R",
+            badge_text="🔥勝負R",
             real_bet_level="high",
             tickets=tickets,
             total_amount=total_amount,

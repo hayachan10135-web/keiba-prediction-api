@@ -100,8 +100,8 @@ class StrategyReal(BaseBettingStrategy):
             real_bet_badge = f"🔰【実勝負(保証)】複勝{bias_tag}{suffix}"
             reason_text = f"【実勝負】勝負Rなし日・日次1R最低保証枠 (少額{bet_amount:,}円)"
         else:
-            strategy_name = "🎯【実勝負】高安定回収基盤 (複勝1点)"
-            real_bet_badge = f"🎯【実勝負】複勝{bias_tag}{suffix}"
+            strategy_name = "⭐【実勝負】高安定回収基盤 (複勝1点)"
+            real_bet_badge = f"⭐【実勝負】複勝{bias_tag}{suffix}"
             reason_text = f"【実勝負】高複勝率・安定エッジ枠 (複勝率>=0.65 & EV>=1.05 & 投資{bet_amount:,}円)"
 
         summary = f"{strategy_name} [複勝{w0_u} {w0_name} / 計{total_amount:,}円]"
@@ -115,7 +115,7 @@ class StrategyReal(BaseBettingStrategy):
             strategy_type=self.strategy_type,
             strategy_name=strategy_name,
             real_bet_badge=real_bet_badge,
-            badge_text="🎯実勝負",
+            badge_text="⭐実勝負",
             real_bet_level="standard",
             tickets=tickets,
             total_amount=total_amount,

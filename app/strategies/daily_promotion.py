@@ -379,7 +379,7 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
         h_rec["edge_ratio"] = top_race["edge_ratio"]
         h_rec["strategy_name"] = strategy_name
         h_rec["real_bet_badge"] = real_bet_badge
-        h_rec["badge_text"] = "🎯実勝負"
+        h_rec["badge_text"] = "⭐実勝負"
         h_rec["target_umaban"] = w0_u
         h_rec["target_horse_name"] = w0_name
         h_rec["tansho_bets"] = []
@@ -407,7 +407,7 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
         top_rec["horse_name"] = w0_name
         top_rec["is_pass"] = False
         top_rec["grade"] = "A"
-        top_rec["confidence_label"] = "🎯実勝負"
+        top_rec["confidence_label"] = "⭐実勝負"
         top_rec["tansho_amount"] = 0
         top_rec["fukusho_amount"] = bet_amount
         top_rec["total_amount"] = bet_amount
