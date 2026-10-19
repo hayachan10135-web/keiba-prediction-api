@@ -56,74 +56,56 @@ class DailyPromotionStrategy(BaseBettingStrategy):
         w0_u = int(honmei_horse.get("umaban", 0))
         w0_name = str(honmei_horse.get("horse_name", f"馬{w0_u}"))
         w0_odds = float(honmei_horse.get("odds") or 50.0)
-        surface_type = int(race_info.get("surface_type", 0))
-        prob_gachi = float(race_info.get("prob_gachi", 0.0))
 
-        if surface_type == 1:
-            d_tan, d_fuku = 700, 300
-            strategy_name = f"⭐ 本日厳選No.1: ダート適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            real_bet_badge = f"⭐【本日厳選No.1】ダート適性単複{bias_tag}{suffix}"
-        elif w0_odds >= 5.0 or prob_gachi <= 0.15:
-            d_tan, d_fuku = 500, 500
-            strategy_name = f"⭐ 本日厳選No.1: 芝妙味適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            real_bet_badge = f"⭐【本日厳選No.1】芝妙味単複{bias_tag}{suffix}"
-        else:
-            d_tan, d_fuku = 700, 300
-            strategy_name = f"⭐ 本日厳選No.1: 芝本命適性単複 (単{d_tan}円＋複{d_fuku}円)"
-            real_bet_badge = f"⭐【本日厳選No.1】芝本命単複{bias_tag}{suffix}"
+        bet_amount = 300
+        strategy_name = f"🔰【実勝負(保証)】日次1R参加・少額防衛 (複勝{bet_amount:,}円)"
+        real_bet_badge = f"🔰【実勝負(保証)】複勝{bias_tag}{suffix}"
 
-        tickets: List[BetTicket] = []
-
-        # 単勝
-        tickets.append(BetTicket(
-            ticket_type="単勝",
-            combination=[w0_u],
-            combination_str=f"{w0_u}",
-            amount=d_tan,
-            odds=w0_odds,
-            expected_payout=int(round(d_tan * w0_odds)),
-            is_real_odds=True,
-            memo=f"単勝(デイリー厳選) {w0_u}番 ({w0_name}){bias_tag} {d_tan:,}円"
-        ))
-
-        # 複勝
         est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-        tickets.append(BetTicket(
-            ticket_type="複勝",
-            combination=[w0_u],
-            combination_str=f"{w0_u}",
-            amount=d_fuku,
-            odds=est_fuku_odds,
-            expected_payout=int(round(d_fuku * est_fuku_odds)),
-            is_real_odds=False,
-            memo=f"複勝(デイリー厳選) {w0_u}番 ({w0_name}){bias_tag} {d_fuku:,}円"
-        ))
+        tickets: List[BetTicket] = [
+            BetTicket(
+                ticket_type="複勝",
+                combination=[w0_u],
+                combination_str=f"{w0_u}",
+                amount=bet_amount,
+                odds=est_fuku_odds,
+                expected_payout=int(round(bet_amount * est_fuku_odds)),
+                is_real_odds=False,
+                memo=f"複勝(デイリー保証) {w0_u}番 ({w0_name}){bias_tag} {bet_amount:,}円"
+            )
+        ]
 
-        total_amount = sum(t.amount for t in tickets)
-        summary = f"{strategy_name} [単勝{d_tan:,}円 ＋ 複勝{d_fuku:,}円 (軸{w0_u} {w0_name}) / 計{total_amount:,}円]"
+        total_amount = bet_amount
+        summary = f"{strategy_name} [複勝{w0_u} {w0_name} / 計{total_amount:,}円]"
 
         return StrategyDecision(
             is_participate=True,
             is_real_bet_target=True,
-            assigned_tier="Daily_No1",
+            is_virtual_bet=False,
+            bet_category="real",
+            assigned_tier="REAL",
             strategy_type=self.strategy_type,
             strategy_name=strategy_name,
             real_bet_badge=real_bet_badge,
             real_bet_level="standard",
             tickets=tickets,
             total_amount=total_amount,
+            target_umaban=w0_u,
+            target_horse_name=w0_name,
             confidence_score=confidence_score,
             edge_ratio=round(win_edge, 2),
             synth_odds=round(w0_odds, 1),
             summary=summary,
-            reason="本日厳選No.1昇格枠採択 (自然合致0件時リカバリ)"
+            reason="本日厳選No.1昇格枠採択 (自然合致0件時リカバリ・複勝少額防衛)"
         )
 
 # =========================================================================
 # ★ デイリー昇格調停オーケストレーション (Coordinator)
 # =========================================================================
 
-NATURAL_REAL_STRATEGIES = ("strategy_b", "strategy_a", "strategy_c", "strategy_a_hole")
+NATURAL_REAL_STRATEGIES = (
+    "super_bet", "real_bet", "strategy_b", "strategy_a", "strategy_c", "strategy_a_hole"
+)
 
 _daily_top_race_id_cache: Dict[str, str] = {}
 _cache_invalidation_handler: Optional[Callable[[str], None]] = None
@@ -148,7 +130,7 @@ def invalidate_daily_top_cache(target_date: str):
 
 def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[Any] = None) -> Optional[str]:
     """
-    当日(target_date)全レースの中で、自然条件（戦略B/A/C/A-2）を満たすレースが0レースのときのみ、
+    当日(target_date)全レースの中で、自然条件（勝負R / 実勝負）を満たすレースが0レースのときのみ、
     『確信度 × エッジ適性スコア』が最も高い1レースの race_id を特定して返す。
     自然条件を満たすレースが1つ以上存在する場合は None を返す（全合致レースをそのまま実馬券とする）。
     """
@@ -165,16 +147,18 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
         if not rows:
             return None
 
-        # 自然条件（戦略B / A / C / A-2）を満たすレースが1つでもあれば、昇格枠は不要
+        # 自然条件（勝負R / 実勝負 / 戦略B/A/C/A-2）を満たすレースが1つでもあれば、昇格枠は不要
         existing_daily_top_rid = None
         for r in rows:
             rid = str(r.get("race_id") or "")
             dj = r.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
-            if h_rec.get("strategy_type") in NATURAL_REAL_STRATEGIES:
+            st_type = h_rec.get("strategy_type")
+            b_cat = h_rec.get("bet_category")
+            if st_type in NATURAL_REAL_STRATEGIES or b_cat in ("super", "real"):
                 _daily_top_race_id_cache.pop(target_date, None)
                 return None
-            if h_rec.get("strategy_type") == "daily_top" and h_rec.get("is_real_bet_target"):
+            if st_type == "daily_top" and h_rec.get("is_real_bet_target"):
                 existing_daily_top_rid = rid
 
         # 既に daily_top に昇格済みのレースがあれば、再推論・発走後もそのレースを維持する
@@ -191,7 +175,7 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
             if "障" in r_name or "障害" in c_det or "新馬" in r_name or "メイクデビュー" in r_name:
                 continue
             horses = dj.get("horses") or []
-            if len(horses) < 8:
+            if len(horses) < 6:
                 continue
 
             # 当日の場合は未発走（発走時刻前）のレースを優先対象とする
@@ -232,9 +216,9 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
 
 def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any] = None) -> Optional[str]:
     """
-    【実馬券厳選ルール】
-    1. 戦略B（勝負馬券）および戦略A・C・A-2（実馬券1〜3）を満たすレースはすべて実馬券（is_real_bet_target = True）とする。
-    2. 上記を満たすレースが0レースのときのみ、当日全レースの中で『確信度 × エッジ適性スコア』が最も高い1レースを実馬券に昇格する。
+    【実馬券厳選ルール (新4区分統合版)】
+    1. 勝負R (super) または 実勝負 (real) を満たすレースはすべて実馬券（is_real_bet_target = True）とする。
+    2. 上記を満たすレースが0レースのときのみ、当日全レースの中で『確信度 × エッジ適性スコア』が最も高い1レースを実勝負(保証)に昇格する。
     """
     supabase = supabase_client or get_supabase_client()
     if not target_date or not supabase:
@@ -250,35 +234,25 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             return None
 
         # 当日公式スケジュールに登録されているレースIDのみを厳密に対象とする (過去テストデータの混入を物理遮断)
-        if target_date == "2026-10-18":
-            rows = [r for r in rows if str(r.get("race_id") or "")[4:6] in {"05", "08", "04"}]
-        else:
-            sched_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", target_date).execute()
-            valid_scheduled_rids = {str(sr["race_id"]) for sr in (sched_res.data or []) if sr.get("race_id")}
-            if valid_scheduled_rids:
-                rows = [r for r in rows if str(r.get("race_id") or "") in valid_scheduled_rids]
+        sched_res = supabase.table("keiba_scheduled_races").select("race_id").eq("race_date", target_date).execute()
+        valid_scheduled_rids = {str(sr["race_id"]) for sr in (sched_res.data or []) if sr.get("race_id")}
+        if valid_scheduled_rids:
+            rows = [r for r in rows if str(r.get("race_id") or "") in valid_scheduled_rids]
 
         natural_real_rids = []
         existing_daily_top_rid = None
-        # Step 1: 過去に「参考推奨」へ格下げされていた自然合致レース（戦略B/A/C/A-2）があれば全て実馬券に復元
+        # Step 1: 勝負R・実勝負に合致しているレースを探索・確認
         for r in rows:
             rid = str(r.get("race_id") or "")
             dj = r.get("data_json") or {}
             h_rec = dj.get("hybrid_recommendation") or {}
             st_type = h_rec.get("strategy_type")
-            if st_type in NATURAL_REAL_STRATEGIES:
+            b_cat = h_rec.get("bet_category")
+            if st_type in NATURAL_REAL_STRATEGIES or b_cat in ("super", "real"):
                 natural_real_rids.append(rid)
-                if not h_rec.get("is_real_bet_target") or "参考推奨" in str(h_rec.get("real_bet_badge") or ""):
+                if not h_rec.get("is_real_bet_target"):
                     h_rec["is_participate"] = True
                     h_rec["is_real_bet_target"] = True
-                    h_rec["real_bet_level"] = "high" if st_type == "strategy_b" else "standard"
-                    badge_map = {
-                        "strategy_b": "🔥【超勝負R】単勝＋馬単レバレッジ",
-                        "strategy_a": "⭐【芝厳選】単複ケリー傾斜",
-                        "strategy_c": "🛡️【ダート本命】手堅い単複防衛",
-                        "strategy_a_hole": "⚡【芝波乱妙味】単複好配当狙い"
-                    }
-                    h_rec["real_bet_badge"] = badge_map.get(st_type, "⭐【実馬券推奨】")
                     dj["hybrid_recommendation"] = h_rec
                     supabase.table("keiba_predictions_cache").update({"data_json": dj}).eq("race_id", rid).execute()
             elif st_type == "daily_top" and h_rec.get("is_real_bet_target"):
@@ -295,6 +269,8 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
                     h_rec["is_real_bet_target"] = False
                     h_rec["real_bet_level"] = "none"
                     h_rec["real_bet_badge"] = None
+                    h_rec["badge_text"] = "見送り推奨"
+                    h_rec["bet_category"] = "skip"
                     h_rec["strategy_type"] = "skip"
                     h_rec["strategy_name"] = "見送り推奨 (資金保全)"
                     h_rec["tansho_bets"] = []
@@ -316,7 +292,7 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             invalidate_daily_top_cache(target_date)
             return natural_real_rids[0]
 
-        # Step 3: 自然合致が0レースのときのみ、確信度 × エッジ適性スコア 最高位の1レースを実馬券に昇格
+        # Step 3: 自然合致が0レースのときのみ、確信度 × エッジ適性スコア 最高位の1レースを実勝負(保証)に昇格
         candidates = []
         for r in rows:
             rid = str(r.get("race_id") or "")
@@ -326,7 +302,7 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             if "障" in r_name or "障害" in c_det or "新馬" in r_name or "メイクデビュー" in r_name:
                 continue
             horses = dj.get("horses") or []
-            if len(horses) < 8:
+            if len(horses) < 6:
                 continue
 
             is_unrun = True
@@ -373,26 +349,13 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
         w0_u = int(honmei_horse.get("umaban") or 1)
         w0_name = str(honmei_horse.get("horse_name") or "")
         w0_odds = float(honmei_horse.get("odds") or 3.0)
-        c_det = str((top_dj.get("race_details") or {}).get("course_details") or "")
-        is_dirt = ("ダ" in c_det) or ("ダート" in c_det)
 
-        h_rec = top_dj.get("hybrid_recommendation") or {}
-        h_rec["is_participate"] = True
-        h_rec["is_real_bet_target"] = True
-        h_rec["real_bet_level"] = "standard"
-        h_rec["strategy_type"] = "daily_top"
-        h_rec["reason"] = "戦略Daily_No1採択"
-        h_rec["confidence_score"] = top_race["confidence_score"]
-        h_rec["edge_ratio"] = top_race["edge_ratio"]
-
-        tansho_bets = []
-        fukusho_bets = []
         bet_amount = 300
-        h_rec["strategy_name"] = f"🔰【実勝負(保証)】日次1R参加・少額防衛 (複勝{bet_amount:,}円)"
-        h_rec["real_bet_badge"] = "🔰【実勝負(保証)】複勝 (0R時昇格)"
+        strategy_name = f"🔰【実勝負(保証)】日次1R参加・少額防衛 (複勝{bet_amount:,}円)"
+        real_bet_badge = "🔰【実勝負(保証)】複勝 (0R時昇格)"
 
         est_fuku_odds = round(max(1.1, w0_odds * 0.35), 1)
-        fukusho_bets.append({
+        fukusho_bets = [{
             "ticket_type": "複勝",
             "combination": [w0_u],
             "combination_str": f"{w0_u}",
@@ -400,21 +363,43 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             "odds": est_fuku_odds,
             "expected_payout": int(round(bet_amount * est_fuku_odds)),
             "is_real_odds": False,
-            "memo": f"複勝(デイリー厳選) {w0_u}番 ({w0_name}) {bet_amount:,}円"
-        })
+            "memo": f"複勝(デイリー保証) {w0_u}番 ({w0_name}) {bet_amount:,}円"
+        }]
 
+        h_rec = top_dj.get("hybrid_recommendation") or {}
+        h_rec["is_participate"] = True
+        h_rec["is_real_bet_target"] = True
+        h_rec["is_virtual_bet"] = False
+        h_rec["bet_category"] = "real"
+        h_rec["assigned_tier"] = "REAL"
+        h_rec["real_bet_level"] = "standard"
+        h_rec["strategy_type"] = "daily_top"
+        h_rec["reason"] = "本日厳選No.1昇格枠採択 (自然合致0件時リカバリ・複勝少額防衛)"
+        h_rec["confidence_score"] = top_race["confidence_score"]
+        h_rec["edge_ratio"] = top_race["edge_ratio"]
+        h_rec["strategy_name"] = strategy_name
+        h_rec["real_bet_badge"] = real_bet_badge
+        h_rec["badge_text"] = "🎯実勝負"
+        h_rec["target_umaban"] = w0_u
+        h_rec["target_horse_name"] = w0_name
         h_rec["tansho_bets"] = []
         h_rec["fukusho_bets"] = fukusho_bets
+        h_rec["umatan_bets"] = []
+        h_rec["umaren_bets"] = []
+        h_rec["trio_bets"] = []
+        h_rec["sanrentan_bets"] = []
         h_rec["tansho_amount"] = 0
         h_rec["fukusho_amount"] = bet_amount
         h_rec["umatan_amount"] = 0
         h_rec["total_amount"] = bet_amount
-        h_rec["summary"] = f"{h_rec['strategy_name']}：複勝{bet_amount:,}円"
+        h_rec["summary"] = f"{strategy_name} [複勝{w0_u} {w0_name} / 計{bet_amount:,}円]"
+
+        # 総合台帳にもそのまま反映
         h_rec["is_virtual_bet_target"] = True
-        h_rec["virtual_bets"] = tansho_bets + fukusho_bets
-        h_rec["virtual_total_amount"] = d_tan + d_fuku
-        h_rec["virtual_strategy_name"] = h_rec["strategy_name"]
-        h_rec["virtual_badge"] = h_rec["real_bet_badge"]
+        h_rec["virtual_bets"] = fukusho_bets
+        h_rec["virtual_total_amount"] = bet_amount
+        h_rec["virtual_strategy_name"] = strategy_name
+        h_rec["virtual_badge"] = real_bet_badge
         top_dj["hybrid_recommendation"] = h_rec
 
         top_rec = top_dj.get("recommendation") or {}
@@ -422,10 +407,10 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
         top_rec["horse_name"] = w0_name
         top_rec["is_pass"] = False
         top_rec["grade"] = "A"
-        top_rec["confidence_label"] = "厳選勝負"
-        top_rec["tansho_amount"] = d_tan
-        top_rec["fukusho_amount"] = d_fuku
-        top_rec["total_amount"] = d_tan + d_fuku
+        top_rec["confidence_label"] = "🎯実勝負"
+        top_rec["tansho_amount"] = 0
+        top_rec["fukusho_amount"] = bet_amount
+        top_rec["total_amount"] = bet_amount
         top_rec["summary"] = h_rec["summary"]
         top_dj["recommendation"] = top_rec
 
@@ -447,13 +432,23 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
                     r_h["is_real_bet_target"] = False
                     r_h["real_bet_level"] = "none"
                     r_h["real_bet_badge"] = None
+                    r_h["badge_text"] = "見送り推奨"
+                    r_h["bet_category"] = "skip"
                     r_h["strategy_type"] = "skip"
+                    r_h["strategy_name"] = "見送り推奨 (資金保全)"
                     r_h["tansho_bets"] = []
                     r_h["fukusho_bets"] = []
                     r_h["tansho_amount"] = 0
                     r_h["fukusho_amount"] = 0
                     r_h["total_amount"] = 0
                     r_dj["hybrid_recommendation"] = r_h
+                    rec_obj = r_dj.get("recommendation") or {}
+                    rec_obj["is_pass"] = True
+                    rec_obj["grade"] = "D"
+                    rec_obj["confidence_label"] = "見送り推奨"
+                    rec_obj["tansho_amount"] = 0
+                    rec_obj["fukusho_amount"] = 0
+                    rec_obj["total_amount"] = 0
                     supabase.table("keiba_predictions_cache").update({"data_json": r_dj}).eq("race_id", r_rid).execute()
 
         _daily_top_race_id_cache[target_date] = top_rid

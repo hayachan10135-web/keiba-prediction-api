@@ -56,6 +56,7 @@ class StrategyArbiter:
         is_daily_top_race: bool = False,
         is_real_guarantee: bool = False,
         is_virtual_guarantee: bool = False,
+        race_class_code: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         compute_hybrid_rec_from_inputs と完全互換のハイブリッド推奨辞書を生成
@@ -154,7 +155,8 @@ class StrategyArbiter:
                 return 5
             return 2  # デフォルト1勝C
 
-        race_class_code = infer_race_class_code(race_name)
+        if race_class_code is None:
+            race_class_code = infer_race_class_code(race_name)
 
         race_info = {
             "race_name": race_name,

@@ -112,12 +112,13 @@ class StrategyReal(BaseBettingStrategy):
             is_virtual_bet=False,
             bet_category="real",
             assigned_tier="REAL",
+            strategy_type=self.strategy_type,
             strategy_name=strategy_name,
+            real_bet_badge=real_bet_badge,
+            badge_text="🎯実勝負",
+            real_bet_level="standard",
             tickets=tickets,
             total_amount=total_amount,
-            target_umaban=w0_u,
-            target_horse_name=w0_name,
-            real_bet_badge=real_bet_badge,
-            summary_text=summary,
+            summary=summary,
             reason=reason_text
         )

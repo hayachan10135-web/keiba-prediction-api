@@ -33,13 +33,13 @@ def get_supabase_client() -> Optional[Any]:
     if USE_LOCAL_SQLITE:
         try:
             if not os.path.exists(DEFAULT_DB_PATH):
-                print(f"[Database] ⚠️ ローカルDBが見つかりません ({DEFAULT_DB_PATH})。新規作成します。", file=sys.stderr)
+                print(f"[Database] [WARN] ローカルDBが見つかりません ({DEFAULT_DB_PATH})。新規作成します。", file=sys.stderr)
             _db_client = LocalSQLiteClient(DEFAULT_DB_PATH)
-            print(f"[Database] ⚡ 最速ローカル SQLite (WALモード) を初期化しました: {DEFAULT_DB_PATH}")
+            print(f"[Database] [LOCAL_DB] 最速ローカル SQLite (WALモード) を初期化しました: {DEFAULT_DB_PATH}")
             return _db_client
         except Exception as e:
-            print(f"[Database] ❌ ローカル SQLite 初期化エラー: {e}", file=sys.stderr)
-            return None
+            print(f"[Database] [ERROR] ローカル SQLite 初期化エラー: {e}", file=sys.stderr)
+            raise RuntimeError(f"ローカル SQLite 初期化エラー: {e}")
 
     # Supabase (フォールバック)
     if settings.SUPABASE_URL and settings.SUPABASE_KEY:

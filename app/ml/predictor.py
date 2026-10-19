@@ -191,7 +191,8 @@ def compute_hybrid_rec_from_inputs(
     track_bias_data: Optional[dict] = None,
     is_daily_top_race: bool = False,
     is_real_guarantee: bool = False,
-    is_virtual_guarantee: bool = False
+    is_virtual_guarantee: bool = False,
+    race_class_code: Optional[int] = None
 ) -> dict:
     """買い目戦略・調停・トリガミ防止・スリッページ停止判定を app/strategies/arbiter.py へ委任"""
     return _strategy_arbiter.evaluate_race(
@@ -210,7 +211,8 @@ def compute_hybrid_rec_from_inputs(
         track_bias_data=track_bias_data,
         is_daily_top_race=is_daily_top_race,
         is_real_guarantee=is_real_guarantee,
-        is_virtual_guarantee=is_virtual_guarantee
+        is_virtual_guarantee=is_virtual_guarantee,
+        race_class_code=race_class_code
     )
 
 
@@ -421,8 +423,12 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
     wins_list = []
 
     for h in horses:
-        w = h["wakuban"]
-        u = h["umaban"]
+        u = int(h.get("umaban") or 1)
+        w_raw = h.get("wakuban")
+        if w_raw is not None and str(w_raw).isdigit() and int(w_raw) > 0:
+            w = int(w_raw)
+        else:
+            w = min(max(((u - 1) * 8 // max(head_count, 1)) + 1, 1), 8)
         k = float(h.get("kinryo", 55.0))
 
         raw_name = h.get("horse_name", "")
@@ -969,7 +975,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         track_bias_data=track_bias_data,
         is_daily_top_race=is_daily_top_race,
         is_real_guarantee=is_real_guarantee,
-        is_virtual_guarantee=is_virtual_guarantee
+        is_virtual_guarantee=is_virtual_guarantee,
+        race_class_code=race_class_code
     )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])

@@ -135,12 +135,13 @@ class StrategyVirtual(BaseBettingStrategy):
             is_virtual_bet=True,
             bet_category="virtual",
             assigned_tier="VIRTUAL",
+            strategy_type=self.strategy_type,
             strategy_name=strategy_name,
+            real_bet_badge=real_bet_badge,
+            badge_text="🎮仮想",
+            real_bet_level="virtual",
             tickets=tickets,
             total_amount=total_amount,
-            target_umaban=w0_u,
-            target_horse_name=w0_name,
-            real_bet_badge=real_bet_badge,
-            summary_text=summary,
+            summary=summary,
             reason=reason_text
         )

@@ -118,13 +118,14 @@ class StrategySuper(BaseBettingStrategy):
             is_virtual_bet=False,
             bet_category="super",
             assigned_tier="SUPER",
+            strategy_type=self.strategy_type,
             strategy_name=strategy_name,
+            real_bet_badge=real_bet_badge,
+            badge_text="⭐勝負R",
+            real_bet_level="high",
             tickets=tickets,
             total_amount=total_amount,
-            target_umaban=w0_u,
-            target_horse_name=w0_name,
-            real_bet_badge=real_bet_badge,
-            summary_text=summary,
+            summary=summary,
             reason=(
                 f"【勝負R({rank_label})選定】1・2勝クラス適正EVゾーン "
                 f"(EV {win_edge:.2f} ∈ [1.02, 1.25] & 単勝 {w0_odds:.1f}倍 ∈ [3.0, 7.0] & 投資 {bet_amount:,}円)"

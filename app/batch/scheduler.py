@@ -238,9 +238,8 @@ async def background_maintenance_loop():
                             break
 
                         r_id = r["race_id"]
-                        # 【最重要ガード】JRA公式の本日会場コード (04: 新潟, 05: 東京, 08: 京都) 以外の不正・過去レースは除外
                         venue_code = r_id[4:6] if len(r_id) == 12 else ""
-                        if venue_code not in {"04", "05", "08"}:
+                        if not (venue_code.isdigit() and 1 <= int(venue_code) <= 10):
                             continue
 
                         p_dt_str = r.get("post_datetime")
