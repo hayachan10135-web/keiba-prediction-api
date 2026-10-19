@@ -27,6 +27,9 @@ def get_expected_api_key() -> str:
     env_key = os.environ.get("API_KEY") or getattr(settings, "API_KEY", "")
     if env_key and env_key.strip():
         return env_key.strip()
+    # 本番環境下で API_KEY が未設定の場合は安全のため警告を出力
+    if getattr(settings, "ENV", "production") == "production":
+        print("[Security Warning] ⚠️ API_KEY が未設定です。デフォルトキーが使用されています。本番運用時は .env に強固な API_KEY を設定してください。")
     return DEFAULT_API_KEY
 
 

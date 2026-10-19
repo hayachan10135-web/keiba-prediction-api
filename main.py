@@ -23,7 +23,6 @@ from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
-from supabase import create_client, Client
 from ipat_fast_client import IPATFastClient, VENUE_CODE_MAP
 from umaca_fast_client import UMACAFastClient
 
@@ -245,19 +244,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 
-# --- Supabase クライアント初期化 ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+# --- データベース クライアント初期化 (最速ローカル SQLite 統一) ---
+from app.core.database import get_db
 
-supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabaseクライアントを正常に初期化しました。")
-    except Exception as e:
-        print(f"Supabase初期化エラー: {e}")
-else:
-    print("警告: SUPABASE_URL または SUPABASE_KEY が環境変数に設定されていません。")
+supabase: Optional[Any] = get_db()
+if supabase is None:
+    print("[Database Warning] データベースクライアントの初期化に失敗しました。")
+
 
 # --- Firebase Admin SDK 初期化 & プッシュ通知ヘルパー ---
 firebase_app = None

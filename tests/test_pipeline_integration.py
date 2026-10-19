@@ -35,7 +35,8 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertIn("class_c", predictor.calibration_table)
 
     def test_inference_pipeline_execution(self):
-        """ダミーレースデータに対して build_prediction_and_recs が正常に推論を完了すること"""
+        """ダミーレースデータに対して build_prediction_and_recs が正常に推論を完了すること（外部通信モック化）"""
+        from unittest.mock import patch
         from app.ml.predictor import build_prediction_and_recs
 
         horses = [
@@ -49,13 +50,15 @@ class TestPipelineIntegration(unittest.TestCase):
         race_details = {"course_details": "芝2000m", "post_time": "15:40", "weather": "晴", "condition": "良"}
         course_meta = {"venue": "東京", "surface": "芝", "distance": 2000, "race_date": "2026-10-19"}
 
-        res = build_prediction_and_recs(
-            horses=horses,
-            race_details=race_details,
-            race_name="3歳以上2勝クラス",
-            race_id="202605040811",
-            course_meta=course_meta
-        )
+        # テスト実行時に実際の netkeiba へ通信して HTTP 400 サーキットブレーカーを作動させないようモック化
+        with patch("app.ml.predictor.fetch_real_odds", return_value={}):
+            res = build_prediction_and_recs(
+                horses=horses,
+                race_details=race_details,
+                race_name="3歳以上2勝クラス",
+                race_id="202605040811",
+                course_meta=course_meta
+            )
 
         self.assertIn("horses", res)
         self.assertIn("hybrid_recommendation", res)
