@@ -16,7 +16,11 @@ from app.scrapers.netkeiba_client import (
     register_post_time_callback,
     register_schedule_callback,
     USER_AGENTS,
-    HEADERS_PC
+    HEADERS_PC,
+    is_waf_in_cooldown,
+    get_waf_cooldown_remaining,
+    trigger_waf_cooldown,
+    reset_waf_cooldown
 )
 from app.scrapers.schedule_crawler import (
     parse_netkeiba_race_list_html,
@@ -45,5 +49,9 @@ __all__ = [
     "invalidate_venues_cache",
     "register_crawler_post_time_handler",
     "register_venues_loaded_handler",
-    "VENUE_CODE_MAP"
+    "VENUE_CODE_MAP",
+    "is_waf_in_cooldown",
+    "get_waf_cooldown_remaining",
+    "trigger_waf_cooldown",
+    "reset_waf_cooldown"
 ]

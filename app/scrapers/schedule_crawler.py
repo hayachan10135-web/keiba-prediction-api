@@ -181,6 +181,18 @@ def fetch_venues_for_date_raw(date_str: str, force_refresh: bool = False) -> Lis
         elif isinstance(c_entry, list):
             return json.loads(json.dumps(c_entry))
 
+    # 恒久対策①：DBファースト（過去日、またはWAF冷却中の場合、外部スクレイピングを一切行わず即座にDBデータを返却）
+    # 過去日（formatted_date < today_s）は発走時刻変更等もないため外部通信を物理根絶
+    from app.scrapers.netkeiba_client import is_waf_in_cooldown
+    if formatted_date < today_s or is_waf_in_cooldown():
+        db_venues = fetch_venues_from_database(formatted_date)
+        if db_venues:
+            _period_venues_cache[formatted_date] = {
+                "venues": db_venues,
+                "updated_at": now
+            }
+            return json.loads(json.dumps(db_venues))
+
     urls = [
         f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={clean_d}",
         f"https://race.netkeiba.com/top/race_list.html?kaisai_date={clean_d}",

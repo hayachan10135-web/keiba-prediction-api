@@ -19,7 +19,12 @@ from app.core.database import get_supabase_client
 from app.core.timezone import now_jst, now_jst_naive, today_jst_str, JST
 from app.settlement import invalidate_summary_caches
 from app.schedule import discover_period_kaisai_dates, _latest_post_times
-from app.scrapers import fetch_venues_for_date_raw
+from app.scrapers import (
+    fetch_venues_for_date_raw,
+    is_waf_in_cooldown,
+    get_waf_cooldown_remaining,
+    reset_waf_cooldown,
+)
 from app.maintenance import (
     CURRENT_DB_VERSION,
     clear_all_database,
@@ -729,3 +734,27 @@ def endpoint_reselect_daily_real_bet(target_date: Optional[str] = Query(None)):
         "selected_race_id": top_rid,
         "prediction": pred
     }
+
+
+@router.get("/admin/waf-status")
+def endpoint_waf_status():
+    """netkeiba WAFサーキットブレーカー（アクセス制限自動冷却モード）の現在ステータスを取得"""
+    import os
+    is_blocked = is_waf_in_cooldown()
+    rem = get_waf_cooldown_remaining()
+    proxy_set = bool(os.getenv("NETKEIBA_PROXY_URL"))
+    return {
+        "waf_cooldown_active": is_blocked,
+        "remaining_seconds": rem,
+        "cooldown_minutes": round(rem / 60, 1),
+        "proxy_configured": proxy_set,
+        "message": "冷却モード作動中です。外部スクレイピングを停止し完全DBフォールバック中。" if is_blocked else "通常運用中です（WAF制限なし）。"
+    }
+
+
+@router.post("/admin/waf-reset")
+def endpoint_waf_reset():
+    """netkeiba WAF冷却モードを手動リセット"""
+    reset_waf_cooldown()
+    return {"status": "ok", "message": "WAF冷却モードをリセットしました。"}
+

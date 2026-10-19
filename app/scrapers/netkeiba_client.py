@@ -18,6 +18,7 @@ import time
 import json
 import random
 import datetime
+import threading
 from typing import Optional, List, Dict, Tuple, Any, Callable
 import requests
 from requests.adapters import HTTPAdapter
@@ -31,10 +32,10 @@ from app.core.race_utils import clean_pure_race_name
 
 # --- 堅牢なスクレイピング用 HTTP クライアント基盤 ---
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"
 ]
 
 HEADERS_PC = {
@@ -42,9 +43,46 @@ HEADERS_PC = {
     "Referer": "https://race.netkeiba.com/"
 }
 
+# --- グローバル・レートリミッター（最小アクセス間隔の強制） ---
+_rate_limiter_lock = threading.Lock()
+_last_request_time: float = 0.0
+MIN_REQUEST_INTERVAL_SECONDS: float = 1.3  # netkeiba WAF 安全閾値
+
+# --- WAF サーキットブレーカー（HTTP 400 検知時の自動冷却機能） ---
+_circuit_breaker_lock = threading.Lock()
+_waf_blocked_until: float = 0.0
+WAF_COOLDOWN_SECONDS: float = 1800.0  # 30分間冷却
+
+
+def is_waf_in_cooldown() -> bool:
+    """WAF冷却モード作動中かどうかを判定"""
+    return time.time() < _waf_blocked_until
+
+
+def get_waf_cooldown_remaining() -> int:
+    """WAF冷却モードの残り秒数を取得"""
+    rem = int(_waf_blocked_until - time.time())
+    return max(0, rem)
+
+
+def trigger_waf_cooldown(reason: str = "HTTP 400 WAF Block"):
+    """WAF冷却モードを発動"""
+    global _waf_blocked_until
+    with _circuit_breaker_lock:
+        _waf_blocked_until = time.time() + WAF_COOLDOWN_SECONDS
+    print(f"[Netkeiba CircuitBreaker] ⚠️ {reason} を検知しました。{WAF_COOLDOWN_SECONDS/60:.0f}分間、外部スクレイピングを完全停止してDBフォールバックに移行します。")
+
+
+def reset_waf_cooldown():
+    """WAF冷却モードを手動解除"""
+    global _waf_blocked_until
+    with _circuit_breaker_lock:
+        _waf_blocked_until = 0.0
+    print("[Netkeiba CircuitBreaker] WAF冷却モードを手動リセットしました。")
+
 
 def create_robust_session() -> requests.Session:
-    """自動リトライ、コネクションプール、タイムアウト制御を備えた堅牢なセッション"""
+    """自動リトライ、コネクションプール、タイムアウト制御、外部プロキシ対応を備えた堅牢なセッション"""
     s = requests.Session()
     retries = Retry(
         total=getattr(settings, "SCRAPER_MAX_RETRIES", 3),
@@ -55,6 +93,13 @@ def create_robust_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=30)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+
+    # 環境変数 NETKEIBA_PROXY_URL によるプロキシ設定対応
+    proxy_url = os.getenv("NETKEIBA_PROXY_URL")
+    if proxy_url:
+        s.proxies = {"http": proxy_url, "https": proxy_url}
+        print(f"[Scraper] netkeiba通信に外部プロキシを適用しました: {proxy_url[:15]}...")
+
     return s
 
 
@@ -69,11 +114,29 @@ def safe_scrape_get(
     max_retries: int = 3
 ) -> requests.Response:
     """
-    User-Agentローテーション、リトライ、ジッター、接続保持を統合した安全なHTTP GET
+    User-Agentローテーション、レートリミット、WAFサーキットブレーカー、リトライ、ジッター、接続保持を統合した安全なHTTP GET
     """
+    global _last_request_time
+
+    # 1. WAFサーキットブレーカー判定（冷却中なら外部リクエストを行わず400モックを即座に返し、DBフォールバックを促す）
+    if is_waf_in_cooldown():
+        mock_resp = requests.Response()
+        mock_resp.status_code = 400
+        mock_resp._content = b""
+        return mock_resp
+
+    # 2. グローバル・レートリミッター（連続リクエスト時の安全ウェイト強制 + ジッター）
+    with _rate_limiter_lock:
+        now = time.time()
+        elapsed = now - _last_request_time
+        target_interval = MIN_REQUEST_INTERVAL_SECONDS + random.uniform(0.1, 0.4)
+        if elapsed < target_interval:
+            time.sleep(target_interval - elapsed)
+        _last_request_time = time.time()
+
     req_headers = {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
         "Referer": referer,
         "Connection": "keep-alive"
@@ -85,9 +148,15 @@ def safe_scrape_get(
     for attempt in range(max_retries):
         try:
             if attempt > 0:
-                sleep_time = 0.3 * (2 ** attempt) + random.uniform(0.05, 0.2)
+                sleep_time = 0.5 * (2 ** attempt) + random.uniform(0.1, 0.3)
                 time.sleep(sleep_time)
             resp = GLOBAL_HTTP_SESSION.get(url, headers=req_headers, timeout=timeout)
+
+            # WAFの400アクセス制限を検知した場合、サーキットブレーカーを作動させてリトライ中断
+            if resp.status_code == 400:
+                trigger_waf_cooldown(f"HTTP 400 for {url}")
+                return resp
+
             if resp.status_code in [429, 500, 502, 503, 504]:
                 if attempt < max_retries - 1:
                     continue
