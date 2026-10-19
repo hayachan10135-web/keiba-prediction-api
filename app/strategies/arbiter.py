@@ -16,10 +16,6 @@ from app.strategies.base import BaseBettingStrategy
 from app.strategies.strategy_super import StrategySuper
 from app.strategies.strategy_real import StrategyReal
 from app.strategies.strategy_virtual import StrategyVirtual
-from app.strategies.strategy_b import StrategyB
-from app.strategies.strategy_a import StrategyA
-from app.strategies.strategy_c import StrategyC
-from app.strategies.strategy_a_hole import StrategyAHole
 from app.strategies.daily_promotion import DailyPromotionStrategy
 from app.strategies.trigami_pruner import TrigamiPruner
 from app.strategies.models import StrategyDecision, BetTicket
@@ -232,12 +228,14 @@ class StrategyArbiter:
         fukusho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "複勝"]
         umatan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬単"]
         umaren_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬連"]
+        wide_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "ワイド"]
         trio_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連複"]
         sanrentan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連単"]
 
         tan_amt = sum(b["amount"] for b in tansho_bets)
         fuku_amt = sum(b["amount"] for b in fukusho_bets)
         utan_amt = sum(b["amount"] for b in umatan_bets)
+        wide_amt = sum(b["amount"] for b in wide_bets)
         total_amt = decision.total_amount
 
         # 仮想馬券 (総合台帳用) の生成
@@ -253,8 +251,8 @@ class StrategyArbiter:
             virtual_strategy_name = decision.strategy_name
             virtual_badge = decision.real_bet_badge
         elif decision.bet_category == "virtual":
-            # 仮想観戦枠 -> 3連複チケットを仮想馬券として登録
-            virtual_bets = trio_bets
+            # 仮想観戦枠 -> 生成された全チケット（クラスA:ワイド、クラスB:単勝、クラスC:馬連 等）を仮想馬券として登録
+            virtual_bets = [t.to_dict() for t in decision.tickets]
             virtual_total_amount = total_amt
             virtual_strategy_name = decision.strategy_name
             virtual_badge = decision.real_bet_badge
@@ -273,11 +271,13 @@ class StrategyArbiter:
             "fukusho_bets": fukusho_bets,
             "umatan_bets": umatan_bets,
             "umaren_bets": umaren_bets,
+            "wide_bets": wide_bets,
             "trio_bets": trio_bets,
             "sanrentan_bets": sanrentan_bets,
             "tansho_amount": tan_amt,
             "fukusho_amount": fuku_amt,
             "umatan_amount": utan_amt,
+            "wide_amount": wide_amt,
             "hypothetical_umaren_bets": [],
             "trio_bet": trio_bets[0] if trio_bets else None,
             "reason": decision.reason,

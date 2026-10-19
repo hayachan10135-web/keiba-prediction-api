@@ -445,6 +445,17 @@ def has_already_betted_race(date_str: str, race_id: str) -> bool:
     """指定レース(race_id)がすでに自動投票完了済みか確認 (同一レース二重発注防止)"""
     if race_id in _auto_betted_races:
         return True
+    # 1. keiba_real_bets テーブルから直接確認 (再起動耐性・DB層物理防御)
+    try:
+        db_cli = get_db()
+        if db_cli:
+            res = db_cli.table("keiba_real_bets").select("id").eq("race_id", race_id).eq("is_manual_bet", False).eq("status", "success").execute()
+            if res.data and len(res.data) > 0:
+                _auto_betted_races.add(race_id)
+                return True
+    except Exception:
+        pass
+    # 2. settings 内の betted_races_by_date から確認
     try:
         settings = load_betting_settings_from_supabase()
         betted = settings.get("betted_races_by_date", {})

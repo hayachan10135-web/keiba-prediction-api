@@ -155,6 +155,54 @@ class TestArbiter4Classes(unittest.TestCase):
         self.assertTrue(decision["is_virtual_bet"])
         self.assertIn("🎮", decision["badge_text"])
 
+    def test_virtual_class_a_generates_wide_bets(self):
+        """クラスA（新馬・未勝利）の仮想枠選出時、ワイド2点（計1,000円）が正しく生成されること"""
+        horses = self._create_mock_horses(count=12, top_odds=4.5, top_prob_win=0.25, top_prob_top3=0.55)
+        decision = self.arbiter.evaluate_race(
+            race_name="3歳未勝利",
+            race_details={"course_details": "芝1600m"},
+            horses=horses,
+            surface_type=0,
+            prob_gachi=0.3,
+            prob_himo=0.4,
+            opponents=[],
+            u0=1,
+            honmei_horse=horses[0],
+            race_date_str="2026-10-19",
+            is_virtual_guarantee=True,
+            race_class_code=1,  # クラスA (未勝利)
+        )
+        self.assertEqual(decision["bet_category"], "virtual")
+        self.assertIn("wide_bets", decision)
+        self.assertEqual(len(decision["wide_bets"]), 2)
+        self.assertEqual(decision["wide_amount"], 1000)
+        self.assertEqual(len(decision["virtual_bets"]), 2)
+        self.assertEqual(decision["virtual_total_amount"], 1000)
+
+    def test_payout_verifier_wide_hit(self):
+        """PayoutVerifier がワイド馬券の的中と払戻金を正しく照合できること"""
+        from app.settlement.payout_verifier import PayoutVerifier
+
+        tickets = [
+            {"ticket_type": "ワイド", "combination": [1, 2], "amount": 500},
+            {"ticket_type": "ワイド", "combination": [1, 3], "amount": 500},
+        ]
+        payouts_data = {
+            "wide": {
+                "1-2": 480,   # 1-2 的中 (100円あたり480円 -> 500円投資で 2,400円)
+                "2-5": 820,
+                "1-5": 650,
+            }
+        }
+        total_payout, all_hits, bet_breakdown, payout_breakdown = PayoutVerifier.verify_all_tickets(tickets, payouts_data)
+        self.assertEqual(total_payout, 2400)
+        self.assertEqual(len(all_hits), 1)
+        self.assertEqual(all_hits[0]["type"], "ワイド")
+        self.assertEqual(all_hits[0]["comb"], "1-2")
+        self.assertEqual(all_hits[0]["payout"], 2400)
+        self.assertEqual(bet_breakdown.get("ワイド"), 1000)
+        self.assertEqual(payout_breakdown.get("ワイド"), 2400)
+
 
 if __name__ == "__main__":
     unittest.main()

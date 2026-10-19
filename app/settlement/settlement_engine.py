@@ -1090,6 +1090,7 @@ def process_settlement_calculation(
     fukusho_bets = hybrid_rec.get("fukusho_bets") or []
     umatan_bets = hybrid_rec.get("umatan_bets") or []
     umaren_bets = hybrid_rec.get("umaren_bets") or []
+    wide_bets = hybrid_rec.get("wide_bets") or []
     sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
     trio_bets = hybrid_rec.get("trio_bets") or []
     trio_bet = hybrid_rec.get("trio_bet")
@@ -1105,6 +1106,8 @@ def process_settlement_calculation(
         all_tickets.append({"ticket_type": "馬単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
     for b in umaren_bets:
         all_tickets.append({"ticket_type": "馬連", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+    for b in wide_bets:
+        all_tickets.append({"ticket_type": "ワイド", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
     for b in sanrentan_bets:
         all_tickets.append({"ticket_type": "3連単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
     for b in trio_bets:
@@ -1117,6 +1120,7 @@ def process_settlement_calculation(
     fuku_bet_tot = bet_breakdown.get("複勝", 0)
     utan_bet_tot = bet_breakdown.get("馬単", 0)
     u_bet_tot = bet_breakdown.get("馬連", 0)
+    wide_bet_tot = bet_breakdown.get("ワイド", 0)
     s_bet_tot = bet_breakdown.get("3連単", 0)
     t_bet_tot = bet_breakdown.get("三連複", 0)
 
@@ -1124,6 +1128,7 @@ def process_settlement_calculation(
     fukusho_payout = payout_breakdown.get("複勝", 0)
     umatan_payout = payout_breakdown.get("馬単", 0)
     umaren_payout = payout_breakdown.get("馬連", 0)
+    wide_payout = payout_breakdown.get("ワイド", 0)
     sanrentan_payout = payout_breakdown.get("3連単", 0)
     trio_payout = payout_breakdown.get("三連複", 0)
 
@@ -1147,6 +1152,8 @@ def process_settlement_calculation(
         hit_type = "三連複的中🎯"
     elif "馬連" in hit_types_found:
         hit_type = "馬連的中🎯"
+    elif "ワイド" in hit_types_found:
+        hit_type = "ワイド的中🎯"
     else:
         hit_type = "不的中"
 
@@ -1177,6 +1184,9 @@ def process_settlement_calculation(
     if u_bet_tot > 0:
         bet_breakdown["馬連"] = u_bet_tot
         payout_breakdown["馬連"] = umaren_payout
+    if wide_bet_tot > 0:
+        bet_breakdown["ワイド"] = wide_bet_tot
+        payout_breakdown["ワイド"] = wide_payout
     if s_bet_tot > 0:
         bet_breakdown["3連単"] = s_bet_tot
         payout_breakdown["3連単"] = sanrentan_payout
@@ -1221,6 +1231,7 @@ def process_settlement_calculation(
             "fukusho_bets": fukusho_bets,
             "umatan_bets": umatan_bets,
             "umaren_bets": umaren_bets,
+            "wide_bets": wide_bets,
             "sanrentan_bets": sanrentan_bets,
             "trio_bets": trio_bets,
             "trio_bet": trio_bet,

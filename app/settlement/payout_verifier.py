@@ -30,6 +30,7 @@ class PayoutVerifier:
         fuku_map = payouts_data.get("fukusho", {})
         utan_map = payouts_data.get("umatan", {})
         uren_map = payouts_data.get("umaren", {})
+        wide_map = payouts_data.get("wide", {})
         tierce_map = payouts_data.get("tierce", {})  # 3連単
         trio_map = payouts_data.get("trio", {})      # 3連複
 
@@ -86,6 +87,18 @@ class PayoutVerifier:
                     payout_breakdown["馬連"] = payout_breakdown.get("馬連", 0) + pay
                     all_hits.append({
                         "type": "馬連", "comb": comb_key, "amount": amt, "unit_payout": unit_p, "payout": pay
+                    })
+
+            # 4-2. ワイド
+            elif t_type in ("ワイド", "ﾜｲﾄﾞ") and len(comb) >= 2:
+                comb_key = f"{min(comb[0], comb[1])}-{max(comb[0], comb[1])}"
+                unit_p = wide_map.get(comb_key, 0)
+                if unit_p > 0:
+                    pay = int((amt / 100.0) * unit_p)
+                    total_payout += pay
+                    payout_breakdown["ワイド"] = payout_breakdown.get("ワイド", 0) + pay
+                    all_hits.append({
+                        "type": "ワイド", "comb": comb_key, "amount": amt, "unit_payout": unit_p, "payout": pay
                     })
 
             # 5. 3連単

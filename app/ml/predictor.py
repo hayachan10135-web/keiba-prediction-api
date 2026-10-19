@@ -688,8 +688,49 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         else:
             feature_rows.append(row58[:expected_num_features] if len(row58) >= expected_num_features else row48[:expected_num_features])
 
-    # 3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) 推論
-    if model_win and model_top3:
+    w_scores = None
+    t_scores = None
+
+    # 1. クラス別特化モデル (A/B/C) が利用可能な場合は最優先で推論（不要な旧6モデル推論を完全排除し3〜5倍高速化）
+    target_class_code = race_class_code
+    m_cls_w, m_cls_t, cls_key = None, None, None
+    if target_class_code in (0, 1) and model_class_a_win and model_class_a_top3:
+        m_cls_w, m_cls_t, cls_key = model_class_a_win, model_class_a_top3, "class_a"
+    elif target_class_code in (2, 3) and model_class_b_win and model_class_b_top3:
+        m_cls_w, m_cls_t, cls_key = model_class_b_win, model_class_b_top3, "class_b"
+    elif target_class_code in (4, 5) and model_class_c_win and model_class_c_top3:
+        m_cls_w, m_cls_t, cls_key = model_class_c_win, model_class_c_top3, "class_c"
+
+    if m_cls_w and m_cls_t:
+        try:
+            n_cw = m_cls_w.num_feature()
+            n_ct = m_cls_t.num_feature()
+            inp_cw = [r[:n_cw] for r in feature_rows]
+            inp_ct = [r[:n_ct] for r in feature_rows]
+            raw_cw = np.array(m_cls_w.predict(inp_cw, num_threads=4))
+            raw_ct = np.array(m_cls_t.predict(inp_ct, num_threads=4))
+
+            # キャリブレーション補正 (FR-ML-03: 区分線形補間 np.interp)
+            cal_info = (calibration_table or {}).get(cls_key, {})
+            w_cal_tab = cal_info.get("win_calib", [])
+            t_cal_tab = cal_info.get("top3_calib", [])
+
+            def _calib_linear(vals, tab):
+                if not tab:
+                    return vals
+                xp = [float(e.get("pred", 0.0)) for e in tab]
+                fp = [float(e.get("calib", 0.0)) for e in tab]
+                return np.interp(vals, xp, fp)
+
+            w_scores = _calib_linear(raw_cw, w_cal_tab)
+            t_scores = _calib_linear(raw_ct, t_cal_tab)
+        except Exception as ex_cls:
+            print(f"クラス別モデル推論フォールバック ({cls_key}): {ex_cls}")
+            w_scores = None
+            t_scores = None
+
+    # 2. クラス別モデル未該当レースまたはエラー時のみ、旧3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) にフォールバック
+    if (w_scores is None or t_scores is None) and model_win and model_top3:
         try:
             n_win = model_win.num_feature()
             n_top3 = model_top3.num_feature()
@@ -741,47 +782,15 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
 
             w_scores = wt_lgb_w * w_lgb + wt_cb_w * w_cb + wt_xgb_w * w_xgb
             t_scores = wt_lgb_t * t_lgb + wt_cb_t * t_cb + wt_xgb_t * t_xgb
-
-            # クラス別特化モデル (A/B/C) がロードされている場合はクラス別推論 & キャリブレーションで上書き
-            target_class_code = race_class_code
-            m_cls_w, m_cls_t, cls_key = None, None, None
-            if target_class_code in (0, 1) and model_class_a_win and model_class_a_top3:
-                m_cls_w, m_cls_t, cls_key = model_class_a_win, model_class_a_top3, "class_a"
-            elif target_class_code in (2, 3) and model_class_b_win and model_class_b_top3:
-                m_cls_w, m_cls_t, cls_key = model_class_b_win, model_class_b_top3, "class_b"
-            elif target_class_code in (4, 5) and model_class_c_win and model_class_c_top3:
-                m_cls_w, m_cls_t, cls_key = model_class_c_win, model_class_c_top3, "class_c"
-
-            if m_cls_w and m_cls_t:
-                try:
-                    n_cw = m_cls_w.num_feature()
-                    n_ct = m_cls_t.num_feature()
-                    inp_cw = [r[:n_cw] for r in feature_rows]
-                    inp_ct = [r[:n_ct] for r in feature_rows]
-                    raw_cw = np.array(m_cls_w.predict(inp_cw, num_threads=4))
-                    raw_ct = np.array(m_cls_t.predict(inp_ct, num_threads=4))
-
-                    # キャリブレーション補正
-                    cal_info = (calibration_table or {}).get(cls_key, {})
-                    w_cal_tab = cal_info.get("win_calib", [])
-                    t_cal_tab = cal_info.get("top3_calib", [])
-
-                    def _calib(val, tab):
-                        if not tab: return val
-                        diffs = [abs(e.get("pred", 0.0) - val) for e in tab]
-                        return float(tab[int(np.argmin(diffs))].get("calib", val))
-
-                    w_scores = np.array([_calib(v, w_cal_tab) for v in raw_cw])
-                    t_scores = np.array([_calib(v, t_cal_tab) for v in raw_ct])
-                except Exception as ex_cls:
-                    print(f"クラス別モデル推論フォールバック ({cls_key}): {ex_cls}")
-
-            for idx, h in enumerate(horses):
-                h["prob_win"] = round(float(w_scores[idx]), 4)
-                h["prob_top3"] = round(float(t_scores[idx]), 4)
-                h["score"] = h["prob_win"]
         except Exception as e:
             raise RuntimeError(f"AIアンサンブル推論エラー ({race_id}): {e}")
+
+    # 3. 推論スコアを出走各馬へ反映
+    if w_scores is not None and t_scores is not None:
+        for idx, h in enumerate(horses):
+            h["prob_win"] = round(float(w_scores[idx]), 4)
+            h["prob_top3"] = round(float(t_scores[idx]), 4)
+            h["score"] = h["prob_win"]
     elif model:
         try:
             n_mod = model.num_feature()

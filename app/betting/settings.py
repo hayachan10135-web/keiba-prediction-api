@@ -172,11 +172,12 @@ def get_today_total_betted(target_date: Optional[str] = None) -> int:
     """当日（JST）の自動投票済み累計金額（円）を取得（マニュアル投票 FR-BET-07 は完全除外）"""
     t_date = target_date or today_jst_str()
     supabase = get_supabase_client()
-    total = 0
+    betted_by_race: Dict[str, int] = {}
+
     if supabase:
         try:
             res = supabase.table("keiba_real_bets")\
-                .select("total_amount")\
+                .select("race_id, total_amount, is_manual_bet")\
                 .gte("bet_time", f"{t_date} 00:00:00")\
                 .lte("bet_time", f"{t_date} 23:59:59")\
                 .eq("status", "success")\
@@ -184,17 +185,27 @@ def get_today_total_betted(target_date: Optional[str] = None) -> int:
                 .execute()
             if res.data:
                 for row in res.data:
-                    total += int(row.get("total_amount") or 0)
-                return total
+                    rid = str(row.get("race_id") or "")
+                    amt = int(row.get("total_amount") or 0)
+                    if rid:
+                        betted_by_race[rid] = max(betted_by_race.get(rid, 0), amt)
+                    else:
+                        betted_by_race[f"_db_{len(betted_by_race)}"] = amt
         except Exception as e:
-            print(f"[get_today_total_betted] Supabase集計フォールバック: {e}")
+            print(f"[get_today_total_betted] keiba_real_bets 集計警告: {e}")
 
-    # フォールバック: settings 内の betted_races_by_date から集計
+    # settings 内の betted_races_by_date とマージ（二重計上を防ぎつつどちらの記録も漏らさず上限保護）
     b_dict = _betting_settings.get("betted_races_by_date", {})
     b_list = b_dict.get(t_date, [])
     for b in b_list:
-        total += int(b.get("amount") or 0)
-    return total
+        rid = str(b.get("race_id") or "")
+        amt = int(b.get("amount") or 0)
+        if rid:
+            betted_by_race[rid] = max(betted_by_race.get(rid, 0), amt)
+        else:
+            betted_by_race[f"_meta_{len(betted_by_race)}"] = amt
+
+    return sum(betted_by_race.values())
 
 
 def check_investment_limit(additional_amount: int, target_date: Optional[str] = None) -> Tuple[bool, int, int]:

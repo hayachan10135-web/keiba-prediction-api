@@ -284,6 +284,7 @@ async def background_maintenance_loop():
                                         + (h_rec.get("fukusho_bets") or [])
                                         + (h_rec.get("umatan_bets") or [])
                                         + (h_rec.get("umaren_bets") or [])
+                                        + (h_rec.get("wide_bets") or [])
                                         + (h_rec.get("trio_bets") or [])
                                         + (h_rec.get("sanrentan_bets") or [])
                                     )
@@ -361,11 +362,34 @@ async def background_maintenance_loop():
                                                             _auto_betted_dates_ref.add(today_str)
                                                         if _auto_betted_races_ref is not None:
                                                             _auto_betted_races_ref.add(r_id)
+
+                                                        now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
+                                                        now_time_iso = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+                                                        # 1. keiba_real_bets テーブルへ自動投票レコードを永続化 (is_manual_bet=False)
+                                                        try:
+                                                            supabase_cli = get_supabase_client()
+                                                            if supabase_cli:
+                                                                bet_record = {
+                                                                    "race_id": r_id,
+                                                                    "platform": cur_bet_mode,
+                                                                    "receipt_no": str(rcpt),
+                                                                    "total_amount": tot_amt,
+                                                                    "items": bet_items,
+                                                                    "status": "success",
+                                                                    "is_manual_bet": False,
+                                                                    "bet_time": now_time_iso,
+                                                                }
+                                                                supabase_cli.table("keiba_real_bets").insert(bet_record).execute()
+                                                                print(f"[AutoBet] 💾 keiba_real_bets に自動投票レコードを永続化完了 (race_id: {r_id}, 受付: {rcpt})")
+                                                        except Exception as db_err:
+                                                            print(f"[AutoBet DB Error] keiba_real_bets 保存エラー: {db_err}")
+
+                                                        # 2. settings 内の betted_races_by_date の更新
                                                         try:
                                                             cur_s = load_betting_settings_from_supabase()
                                                             b_dict = cur_s.get("betted_races_by_date", {})
                                                             b_list = b_dict.get(today_str, [])
-                                                            now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
                                                             b_list.append({
                                                                 "race_id": r_id,
                                                                 "receipt_no": str(rcpt),
@@ -377,7 +401,7 @@ async def background_maintenance_loop():
                                                             cur_s["betted_races_by_date"] = b_dict
                                                             if bet_res.get("balance") is not None:
                                                                 cur_s["last_balance"] = bet_res.get("balance")
-                                                                cur_s["last_balance_updated_at"] = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
+                                                                cur_s["last_balance_updated_at"] = now_time_iso
                                                             save_betting_settings_to_supabase(cur_s)
                                                         except Exception as me:
                                                             print(f"[AutoBet Meta Save Error] {me}")
