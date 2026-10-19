@@ -15,11 +15,7 @@ from typing import List, Dict, Tuple, Optional, Any, Callable
 from bs4 import BeautifulSoup
 
 from app.scrapers.netkeiba_client import safe_scrape_get, safe_decode_html, get_today_jst_str
-
-VENUE_CODE_MAP = {
-    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
-    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
-}
+from app.core.race_utils import clean_pure_race_name, VENUE_CODE_MAP
 
 # キャッシュ
 _period_venues_cache: Dict[str, Any] = {}
@@ -104,6 +100,17 @@ def parse_netkeiba_race_list_html(html_text: str) -> List[dict]:
         if post_time_est:
             _notify_post_time(race_id, post_time_est)
 
+        # 純粋なレース名（会場名・R番号・時刻・頭数等を除去）
+        pure_name = clean_pure_race_name(clean_text, race_id)
+        if not pure_name:
+            pure_name = f"{race_no} 一般競走"
+
+        # 付帯コース情報（例: ダ1200m 15頭）
+        c_match = re.search(r"((?:芝|ダ|ダート|障|障害)\d{3,4}m(?:\s*\d{1,2}頭)?)", clean_text)
+        course_desc = c_match.group(1) if c_match else ""
+        info_parts = [p for p in [post_time_est, course_desc] if p]
+        full_info = " ".join(info_parts)
+
         if venue_name not in raw_venue_races:
             raw_venue_races[venue_name] = []
 
@@ -112,8 +119,8 @@ def parse_netkeiba_race_list_html(html_text: str) -> List[dict]:
             "race_id": race_id,
             "kai_day": kai_day,
             "race_num_int": race_num_int,
-            "race_name": clean_text if clean_text else f"{race_no}",
-            "race_info": post_time_est
+            "race_name": pure_name,
+            "race_info": full_info
         })
 
     for v_name, r_list in raw_venue_races.items():

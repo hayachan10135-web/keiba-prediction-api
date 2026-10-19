@@ -17,6 +17,7 @@ from fastapi import HTTPException, Query
 
 from app.core.database import get_supabase_client
 from app.core.timezone import today_jst_str
+from app.core.race_utils import clean_pure_race_name
 from app.settlement.payout_verifier import PayoutVerifier
 from app.settlement.summary_calculator import invalidate_summary_caches
 from app.scrapers import (
@@ -342,9 +343,10 @@ def save_cached_result(race_id: str, race_name: str, race_date: str, result_dict
     if not supabase:
         return
     try:
+        pure_race_name = clean_pure_race_name(race_name, race_id)
         supabase.table("keiba_race_results_cache").upsert({
             "race_id": race_id,
-            "race_name": race_name,
+            "race_name": pure_race_name,
             "race_date": race_date,
             "result_json": result_dict
         }).execute()
@@ -358,10 +360,11 @@ def save_settlement(data: dict):
     if not supabase:
         return
     try:
+        pure_race_name = clean_pure_race_name(data["race_name"], data["race_id"])
         row_dict = {
             "race_id": data["race_id"],
             "race_date": data["race_date"],
-            "race_name": data["race_name"],
+            "race_name": pure_race_name,
             "strategy_type": data.get("strategy_type", "hybrid"),
             "target_umaban": data.get("target_umaban"),
             "horse_name": data.get("horse_name"),
@@ -722,6 +725,7 @@ def process_settlement_calculation(
     from_cache: bool = False
 ) -> dict:
     """レース着順・払戻結果と予想データを突き合わせ、収支・損益・的中判定を確定計算"""
+    race_name = clean_pure_race_name(race_name, race_id)
     supabase = get_supabase_client()
     t_bias = pred_data.get("track_bias") if isinstance(pred_data, dict) else None
     o_alerts = [

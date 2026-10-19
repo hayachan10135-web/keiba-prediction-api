@@ -14,6 +14,7 @@ from fastapi import Query
 
 from app.core.database import get_supabase_client
 from app.core.timezone import now_jst_naive, today_jst_str, is_before_morning_prediction
+from app.core.race_utils import clean_pure_race_name
 from app.scrapers import (
     fetch_venues_for_date_raw,
     register_crawler_post_time_handler,
@@ -57,18 +58,20 @@ def register_race_schedule(race_id: str, race_date: str, race_name: str, post_ti
         post_dt = datetime.datetime(d_parts[0], d_parts[1], d_parts[2], hour, minute, 0)
         post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+        pure_race_name = clean_pure_race_name(race_name, race_id)
+
         existing = supabase.table("keiba_scheduled_races").select("race_id, is_settled, is_predicted").eq("race_id", race_id).execute()
         if existing.data and len(existing.data) > 0:
             supabase.table("keiba_scheduled_races").update({
                 "race_date": race_date,
-                "race_name": race_name,
+                "race_name": pure_race_name,
                 "post_datetime": post_dt_str
             }).eq("race_id", race_id).execute()
         else:
             supabase.table("keiba_scheduled_races").insert({
                 "race_id": race_id,
                 "race_date": race_date,
-                "race_name": race_name,
+                "race_name": pure_race_name,
                 "post_datetime": post_dt_str,
                 "is_settled": 0,
                 "is_predicted": 0
@@ -97,10 +100,12 @@ def ensure_schedules_registered_for_venues(formatted_date: str, venues: List[dic
                     post_dt_str = post_dt.strftime("%Y-%m-%d %H:%M:%S")
                     post_time_str = f"{hour:02d}:{minute:02d}発走"
                     _latest_post_times[r_id] = post_time_str
+                    raw_name = r.get("race_name") or r.get("race_no") or ""
+                    pure_name = clean_pure_race_name(raw_name, r_id)
                     updates_for_schedule.append({
                         "race_id": r_id,
                         "race_date": formatted_date,
-                        "race_name": r.get("race_name", r.get("race_no", "")),
+                        "race_name": pure_name,
                         "post_datetime": post_dt_str,
                         "post_time_str": post_time_str
                     })

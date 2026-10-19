@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 from fastapi import HTTPException
 
 from app.core.config import settings
+from app.core.race_utils import clean_pure_race_name
 
 
 # --- 堅牢なスクレイピング用 HTTP クライアント基盤 ---
@@ -270,7 +271,9 @@ def fetch_shutuba_table(race_id: str, race_date: Optional[str] = None):
                 race_name = m.group(1).strip()
 
     if not race_name:
-        race_name = f"{race_num} 一般競走"
+        raise ValueError(f"レース名が取得できませんでした (race_id: {race_id})。デフォルト値混入防止のため処理を中断します。")
+
+    race_name = clean_pure_race_name(race_name, race_id)
 
     race_data_tag = soup.select_one(".RaceData01, .RaceData")
     race_data_text = race_data_tag.get_text(separator=" ", strip=True) if race_data_tag else ""
@@ -580,7 +583,7 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         "trio": {},
         "tierce": {}
     }
-    race_name = f"Race {race_id}"
+    race_name = ""
     sp_html_text = ""
     pc_html_text = ""
     sp_title = ""
@@ -791,6 +794,23 @@ def fetch_netkeiba_race_result(race_id: str) -> Optional[dict]:
         empty_title = (sp_title.startswith("|") or pc_title.startswith("|") or (not sp_title and not pc_title))
         if has_cancel_kw or (empty_title and len(orders) == 0):
             is_cancelled = True
+
+    if race_name and not race_name.startswith("Race "):
+        race_name = clean_pure_race_name(race_name, race_id)
+    else:
+        # デフォルト値 "Race 2026..." ではなく、keiba_scheduled_races から正規のレース名を取得
+        try:
+            from app.core.database import get_supabase_client
+            sb = get_supabase_client()
+            if sb:
+                sr = sb.table("keiba_scheduled_races").select("race_name").eq("race_id", race_id).limit(1).execute()
+                if sr.data and sr.data[0].get("race_name"):
+                    race_name = clean_pure_race_name(sr.data[0]["race_name"], race_id)
+        except Exception:
+            pass
+
+    if not race_name or race_name.startswith("Race "):
+        raise ValueError(f"確定結果のレース名が取得できませんでした (race_id: {race_id})。デフォルト値の混入を避けるため処理を中断します。")
 
     if is_cancelled:
         return {
