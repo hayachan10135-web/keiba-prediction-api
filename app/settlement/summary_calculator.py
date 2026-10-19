@@ -262,35 +262,23 @@ def get_summary_dates_list(force_refresh: bool = False) -> List[str]:
     try:
         dates_set = set()
         if supabase:
-            # 1. 確定・集計済みレコードがある日付
+            # 1. 確定・集計済みレコードがある日付 (DISTINCT で一括高速取得)
             try:
-                page = 0
-                while True:
-                    res_settle = supabase.table("keiba_race_settlements").select("race_date").range(page * 1000, (page + 1) * 1000 - 1).execute()
-                    batch = res_settle.data or []
-                    for row in batch:
-                        d = row.get("race_date")
-                        if d and len(d) == 10 and d.startswith("20"):
-                            dates_set.add(d)
-                    if len(batch) < 1000:
-                        break
-                    page += 1
+                res_settle = supabase.table("keiba_race_settlements").select("DISTINCT race_date").execute()
+                for row in (res_settle.data or []):
+                    d = row.get("race_date")
+                    if d and len(d) == 10 and d.startswith("20"):
+                        dates_set.add(d)
             except Exception as e:
                 print(f"settlements dates error: {e}")
 
-            # 2. レース開催日として登録された日付
+            # 2. レース開催日として登録された日付 (DISTINCT で一括高速取得)
             try:
-                page = 0
-                while True:
-                    res_sched = supabase.table("keiba_scheduled_races").select("race_date").range(page * 1000, (page + 1) * 1000 - 1).execute()
-                    batch = res_sched.data or []
-                    for row in batch:
-                        d = row.get("race_date")
-                        if d and len(d) == 10 and d.startswith("20"):
-                            dates_set.add(d)
-                    if len(batch) < 1000:
-                        break
-                    page += 1
+                res_sched = supabase.table("keiba_scheduled_races").select("DISTINCT race_date").execute()
+                for row in (res_sched.data or []):
+                    d = row.get("race_date")
+                    if d and len(d) == 10 and d.startswith("20"):
+                        dates_set.add(d)
             except Exception as e:
                 print(f"scheduled dates error: {e}")
 

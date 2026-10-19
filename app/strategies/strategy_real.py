@@ -40,8 +40,8 @@ class StrategyReal(BaseBettingStrategy):
         surface_type: int,
         is_summer: bool,
     ) -> bool:
-        # 日次スロット保証による明示的選定の場合
-        if race_info.get("is_real_guarantee", False):
+        # 日次スロット保証による明示的選定の場合 (is_real_guarantee または is_daily_top_race)
+        if race_info.get("is_real_guarantee", False) or race_info.get("is_daily_top_race", False):
             return True
 
         if len(horses) < 6 or surface_type == 2:
@@ -73,7 +73,7 @@ class StrategyReal(BaseBettingStrategy):
         w0_name = str(honmei_horse.get("horse_name", f"馬{w0_u}"))
         w0_odds = float(honmei_horse.get("odds") or 50.0)
 
-        is_guarantee = bool(race_info.get("is_real_guarantee", False))
+        is_guarantee = bool(race_info.get("is_real_guarantee", False) or race_info.get("is_daily_top_race", False))
 
         # 保証枠は少額300円、自然枠は1,000円
         bet_amount = 300 if is_guarantee else 1000

@@ -78,6 +78,26 @@ class TestManualBetExclusion(unittest.TestCase):
         for row in (res_auto.data or []):
             self.assertFalse(bool(row.get("is_manual_bet")), "is_manual_bet=False のみが取得されること")
 
+    def test_sqlite_bridge_distinct_query(self):
+        """
+        LocalSQLiteClient において SELECT DISTINCT <column> が正常に解釈され、
+        重複のないカラム値リストが返却されることを検証
+        """
+        from app.core.sqlite_bridge import LocalSQLiteClient, DEFAULT_DB_PATH
+
+        if not os.path.exists(DEFAULT_DB_PATH):
+            self.skipTest("ローカル SQLite DBが存在しないためスキップ")
+
+        client = LocalSQLiteClient(DEFAULT_DB_PATH)
+        res_distinct = client.table("keiba_race_settlements").select("DISTINCT race_date").execute()
+        self.assertGreater(len(res_distinct.data), 0)
+        seen_dates = set()
+        for row in res_distinct.data:
+            self.assertIn("race_date", row, "race_date カラムが存在すること")
+            d = row["race_date"]
+            self.assertNotIn(d, seen_dates, f"重複日付が存在してはならない: {d}")
+            seen_dates.add(d)
+
 
 if __name__ == "__main__":
     unittest.main()

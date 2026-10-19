@@ -179,6 +179,30 @@ class TestArbiter4Classes(unittest.TestCase):
         self.assertEqual(len(decision["virtual_bets"]), 2)
         self.assertEqual(decision["virtual_total_amount"], 1000)
 
+    def test_daily_top_race_promotion(self):
+        """is_daily_top_race=True（自然合致0件時のデイリー昇格枠）の場合、⭐【実勝負(保証)】として選出され実馬券対象となること"""
+        horses = self._create_mock_horses(count=10, top_odds=8.5, top_prob_win=0.15, top_prob_top3=0.40)
+        decision = self.arbiter.evaluate_race(
+            race_name="3歳以上1勝クラス",
+            race_details={"course_details": "ダ1800m"},
+            horses=horses,
+            surface_type=1,
+            prob_gachi=0.2,
+            prob_himo=0.2,
+            opponents=[],
+            u0=1,
+            honmei_horse=horses[0],
+            race_date_str="2026-10-19",
+            is_daily_top_race=True,
+            race_class_code=2,
+        )
+        self.assertTrue(decision["is_participate"])
+        self.assertEqual(decision["bet_category"], "real")
+        self.assertTrue(decision["is_real_bet_target"])
+        self.assertEqual(decision["total_amount"], 300)
+        self.assertIn("wide_bets", decision)
+        self.assertIn("wide_amount", decision)
+
     def test_payout_verifier_wide_hit(self):
         """PayoutVerifier がワイド馬券の的中と払戻金を正しく照合できること"""
         from app.settlement.payout_verifier import PayoutVerifier

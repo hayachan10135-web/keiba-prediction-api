@@ -82,44 +82,11 @@ _stats_overlay: Dict[str, Any] = {
 
 
 def load_all_models():
-    """全LightGBMモデルおよび統計辞書をロード"""
-    global model, model_win, model_top3, model_maiden_win, model_maiden_top3, model_gachi, model_himo, stats_dict
+    """本番特化モデル (クラス別A/B/C、メタモデルgachi/himo、統計辞書) を最優先でロード"""
+    global model_gachi, model_himo, stats_dict
+    global model_class_a_win, model_class_a_top3, model_class_b_win, model_class_b_top3, model_class_c_win, model_class_c_top3, calibration_table
 
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = lgb.Booster(model_file=MODEL_PATH)
-            print("現行LightGBMモデルを正常にロードしました。")
-        except Exception as e:
-            print(f"現行モデルロード失敗: {e}")
-
-    if os.path.exists(WIN_MODEL_PATH):
-        try:
-            model_win = lgb.Booster(model_file=WIN_MODEL_PATH)
-            print("1着特化モデル (m_win) を正常にロードしました。")
-        except Exception as e:
-            print(f"1着特化モデルロード失敗: {e}")
-
-    if os.path.exists(TOP3_MODEL_PATH):
-        try:
-            model_top3 = lgb.Booster(model_file=TOP3_MODEL_PATH)
-            print("3着内特化モデル (m_top3) を正常にロードしました。")
-        except Exception as e:
-            print(f"3着内特化モデルロード失敗: {e}")
-
-    if os.path.exists(MAIDEN_WIN_MODEL_PATH):
-        try:
-            model_maiden_win = lgb.Booster(model_file=MAIDEN_WIN_MODEL_PATH)
-            print("未勝利戦Winモデル (m_maiden_win) を正常にロードしました。")
-        except Exception as e:
-            print(f"未勝利戦Winモデルロード失敗: {e}")
-
-    if os.path.exists(MAIDEN_TOP3_MODEL_PATH):
-        try:
-            model_maiden_top3 = lgb.Booster(model_file=MAIDEN_TOP3_MODEL_PATH)
-            print("未勝利戦Top3モデル (m_maiden_top3) を正常にロードしました。")
-        except Exception as e:
-            print(f"未勝利戦Top3モデルロード失敗: {e}")
-
+    # 1. メタモデル (ガチガチ・中波乱判定) のロード
     if os.path.exists(GACHI_MODEL_PATH):
         try:
             model_gachi = lgb.Booster(model_file=GACHI_MODEL_PATH)
@@ -134,42 +101,7 @@ def load_all_models():
         except Exception as e:
             print(f"中波乱判定メタモデルロード失敗: {e}")
 
-    # CatBoost モデルのロード
-    global model_cb_win, model_cb_top3
-    if os.path.exists(CB_WIN_MODEL_PATH) and os.path.exists(CB_TOP3_MODEL_PATH):
-        try:
-            from catboost import CatBoostClassifier
-            model_cb_win = CatBoostClassifier()
-            model_cb_win.load_model(CB_WIN_MODEL_PATH)
-            model_cb_top3 = CatBoostClassifier()
-            model_cb_top3.load_model(CB_TOP3_MODEL_PATH)
-            print("CatBoostアンサンブルモデル (cb_win / cb_top3) を正常にロードしました。")
-        except Exception as e:
-            print(f"CatBoostモデルロード失敗: {e}")
-
-    # XGBoost モデルのロード
-    global model_xgb_win, model_xgb_top3
-    if os.path.exists(XGB_WIN_MODEL_PATH) and os.path.exists(XGB_TOP3_MODEL_PATH):
-        try:
-            import xgboost as xgb
-            model_xgb_win = xgb.Booster()
-            model_xgb_win.load_model(XGB_WIN_MODEL_PATH)
-            model_xgb_top3 = xgb.Booster()
-            model_xgb_top3.load_model(XGB_TOP3_MODEL_PATH)
-            print("XGBoostアンサンブルモデル (xgb_win / xgb_top3) を正常にロードしました。")
-        except Exception as e:
-            print(f"XGBoostモデルロード失敗: {e}")
-
-    # アンサンブル設定 (ensemble_config.json) のロード
-    global ensemble_config
-    if os.path.exists(ENSEMBLE_CONFIG_PATH):
-        try:
-            with open(ENSEMBLE_CONFIG_PATH, "r", encoding="utf-8") as f:
-                ensemble_config = json.load(f)
-            print("アンサンブル設定 (ensemble_config.json) を正常にロードしました。")
-        except Exception as e:
-            print(f"アンサンブル設定ロード失敗: {e}")
-
+    # 2. 統計辞書のロード
     if os.path.exists(DICT_PATH):
         try:
             with open(DICT_PATH, "r", encoding="utf-8") as f:
@@ -178,8 +110,7 @@ def load_all_models():
         except Exception as e:
             print(f"統計辞書ロード失敗: {e}")
 
-    # クラス別特化モデル (A/B/C) のロード
-    global model_class_a_win, model_class_a_top3, model_class_b_win, model_class_b_top3, model_class_c_win, model_class_c_top3, calibration_table
+    # 3. クラス別特化モデル (A/B/C) およびキャリブレーション辞書のロード (本番最優先)
     try:
         if os.path.exists(CLASS_A_WIN_MODEL_PATH):
             model_class_a_win = lgb.Booster(model_file=CLASS_A_WIN_MODEL_PATH)
@@ -196,6 +127,72 @@ def load_all_models():
         print("クラス別特化モデル (A/B/C) およびキャリブレーション辞書を正常にロードしました。")
     except Exception as e:
         print(f"クラス別モデルロード警告: {e}")
+
+
+def ensure_fallback_ensemble_loaded():
+    """
+    クラス別特化モデルで推論できない異常レース発生時のみ、
+    旧3大アンサンブルモデル (LightGBM × CatBoost × XGBoost) を遅延ロード (Lazy Load)
+    """
+    global model, model_win, model_top3, model_maiden_win, model_maiden_top3
+    global model_cb_win, model_cb_top3, model_xgb_win, model_xgb_top3, ensemble_config
+
+    if model_win is not None and model_top3 is not None:
+        return
+
+    print("[LazyLoad] 旧アンサンブルモデル群の遅延ロードを実行します...")
+
+    if os.path.exists(WIN_MODEL_PATH) and model_win is None:
+        try:
+            model_win = lgb.Booster(model_file=WIN_MODEL_PATH)
+            print("1着特化モデル (m_win) を遅延ロードしました。")
+        except Exception as e:
+            print(f"1着特化モデル遅延ロード失敗: {e}")
+
+    if os.path.exists(TOP3_MODEL_PATH) and model_top3 is None:
+        try:
+            model_top3 = lgb.Booster(model_file=TOP3_MODEL_PATH)
+            print("3着内特化モデル (m_top3) を遅延ロードしました。")
+        except Exception as e:
+            print(f"3着内特化モデル遅延ロード失敗: {e}")
+
+    if os.path.exists(MODEL_PATH) and model is None:
+        try:
+            model = lgb.Booster(model_file=MODEL_PATH)
+        except Exception:
+            pass
+
+    # CatBoost モデル
+    if os.path.exists(CB_WIN_MODEL_PATH) and os.path.exists(CB_TOP3_MODEL_PATH) and model_cb_win is None:
+        try:
+            from catboost import CatBoostClassifier
+            model_cb_win = CatBoostClassifier()
+            model_cb_win.load_model(CB_WIN_MODEL_PATH)
+            model_cb_top3 = CatBoostClassifier()
+            model_cb_top3.load_model(CB_TOP3_MODEL_PATH)
+            print("CatBoostモデルを遅延ロードしました。")
+        except Exception as e:
+            print(f"CatBoostモデル遅延ロード失敗: {e}")
+
+    # XGBoost モデル
+    if os.path.exists(XGB_WIN_MODEL_PATH) and os.path.exists(XGB_TOP3_MODEL_PATH) and model_xgb_win is None:
+        try:
+            import xgboost as xgb
+            model_xgb_win = xgb.Booster()
+            model_xgb_win.load_model(XGB_WIN_MODEL_PATH)
+            model_xgb_top3 = xgb.Booster()
+            model_xgb_top3.load_model(XGB_TOP3_MODEL_PATH)
+            print("XGBoostモデルを遅延ロードしました。")
+        except Exception as e:
+            print(f"XGBoostモデル遅延ロード失敗: {e}")
+
+    # アンサンブル設定
+    if os.path.exists(ENSEMBLE_CONFIG_PATH) and ensemble_config is None:
+        try:
+            with open(ENSEMBLE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                ensemble_config = json.load(f)
+        except Exception:
+            pass
 
 
 # モジュールインポート時に自動ロード

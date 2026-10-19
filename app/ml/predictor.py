@@ -364,14 +364,14 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         raise ValueError(f"レース {race_id} の出走馬データが空のため予想を生成できません。ダミー値による補完は禁止されています。")
 
     expected_num_features = 48
-    if model_win:
+    if model_class_b_win:
         try:
-            expected_num_features = model_win.num_feature()
+            expected_num_features = model_class_b_win.num_feature()
         except Exception:
             expected_num_features = 48
-    elif model:
+    elif model_win:
         try:
-            expected_num_features = model.num_feature()
+            expected_num_features = model_win.num_feature()
         except Exception:
             expected_num_features = 48
 
@@ -730,6 +730,9 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             t_scores = None
 
     # 2. クラス別モデル未該当レースまたはエラー時のみ、旧3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) にフォールバック
+    if (w_scores is None or t_scores is None):
+        from app.ml.model_loader import ensure_fallback_ensemble_loaded
+        ensure_fallback_ensemble_loaded()
     if (w_scores is None or t_scores is None) and model_win and model_top3:
         try:
             n_win = model_win.num_feature()

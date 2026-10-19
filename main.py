@@ -927,13 +927,6 @@ def _startup_background_init():
         normalize_mislabeled_dates()
         fix_duplicated_horses_cache_2026()
         _clear_morning_unannounced_badges()
-        # 過去日（10/17等）の確定バッジ整合を確実に復元
-        try:
-            raw_v_1017 = fetch_venues_for_date_raw("2026-10-17")
-            if raw_v_1017:
-                attach_prediction_badges_to_venues("2026-10-17", raw_v_1017)
-        except Exception as e_1017:
-            print(f"[Startup 10/17 Heal Warning] {e_1017}")
         if not is_before_morning_prediction(today_jst_str()):
             ensure_daily_single_real_bet(today_jst_str())
         endpoint_sync_active_post_times(today_jst_str())

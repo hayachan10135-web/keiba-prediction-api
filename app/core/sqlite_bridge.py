@@ -222,6 +222,10 @@ class SQLiteQueryBuilder:
         cols = self._select_cols.strip()
         if cols == "*":
             cols_clause = "*"
+        elif cols.upper().startswith("DISTINCT "):
+            raw_target = cols[9:].strip()
+            target_parts = [f'"{p.strip()}"' for p in raw_target.split(",") if p.strip()]
+            cols_clause = "DISTINCT " + (", ".join(target_parts) if target_parts else "*")
         else:
             parts = [f'"{p.strip()}"' for p in cols.split(",") if p.strip()]
             cols_clause = ", ".join(parts) if parts else "*"
