@@ -26,6 +26,7 @@ JSON_COLUMNS = {
     "track_bias",
     "odds_alerts",
     "top3_orders",
+    "mark_orders",
     "items",
     "value",
 }

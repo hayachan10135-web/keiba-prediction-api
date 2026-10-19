@@ -361,6 +361,13 @@ def save_settlement(data: dict):
         return
     try:
         pure_race_name = clean_pure_race_name(data["race_name"], data["race_id"])
+        
+        # bet_details からカテゴリ情報等を安全にフォールバック取得
+        b_det_in = data.get("bet_details") or {}
+        b_cat = data.get("bet_category") or (b_det_in.get("bet_category") if isinstance(b_det_in, dict) else None) or "skip"
+        is_real_t = 1 if (data.get("is_real_bet_target") or (isinstance(b_det_in, dict) and b_det_in.get("is_real_bet_target"))) else 0
+        is_virt = 1 if (data.get("is_virtual_bet") or (isinstance(b_det_in, dict) and b_det_in.get("is_virtual_bet"))) else 0
+
         row_dict = {
             "race_id": data["race_id"],
             "race_date": data["race_date"],
@@ -370,12 +377,24 @@ def save_settlement(data: dict):
             "horse_name": data.get("horse_name"),
             "grade": data.get("grade"),
             "is_pass": 1 if data.get("is_pass") else 0,
+            "bet_category": b_cat,
+            "is_real_bet_target": is_real_t,
+            "is_virtual_bet": is_virt,
+            "race_class_code": data.get("race_class_code"),
+            "tansho_bet": data.get("tansho_bet", 0),
+            "fukusho_bet": data.get("fukusho_bet", 0),
+            "umatan_bet": data.get("umatan_bet", 0),
             "umaren_bet": data.get("umaren_bet", 0),
             "trio_bet": data.get("trio_bet", 0),
+            "sanrentan_bet": data.get("sanrentan_bet", 0),
             "total_bet": data.get("total_bet", 0),
             "actual_order": data.get("actual_order"),
+            "tansho_payout": data.get("tansho_payout", 0),
+            "fukusho_payout": data.get("fukusho_payout", 0),
+            "umatan_payout": data.get("umatan_payout", 0),
             "umaren_payout": data.get("umaren_payout", 0),
             "trio_payout": data.get("trio_payout", 0),
+            "sanrentan_payout": data.get("sanrentan_payout", 0),
             "total_payout": data.get("total_payout", 0),
             "is_hit": 1 if data.get("is_hit") else 0,
             "hit_type": data.get("hit_type"),
@@ -386,19 +405,11 @@ def save_settlement(data: dict):
             "payout_breakdown": data.get("payout_breakdown", {}),
             "bet_details": data.get("bet_details"),
             "payout_details": data.get("payout_details"),
-            "tansho_bet": data.get("tansho_bet", 0),
-            "fukusho_bet": data.get("fukusho_bet", 0),
-            "tansho_payout": data.get("tansho_payout", 0),
-            "fukusho_payout": data.get("fukusho_payout", 0)
+            "mark_orders": data.get("mark_orders"),
+            "top3_orders": data.get("top3_orders"),
+            "track_bias": data.get("track_bias"),
+            "odds_alerts": data.get("odds_alerts")
         }
-        if "track_bias" in data and data["track_bias"] is not None:
-            row_dict["track_bias"] = data["track_bias"]
-        if "odds_alerts" in data and data["odds_alerts"] is not None:
-            row_dict["odds_alerts"] = data["odds_alerts"]
-        if "top3_orders" in data and data["top3_orders"] is not None:
-            row_dict["top3_orders"] = data["top3_orders"]
-        if "mark_orders" in data and data["mark_orders"] is not None:
-            row_dict["mark_orders"] = data["mark_orders"]
 
         # bet_details 内の real_bet_meta にも常に top3_orders と mark_orders を格納して冗長保護
         b_det_ensure = row_dict.get("bet_details") or {}
@@ -414,16 +425,12 @@ def save_settlement(data: dict):
         try:
             supabase.table("keiba_race_settlements").upsert(row_dict).execute()
         except Exception as col_err:
+            # 万が一のカラム不一致フォールバック
             if "track_bias" in row_dict or "odds_alerts" in row_dict or "top3_orders" in row_dict or "mark_orders" in row_dict:
                 b_det = row_dict.get("bet_details") or {}
-                if "track_bias" in row_dict:
-                    b_det["track_bias"] = row_dict.pop("track_bias")
-                if "odds_alerts" in row_dict:
-                    b_det["odds_alerts"] = row_dict.pop("odds_alerts")
-                if "top3_orders" in row_dict:
-                    b_det["top3_orders"] = row_dict.pop("top3_orders")
-                if "mark_orders" in row_dict:
-                    b_det["mark_orders"] = row_dict.pop("mark_orders")
+                for pop_k in ("track_bias", "odds_alerts", "top3_orders", "mark_orders", "umatan_bet", "umatan_payout", "sanrentan_bet", "sanrentan_payout", "bet_category", "is_real_bet_target", "is_virtual_bet", "race_class_code"):
+                    if pop_k in row_dict:
+                        b_det[pop_k] = row_dict.pop(pop_k)
                 row_dict["bet_details"] = b_det
                 supabase.table("keiba_race_settlements").upsert(row_dict).execute()
             else:

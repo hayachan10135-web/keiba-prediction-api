@@ -150,10 +150,14 @@ def calc_period_stat(title: str, key: str, rows: list) -> dict:
     rb_payout = 0
     for r in rows:
         if r.get("is_pass") == 0:
-            bd = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
-            rbm = bd.get("real_bet_meta") or {}
-            b_cat = bd.get("bet_category") or rbm.get("bet_category")
-            is_rb = (b_cat in ("super", "real")) or bool(rbm.get("is_real_bet_target"))
+            # カラムから直接判定 (高速)
+            is_rb = (r.get("is_real_bet_target") == 1) or (r.get("bet_category") in ("super", "real"))
+            if not is_rb:
+                # 過去データ用フォールバック
+                bd = r.get("bet_details") if isinstance(r.get("bet_details"), dict) else {}
+                rbm = bd.get("real_bet_meta") or {}
+                b_cat = bd.get("bet_category") or rbm.get("bet_category")
+                is_rb = (b_cat in ("super", "real")) or bool(rbm.get("is_real_bet_target"))
             if is_rb:
                 rb_races += 1
                 if r.get("is_hit") == 1:
@@ -203,7 +207,7 @@ def calculate_aggregate_summary(force_refresh: bool = False) -> dict:
             page_size = 1000
             while True:
                 cum_res = supabase.table("keiba_race_settlements").select(
-                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details"
+                    "race_date, is_pass, is_hit, total_bet, total_payout, pass_benefit, bet_details, bet_category, is_real_bet_target, is_virtual_bet"
                 ).range(page * page_size, (page + 1) * page_size - 1).execute()
                 batch = cum_res.data or []
                 cum_rows.extend(batch)
