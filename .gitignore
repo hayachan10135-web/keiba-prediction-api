@@ -13,4 +13,5 @@ firebase_service_account.json
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.bak*
 *.db
