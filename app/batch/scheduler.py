@@ -129,6 +129,7 @@ async def background_maintenance_loop():
     last_17h_settle_date = None
     last_19h_settle_date = None
     last_830_predict_date = None
+    last_daily_backup_date = None
     healed_post_weight_rids = set()
 
     while True:
@@ -137,6 +138,15 @@ async def background_maintenance_loop():
             now_dt = _now_jst_naive_fn() if _now_jst_naive_fn else datetime.datetime.now()
             today_str = _today_jst_str_fn() if _today_jst_str_fn else now_dt.strftime("%Y-%m-%d")
             p_info = _get_current_kaisai_period_fn(now_dt) if _get_current_kaisai_period_fn else {}
+
+            # --- ⓪ 深夜 3:00 の Google ドライブ自動日次バックアップ ---
+            if now_dt.hour == 3 and last_daily_backup_date != today_str:
+                try:
+                    from app.maintenance.backup import backup_database_to_drive
+                    backup_database_to_drive()
+                    last_daily_backup_date = today_str
+                except Exception as be:
+                    print(f"[Scheduler] 自動日次バックアップエラー: {be}")
 
             # --- ⑥ 金曜 20:00 以降の古いキャッシュ自動整理 (75日以前の過去分のみ安全破棄) ---
             if now_dt.weekday() == 4 and now_dt.hour >= 20:

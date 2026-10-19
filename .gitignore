@@ -8,3 +8,9 @@ firebase_service_account.json
 *service_account*.json
 *.key
 *.pem
+
+# Local SQLite Database
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.db
