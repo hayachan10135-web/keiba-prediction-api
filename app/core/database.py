@@ -20,7 +20,7 @@ USE_LOCAL_SQLITE = os.getenv("USE_LOCAL_SQLITE", "1").lower() in ("1", "true", "
 _db_client: Optional[Any] = None
 
 
-def get_supabase_client() -> Optional[Any]:
+def get_db() -> Optional[Any]:
     """
     データベースクライアントシングルトンを取得。
     USE_LOCAL_SQLITE=True 時は最速ローカル SQLite クライアント (LocalSQLiteClient) を返却。
@@ -54,4 +54,8 @@ def get_supabase_client() -> Optional[Any]:
     else:
         print("[Database] ⚠️ 警告: SUPABASE_URL または SUPABASE_KEY が環境変数に設定されていません。", file=sys.stderr)
         return None
+
+
+# 後方互換性エイリアス (旧名称)
+get_supabase_client = get_db
 

@@ -284,13 +284,13 @@ def normalize_mislabeled_dates():
                 try:
                     supabase.table("keiba_race_results_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
                     migrated_results += 1
-                except Exception:
-                    pass
+                except Exception as e_res:
+                    print(f"[NormalizeDates] race_results_cache update warning for {r_id}: {e_res}")
                 try:
                     supabase.table("keiba_predictions_cache").update({"race_date": correct_date}).eq("race_id", r_id).execute()
                     migrated_predictions += 1
-                except Exception:
-                    pass
+                except Exception as e_pred:
+                    print(f"[NormalizeDates] predictions_cache update warning for {r_id}: {e_pred}")
 
         # keiba_scheduled_races の 2026-10-13 レコードも更新・整理
         try:

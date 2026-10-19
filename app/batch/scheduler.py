@@ -171,8 +171,8 @@ async def background_maintenance_loop():
                         try:
                             chk_p = supabase.table("keiba_predictions_cache").select("race_id").eq("race_date", today_str).execute()
                             already_predicted_count = len(chk_p.data or [])
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[Scheduler] keiba_predictions_cache count warning: {e}")
 
                     if already_predicted_count >= 20:
                         print(f"[Scheduler] 当日({today_str})の予想データは既に準備済み({already_predicted_count}R)です。各レースのマルチステージ自動推論(60m/30m/15m/05m)へ移行します。")

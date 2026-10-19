@@ -206,16 +206,16 @@ def endpoint_clear_db(sync_today: bool = False):
                 "key": "schema_version",
                 "value": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
             }).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ClearDB] schema_version save warning: {e}")
         try:
             supabase.table("keiba_predictions_cache").upsert({
                 "race_id": "SCHEMA_VERSION",
                 "race_date": "9999-12-31",
                 "data_json": {"version": CURRENT_DB_VERSION, "updated_at": today_jst_str()}
             }).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ClearDB] predictions_cache schema_version save warning: {e}")
     return res
 
 
