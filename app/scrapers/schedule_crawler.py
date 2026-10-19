@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from app.scrapers.netkeiba_client import safe_scrape_get, safe_decode_html, get_today_jst_str
 from app.core.race_utils import clean_pure_race_name, VENUE_CODE_MAP
+from app.core.database import get_supabase_client
 
 # キャッシュ
 _period_venues_cache: Dict[str, Any] = {}
@@ -205,8 +206,123 @@ def fetch_venues_for_date_raw(date_str: str, force_refresh: bool = False) -> Lis
         except Exception:
             continue
 
+    # 外部スクレイピング取得が失敗した場合（netkeibaアクセス制限400・ネットワーク不調等）、DBからフォールバック復元
+    db_venues = fetch_venues_from_database(formatted_date)
+    if db_venues:
+        _period_venues_cache[formatted_date] = {
+            "venues": db_venues,
+            "updated_at": now
+        }
+        _notify_venues_loaded(formatted_date, db_venues)
+        return json.loads(json.dumps(db_venues))
+
     _period_checked_empty_dates.add(formatted_date)
     return []
+
+
+def fetch_venues_from_database(date_str: str) -> List[dict]:
+    """
+    データベース (keiba_scheduled_races / keiba_predictions_cache) から
+    指定日付の会場・レース一覧を完全復元（外部スクレイピング障害時の完全フェイルセーフ）
+    """
+    clean_d = date_str.replace("-", "")
+    if len(clean_d) != 8 or not clean_d.isdigit():
+        return []
+    formatted_date = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}"
+
+    try:
+        supabase = get_supabase_client()
+        if not supabase:
+            return []
+
+        sched_res = supabase.table("keiba_scheduled_races")\
+            .select("race_id, race_date, race_name, post_datetime")\
+            .eq("race_date", formatted_date)\
+            .execute()
+
+        sched_data = sched_res.data or []
+        if not sched_data:
+            return []
+
+        # コース情報補完用に predictions_cache から race_details を取得
+        race_ids = [r["race_id"] for r in sched_data if r.get("race_id")]
+        course_info_map = {}
+        try:
+            p_res = supabase.table("keiba_predictions_cache")\
+                .select("race_id, data_json")\
+                .in_("race_id", race_ids)\
+                .execute()
+            for p in (p_res.data or []):
+                dj = p.get("data_json") or {}
+                rd = dj.get("race_details") or {}
+                cd = rd.get("course_details", "").strip()
+                if cd:
+                    course_info_map[p["race_id"]] = cd
+        except Exception:
+            pass
+
+        # 会場ごとにグルーピング
+        raw_venue_races = {}
+        for r in sched_data:
+            race_id = r.get("race_id", "")
+            if len(race_id) != 12 or not race_id.isdigit():
+                continue
+
+            v_code = race_id[4:6]
+            venue_name = VENUE_CODE_MAP.get(v_code, "中央開催")
+            race_num_int = int(race_id[10:12])
+            race_no = f"{race_num_int}R"
+            race_name = r.get("race_name") or f"{race_no} 一般競走"
+
+            post_dt = r.get("post_datetime") or ""
+            post_time_est = ""
+            if len(post_dt) >= 16 and " " in post_dt:
+                post_time_est = f"{post_dt[11:16]}発走"
+            elif ":" in post_dt:
+                post_time_est = f"{post_dt}発走"
+
+            if post_time_est:
+                _notify_post_time(race_id, post_time_est)
+
+            course_desc = course_info_map.get(race_id, "")
+            info_parts = [p for p in [post_time_est, course_desc] if p]
+            full_info = " ".join(info_parts)
+
+            if venue_name not in raw_venue_races:
+                raw_venue_races[venue_name] = []
+
+            raw_venue_races[venue_name].append({
+                "race_no": race_no,
+                "race_id": race_id,
+                "race_num_int": race_num_int,
+                "race_name": race_name,
+                "race_info": full_info
+            })
+
+        venues_data = []
+        # 会場コード順にソート (東京:05, 京都:08, 新潟:04など)
+        sorted_venue_names = sorted(raw_venue_races.keys(), key=lambda vn: raw_venue_races[vn][0]["race_id"][4:6])
+
+        for v_name in sorted_venue_names:
+            r_list = raw_venue_races[v_name]
+            r_list.sort(key=lambda x: x["race_num_int"])
+            venues_data.append({
+                "venue_name": v_name,
+                "races": [
+                    {
+                        "race_no": r["race_no"],
+                        "race_id": r["race_id"],
+                        "race_name": r["race_name"],
+                        "race_info": r["race_info"]
+                    }
+                    for r in r_list
+                ]
+            })
+
+        return venues_data
+    except Exception as e:
+        print(f"[fetch_venues_from_database] DBからのレース一覧復元エラー ({formatted_date}): {e}")
+        return []
 
 
 def invalidate_venues_cache(date_str: Optional[str] = None):

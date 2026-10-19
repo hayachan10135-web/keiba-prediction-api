@@ -17,6 +17,7 @@ from app.core.timezone import now_jst_naive, today_jst_str, is_before_morning_pr
 from app.core.race_utils import clean_pure_race_name
 from app.scrapers import (
     fetch_venues_for_date_raw,
+    fetch_venues_from_database,
     register_crawler_post_time_handler,
     register_venues_loaded_handler,
     register_post_time_callback,
@@ -481,29 +482,30 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
 
 
 def get_today_races(
-    date: Optional[str] = Query(None, description="対象日付 (YYYYMMDD または YYYY-MM-DD)"),
-    force_refresh: bool = Query(False, description="手動でレース一覧・発走時刻を再取得する場合True")
+    date: Optional[str] = None,
+    force_refresh: bool = False
 ):
     """指定日または最新開催日のレース一覧・会場一覧を返却"""
     now_dt = now_jst_naive()
     p_info = get_current_kaisai_period(now_dt)
 
-    if date:
+    if date and isinstance(date, str):
         clean_d = date.replace("-", "")
         target_date = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else date
     else:
         target_date = p_info["today_str"]
 
+    is_refresh = bool(force_refresh) if isinstance(force_refresh, bool) else False
     now_ts = time.time()
     cache_ttl = 30.0
-    if not force_refresh:
+    if not is_refresh:
         c_val = _today_races_cache.get(target_date)
         if c_val and (now_ts - c_val[0] < cache_ttl):
             return c_val[1]
 
     available_dates = discover_period_kaisai_dates(now_dt)
 
-    if not date:
+    if not (date and isinstance(date, str)):
         if not available_dates:
             return {
                 "date": "",
@@ -518,7 +520,9 @@ def get_today_races(
             target_date = available_dates[-1]
 
     try:
-        venues = fetch_venues_for_date_raw(target_date, force_refresh=force_refresh)
+        venues = fetch_venues_for_date_raw(target_date, force_refresh=is_refresh)
+        if not venues:
+            venues = fetch_venues_from_database(target_date)
         if venues:
             if target_date not in available_dates:
                 available_dates = sorted(list(set(available_dates + [target_date])))

@@ -21,6 +21,7 @@ from app.scrapers.netkeiba_client import (
 from app.scrapers.schedule_crawler import (
     parse_netkeiba_race_list_html,
     fetch_venues_for_date_raw,
+    fetch_venues_from_database,
     invalidate_venues_cache,
     register_crawler_post_time_handler,
     register_venues_loaded_handler,
@@ -40,6 +41,7 @@ __all__ = [
     "HEADERS_PC",
     "parse_netkeiba_race_list_html",
     "fetch_venues_for_date_raw",
+    "fetch_venues_from_database",
     "invalidate_venues_cache",
     "register_crawler_post_time_handler",
     "register_venues_loaded_handler",
