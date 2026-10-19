@@ -16,7 +16,8 @@ from app.betting.manual_service import execute_manual_bet
 from app.betting.settings import (
     load_betting_settings_from_supabase,
     save_betting_settings_to_supabase,
-    calculate_remaining_real_bet_amount
+    calculate_remaining_real_bet_amount,
+    get_today_total_betted,
 )
 
 router = APIRouter(tags=["Betting"])
@@ -41,11 +42,14 @@ class BettingSettingsResponse(BaseModel):
     remaining_bet_amount: int = 0
     remaining_real_races_count: int = 0
     balance_shortfall: int = 0
+    daily_investment_limit: Optional[int] = 30000
+    today_total_betted: int = 0
     updated_at: Optional[str] = None
 
 
 class UpdateBettingModeRequest(BaseModel):
-    betting_mode: str
+    betting_mode: Optional[str] = None
+    daily_investment_limit: Optional[int] = None
 
 
 class ManualBetItem(BaseModel):
@@ -102,6 +106,9 @@ def get_betting_settings_endpoint():
         last_bal = settings.get("last_balance") or 0
         shortfall = max(0, rem_amt - last_bal) if (cur_mode in ("ipat", "umaca") and last_bal is not None) else 0
 
+        today_betted = get_today_total_betted()
+        daily_limit = settings.get("daily_investment_limit", 30000)
+
         return BettingSettingsResponse(
             betting_mode=cur_mode,
             auto_bet_real_only=bool(settings.get("auto_bet_real_only", True)),
@@ -114,6 +121,8 @@ def get_betting_settings_endpoint():
             remaining_bet_amount=rem_amt,
             remaining_real_races_count=rem_count,
             balance_shortfall=shortfall,
+            daily_investment_limit=daily_limit,
+            today_total_betted=today_betted,
             updated_at=settings.get("updated_at")
         )
     except Exception as e:
@@ -134,48 +143,56 @@ def get_betting_settings_endpoint():
             remaining_bet_amount=0,
             remaining_real_races_count=0,
             balance_shortfall=0,
+            daily_investment_limit=30000,
+            today_total_betted=0,
             updated_at=None
         )
 
 
 @router.post("/settings/betting-mode")
 def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
-    """自動投票モードを変更 (off / ipat / umaca)"""
-    new_mode = req.betting_mode.lower().strip()
-    if new_mode not in ("off", "ipat", "umaca"):
-        raise HTTPException(status_code=400, detail=f"無効な投票モードです: {new_mode}")
-
+    """自動投票モードおよび1日投資上限を変更 (off / ipat / umaca)"""
     settings = load_betting_settings_from_supabase()
-    settings["betting_mode"] = new_mode
 
-    # モード切替時に選択したプラットフォームの最新残高を自動照会
-    if new_mode in ("ipat", "umaca"):
-        try:
-            client = BettingClientFactory.get_client(new_mode)
-            l_res = client.login()
-            if l_res.get("success"):
-                settings["last_balance"] = l_res.get("balance", 0)
-                settings["balance_status"] = "ok"
-                settings["balance_message"] = None
-            else:
-                # 取得できなかった場合は前回の古い残高をクリアして明示
+    if req.daily_investment_limit is not None:
+        if req.daily_investment_limit < 0:
+            raise HTTPException(status_code=400, detail="投資上限額には0以上の数値を指定してください。")
+        settings["daily_investment_limit"] = req.daily_investment_limit
+
+    if req.betting_mode is not None:
+        new_mode = req.betting_mode.lower().strip()
+        if new_mode not in ("off", "ipat", "umaca"):
+            raise HTTPException(status_code=400, detail=f"無効な投票モードです: {new_mode}")
+        settings["betting_mode"] = new_mode
+
+        # モード切替時に選択したプラットフォームの最新残高を自動照会
+        if new_mode in ("ipat", "umaca"):
+            try:
+                client = BettingClientFactory.get_client(new_mode)
+                l_res = client.login()
+                if l_res.get("success"):
+                    settings["last_balance"] = l_res.get("balance", 0)
+                    settings["balance_status"] = "ok"
+                    settings["balance_message"] = None
+                else:
+                    # 取得できなかった場合は前回の古い残高をクリアして明示
+                    settings["last_balance"] = None
+                    settings["balance_status"] = "unavailable"
+                    err_text = l_res.get("error", "残高を取得できませんでした")
+                    if "時間外" in err_text:
+                        settings["balance_message"] = "ただいま投票受付時間外です"
+                    else:
+                        settings["balance_message"] = err_text
+            except Exception as e:
                 settings["last_balance"] = None
                 settings["balance_status"] = "unavailable"
-                err_text = l_res.get("error", "残高を取得できませんでした")
-                if "時間外" in err_text:
-                    settings["balance_message"] = "ただいま投票受付時間外です"
-                else:
-                    settings["balance_message"] = err_text
-        except Exception as e:
+                settings["balance_message"] = f"照会例外: {e}"
+                print(f"[BettingModeSwitch] 残高自動照会エラー ({new_mode}): {e}")
+        else:
+            # off の場合
             settings["last_balance"] = None
-            settings["balance_status"] = "unavailable"
-            settings["balance_message"] = f"照会例外: {e}"
-            print(f"[BettingModeSwitch] 残高自動照会エラー ({new_mode}): {e}")
-    else:
-        # off の場合
-        settings["last_balance"] = None
-        settings["balance_status"] = "off"
-        settings["balance_message"] = "自動投票OFF"
+            settings["balance_status"] = "off"
+            settings["balance_message"] = "自動投票OFF"
 
     save_betting_settings_to_supabase(settings)
     mode_names = {

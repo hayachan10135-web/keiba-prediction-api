@@ -14,6 +14,7 @@ from app.core.timezone import now_jst, now_jst_naive, today_jst_str, parse_post_
 _betting_settings: Dict[str, Any] = {
     "betting_mode": os.getenv("DEFAULT_BETTING_MODE", "off").lower().strip(),
     "auto_bet_real_only": True,
+    "daily_investment_limit": int(os.getenv("DAILY_INVESTMENT_LIMIT", "30000")),
     "last_balance": None,
     "balance_status": "unavailable",
     "balance_message": None,
@@ -165,4 +166,58 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
     except Exception as e:
         print(f"[RemainingBetAmount] 計算エラー: {e}")
         return 0, 0, []
+
+
+def get_today_total_betted(target_date: Optional[str] = None) -> int:
+    """当日（JST）の自動投票済み累計金額（円）を取得（マニュアル投票 FR-BET-07 は完全除外）"""
+    t_date = target_date or today_jst_str()
+    supabase = get_supabase_client()
+    total = 0
+    if supabase:
+        try:
+            res = supabase.table("keiba_real_bets")\
+                .select("total_amount")\
+                .gte("bet_time", f"{t_date} 00:00:00")\
+                .lte("bet_time", f"{t_date} 23:59:59")\
+                .eq("status", "success")\
+                .eq("is_manual_bet", False)\
+                .execute()
+            if res.data:
+                for row in res.data:
+                    total += int(row.get("total_amount") or 0)
+                return total
+        except Exception as e:
+            print(f"[get_today_total_betted] Supabase集計フォールバック: {e}")
+
+    # フォールバック: settings 内の betted_races_by_date から集計
+    b_dict = _betting_settings.get("betted_races_by_date", {})
+    b_list = b_dict.get(t_date, [])
+    for b in b_list:
+        total += int(b.get("amount") or 0)
+    return total
+
+
+def check_investment_limit(additional_amount: int, target_date: Optional[str] = None) -> Tuple[bool, int, int]:
+    """
+    1日投資上限ガードの判定
+    戻り値: (is_exceeded, current_total_betted, limit)
+    - is_exceeded: True の場合、上限超過のため安全スキップすべき
+    - current_total_betted: 本日これまでの自動投票累計額
+    - limit: 設定されている1日最大投資上限額
+    """
+    limit_val = _betting_settings.get("daily_investment_limit")
+    if limit_val is None:
+        try:
+            env_limit = os.getenv("DAILY_INVESTMENT_LIMIT")
+            limit_val = int(env_limit) if env_limit else 30000
+        except Exception:
+            limit_val = 30000
+    limit = int(limit_val)
+    if limit <= 0:
+        # 0以下の場合は無制限
+        return False, 0, 0
+
+    current_total = get_today_total_betted(target_date)
+    is_exceeded = (current_total + additional_amount) > limit
+    return is_exceeded, current_total, limit
 

@@ -22,6 +22,7 @@ from app.betting.factory import BettingClientFactory
 from app.betting.settings import (
     load_betting_settings_from_supabase,
     save_betting_settings_to_supabase,
+    check_investment_limit,
 )
 
 # DIされる外部依存
@@ -304,96 +305,113 @@ async def background_maintenance_loop():
                                         if already_betted:
                                             print(f"[AutoBet] {r_id} は既に投票済みのためスキップします (二重発注防止)")
                                         else:
-                                            if _auto_betted_races_ref is not None:
-                                                _auto_betted_races_ref.add(r_id)
-                                            print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
-                                            try:
-                                                v_code = r_id[4:6] if len(r_id) == 12 else "05"
-                                                v_map = _venue_code_map_ref or {}
-                                                v_name = v_map.get(v_code, "東京")
-                                                r_no = int(r_id[10:12]) if len(r_id) == 12 else 11
-
-                                                bet_items = []
-                                                for b in all_tickets:
-                                                    c_list = b.get("combination")
-                                                    if not c_list:
-                                                        t_u = b.get("target_umaban")
-                                                        c_list = [t_u] if t_u is not None else []
-                                                    bet_items.append({
-                                                        "ticket_type": b.get("ticket_type", "単勝"),
-                                                        "combination": c_list,
-                                                        "amount": b.get("amount", 100)
-                                                    })
-
-                                                client = BettingClientFactory.get_client(cur_bet_mode)
-                                                bet_res = await asyncio.to_thread(client.execute_bets, v_name, r_no, bet_items, False)
-
-                                                if bet_res.get("status") == "success":
-                                                    rcpt = bet_res.get("receipt_no", "")
-                                                    if _auto_betted_dates_ref is not None:
-                                                        _auto_betted_dates_ref.add(today_str)
-                                                    if _auto_betted_races_ref is not None:
-                                                        _auto_betted_races_ref.add(r_id)
-                                                    try:
-                                                        cur_s = load_betting_settings_from_supabase()
-                                                        b_dict = cur_s.get("betted_races_by_date", {})
-                                                        b_list = b_dict.get(today_str, [])
-                                                        now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
-                                                        b_list.append({
+                                            # --- 【1日最大投資上限ガード判定 (FR-BET-04 / FR-SAF-01)】 ---
+                                            is_limit_exceeded, cur_today_betted, daily_limit = check_investment_limit(tot_amt, today_str)
+                                            if is_limit_exceeded:
+                                                print(f"[AutoBet Guard] 🛡️ 1日投資上限（{daily_limit:,}円）を超過するため自動投票を安全スキップします (本日累計: {cur_today_betted:,}円 + 今回予定: {tot_amt:,}円 > 上限: {daily_limit:,}円)")
+                                                if _send_fcm_notification_fn:
+                                                    _send_fcm_notification_fn(
+                                                        title=f"🛡️【投資上限ガード】{r_name}",
+                                                        body=f"1日の最大投資上限（{daily_limit:,}円）に達したため、自動投票を安全スキップしました。\n（本日累計: {cur_today_betted:,}円 / 今回見送り: {tot_amt:,}円）",
+                                                        data={
+                                                            "type": "DAILY_LIMIT_EXCEEDED",
                                                             "race_id": r_id,
-                                                            "receipt_no": str(rcpt),
-                                                            "amount": tot_amt,
-                                                            "mode": cur_bet_mode,
-                                                            "time": now_jst_obj.strftime("%H:%M:%S")
+                                                            "limit": str(daily_limit),
+                                                            "current_betted": str(cur_today_betted),
+                                                            "attempted_amount": str(tot_amt)
+                                                        }
+                                                    )
+                                            else:
+                                                if _auto_betted_races_ref is not None:
+                                                    _auto_betted_races_ref.add(r_id)
+                                                print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
+                                                try:
+                                                    v_code = r_id[4:6] if len(r_id) == 12 else "05"
+                                                    v_map = _venue_code_map_ref or {}
+                                                    v_name = v_map.get(v_code, "東京")
+                                                    r_no = int(r_id[10:12]) if len(r_id) == 12 else 11
+
+                                                    bet_items = []
+                                                    for b in all_tickets:
+                                                        c_list = b.get("combination")
+                                                        if not c_list:
+                                                            t_u = b.get("target_umaban")
+                                                            c_list = [t_u] if t_u is not None else []
+                                                        bet_items.append({
+                                                            "ticket_type": b.get("ticket_type", "単勝"),
+                                                            "combination": c_list,
+                                                            "amount": b.get("amount", 100)
                                                         })
-                                                        b_dict[today_str] = b_list
-                                                        cur_s["betted_races_by_date"] = b_dict
-                                                        if bet_res.get("balance") is not None:
-                                                            cur_s["last_balance"] = bet_res.get("balance")
-                                                            cur_s["last_balance_updated_at"] = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
-                                                        save_betting_settings_to_supabase(cur_s)
-                                                    except Exception as me:
-                                                        print(f"[AutoBet Meta Save Error] {me}")
-                                                    print(f"[AutoBet] 🎉 {mode_label}投票成功！ 受付番号: {rcpt}")
-                                                    if _send_fcm_notification_fn:
-                                                        _send_fcm_notification_fn(
-                                                            title=f"🎫【{mode_label}投票完了】{v_name}{r_no}R",
-                                                            body=f"受付番号:{rcpt} / {len(bet_items)}点 計{tot_amt:,}円 投票完了！\n残高より正常に引き落とされました。",
-                                                            data={
-                                                                "type": "AUTO_BET_SUCCESS",
+
+                                                    client = BettingClientFactory.get_client(cur_bet_mode)
+                                                    bet_res = await asyncio.to_thread(client.execute_bets, v_name, r_no, bet_items, False)
+
+                                                    if bet_res.get("status") == "success":
+                                                        rcpt = bet_res.get("receipt_no", "")
+                                                        if _auto_betted_dates_ref is not None:
+                                                            _auto_betted_dates_ref.add(today_str)
+                                                        if _auto_betted_races_ref is not None:
+                                                            _auto_betted_races_ref.add(r_id)
+                                                        try:
+                                                            cur_s = load_betting_settings_from_supabase()
+                                                            b_dict = cur_s.get("betted_races_by_date", {})
+                                                            b_list = b_dict.get(today_str, [])
+                                                            now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
+                                                            b_list.append({
                                                                 "race_id": r_id,
                                                                 "receipt_no": str(rcpt),
-                                                                "amount": str(tot_amt),
-                                                                "mode": cur_bet_mode
-                                                            }
-                                                        )
-                                                else:
-                                                    err_msg = bet_res.get("reason") or bet_res.get("error") or "投票処理エラー"
-                                                    print(f"[AutoBet] ⚠️ {mode_label}投票失敗: {err_msg}")
+                                                                "amount": tot_amt,
+                                                                "mode": cur_bet_mode,
+                                                                "time": now_jst_obj.strftime("%H:%M:%S")
+                                                            })
+                                                            b_dict[today_str] = b_list
+                                                            cur_s["betted_races_by_date"] = b_dict
+                                                            if bet_res.get("balance") is not None:
+                                                                cur_s["last_balance"] = bet_res.get("balance")
+                                                                cur_s["last_balance_updated_at"] = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
+                                                            save_betting_settings_to_supabase(cur_s)
+                                                        except Exception as me:
+                                                            print(f"[AutoBet Meta Save Error] {me}")
+                                                        print(f"[AutoBet] 🎉 {mode_label}投票成功！ 受付番号: {rcpt}")
+                                                        if _send_fcm_notification_fn:
+                                                            _send_fcm_notification_fn(
+                                                                title=f"🎫【{mode_label}投票完了】{v_name}{r_no}R",
+                                                                body=f"受付番号:{rcpt} / {len(bet_items)}点 計{tot_amt:,}円 投票完了！\n残高より正常に引き落とされました。",
+                                                                data={
+                                                                    "type": "AUTO_BET_SUCCESS",
+                                                                    "race_id": r_id,
+                                                                    "receipt_no": str(rcpt),
+                                                                    "amount": str(tot_amt),
+                                                                    "mode": cur_bet_mode
+                                                                }
+                                                            )
+                                                    else:
+                                                        err_msg = bet_res.get("reason") or bet_res.get("error") or "投票処理エラー"
+                                                        print(f"[AutoBet] ⚠️ {mode_label}投票失敗: {err_msg}")
+                                                        if _send_fcm_notification_fn:
+                                                            _send_fcm_notification_fn(
+                                                                title=f"⚠️【{mode_label}投票エラー】{v_name}{r_no}R",
+                                                                body=f"自動投票に失敗しました: {err_msg}",
+                                                                data={
+                                                                    "type": "AUTO_BET_FAILED",
+                                                                    "race_id": r_id,
+                                                                    "error": str(err_msg),
+                                                                    "mode": cur_bet_mode
+                                                                }
+                                                            )
+                                                except Exception as ab_err:
+                                                    print(f"[AutoBet] 例外エラー: {ab_err}")
                                                     if _send_fcm_notification_fn:
                                                         _send_fcm_notification_fn(
-                                                            title=f"⚠️【{mode_label}投票エラー】{v_name}{r_no}R",
-                                                            body=f"自動投票に失敗しました: {err_msg}",
+                                                            title=f"⚠️【{mode_label}投票例外】{r_name}",
+                                                            body=f"投票通信中に例外が発生しました: {ab_err}",
                                                             data={
                                                                 "type": "AUTO_BET_FAILED",
                                                                 "race_id": r_id,
-                                                                "error": str(err_msg),
+                                                                "error": str(ab_err),
                                                                 "mode": cur_bet_mode
                                                             }
                                                         )
-                                            except Exception as ab_err:
-                                                print(f"[AutoBet] 例外エラー: {ab_err}")
-                                                if _send_fcm_notification_fn:
-                                                    _send_fcm_notification_fn(
-                                                        title=f"⚠️【{mode_label}投票例外】{r_name}",
-                                                        body=f"投票通信中に例外が発生しました: {ab_err}",
-                                                        data={
-                                                            "type": "AUTO_BET_FAILED",
-                                                            "race_id": r_id,
-                                                            "error": str(ab_err),
-                                                            "mode": cur_bet_mode
-                                                        }
-                                                    )
                             except Exception as pe:
                                 print(f"[Auto-Predict Stage5] 最終推論失敗 ({r_id}): {pe}")
                             finally:
