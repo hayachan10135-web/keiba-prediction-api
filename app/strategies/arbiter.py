@@ -52,6 +52,7 @@ class StrategyArbiter:
         is_real_guarantee: bool = False,
         is_virtual_guarantee: bool = False,
         race_class_code: Optional[int] = None,
+        real_umaren_odds: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         compute_hybrid_rec_from_inputs と完全互換のハイブリッド推奨辞書を生成
@@ -63,7 +64,8 @@ class StrategyArbiter:
         is_shinba = ("新馬" in race_name) or ("メイクデビュー" in race_name)
 
         has_enough_horses = len(horses) >= 6
-        is_valid_race_type = (surface_type != 2) and (not is_shinba) and has_enough_horses
+        # 方針A: 新馬戦もクラスA仮想枠（ワイド流し2点）として参加許可（障害戦と6頭未満のみ全体除外）
+        is_valid_race_type = (surface_type != 2) and has_enough_horses
 
         # AI勝率順ソート (Model B)
         s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
@@ -156,11 +158,14 @@ class StrategyArbiter:
         race_info = {
             "race_name": race_name,
             "race_class_code": race_class_code,
+            "class_group": "A_Maiden" if (is_shinba or race_class_code in (0, 1)) else ("B_1_2_Win" if race_class_code in (2, 3) else "C_3_Open"),
             "surface_type": surface_type,
             "prob_gachi": prob_gachi,
             "is_daily_top_race": is_daily_top_race,
             "is_real_guarantee": is_real_guarantee,
             "is_virtual_guarantee": is_virtual_guarantee,
+            "is_shinba": is_shinba,
+            "real_umaren_odds": real_umaren_odds,
         }
 
         decision: Optional[StrategyDecision] = None
@@ -197,7 +202,7 @@ class StrategyArbiter:
             elif surface_type == 2:
                 s_reason = "障害戦除外 (不確実性高のため見送り)"
             elif is_shinba:
-                s_reason = "新馬戦除外 (過去走データなしのため見送り)"
+                s_reason = "新馬戦選定基準不一致 (資金保全のため見送り)"
             else:
                 s_reason = "3区分選定基準不一致 (資金保全のため見送り)"
 

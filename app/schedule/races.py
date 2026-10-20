@@ -413,9 +413,9 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
                 continue
             r_nm = r.get("race_name", "")
             r_info = r.get("race_info", "")
-            is_shinba = ("新馬" in r_nm) or ("メイクデビュー" in r_nm)
             is_obstacle = ("障害" in r_nm) or ("障" in r_info)
-            if not is_shinba and not is_obstacle:
+            # 方針A: 障害戦のみ除外し、新馬戦（クラスA: ワイド流し2点）も仮想枠として参加可能
+            if not is_obstacle:
                 eligible_for_virtual.append(r)
 
         eligible_for_virtual.sort(key=lambda x: x.get("confidence_score", 0.0), reverse=True)

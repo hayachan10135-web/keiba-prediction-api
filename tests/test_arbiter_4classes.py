@@ -271,5 +271,71 @@ class TestArbiter4Classes(unittest.TestCase):
         self.assertEqual(agg["lifetime"]["period_key"], "lifetime")
 
 
+    def test_shinba_excluded_from_real_bets_but_eligible_for_virtual_class_a(self):
+        """新馬戦（方針A）: 実馬券（勝負R/実勝負）からは除外され、仮想枠（クラスA: ワイド2点）として選出可能であること"""
+        horses = self._create_mock_horses(count=12, top_odds=3.5, top_prob_win=0.38, top_prob_top3=0.75)
+        # 1. 保証なしの場合: 実馬券条件を満たしていても新馬戦のため実馬券にならず見送り(skip)
+        dec_normal = self.arbiter.evaluate_race(
+            race_name="2歳新馬",
+            race_details={"course_details": "芝1600m"},
+            horses=horses,
+            surface_type=0,
+            prob_gachi=0.3,
+            prob_himo=0.2,
+            opponents=[],
+            u0=1,
+            honmei_horse=horses[0],
+            race_date_str="2026-10-20",
+            race_class_code=0,
+        )
+        self.assertFalse(dec_normal["is_real_bet_target"], "新馬戦は実馬券対象外であること")
+
+        # 2. 会場保証枠の場合: クラスA（ワイド2点）として仮想枠選出されること
+        dec_virt = self.arbiter.evaluate_race(
+            race_name="2歳新馬",
+            race_details={"course_details": "芝1600m"},
+            horses=horses,
+            surface_type=0,
+            prob_gachi=0.3,
+            prob_himo=0.2,
+            opponents=[],
+            u0=1,
+            honmei_horse=horses[0],
+            race_date_str="2026-10-20",
+            is_virtual_guarantee=True,
+            race_class_code=0,
+        )
+        self.assertEqual(dec_virt["bet_category"], "virtual")
+        self.assertIn("wide_bets", dec_virt)
+        self.assertEqual(len(dec_virt["wide_bets"]), 2)
+        self.assertEqual(dec_virt["wide_amount"], 1000)
+
+    def test_virtual_class_c_uses_real_umaren_odds(self):
+        """クラスC（3勝・オープン）の仮想枠選出時、real_umaren_odds が存在すれば実オッズが適用されること"""
+        horses = self._create_mock_horses(count=12, top_odds=5.0, top_prob_win=0.28, top_prob_top3=0.58)
+        real_umaren = {(1, 2): 15.4, (1, 3): 28.2}
+        decision = self.arbiter.evaluate_race(
+            race_name="オクトーバーS (3勝クラス)",
+            race_details={"course_details": "芝2000m"},
+            horses=horses,
+            surface_type=0,
+            prob_gachi=0.2,
+            prob_himo=0.4,
+            opponents=[],
+            u0=1,
+            honmei_horse=horses[0],
+            race_date_str="2026-10-20",
+            is_virtual_guarantee=True,
+            race_class_code=4,
+            real_umaren_odds=real_umaren,
+        )
+        self.assertEqual(decision["bet_category"], "virtual")
+        self.assertIn("umaren_bets", decision)
+        self.assertEqual(len(decision["umaren_bets"]), 2)
+        u1_ticket = decision["umaren_bets"][0]
+        self.assertTrue(u1_ticket.get("is_real_odds"), "実オッズフラグが True になっていること")
+        self.assertEqual(u1_ticket.get("odds"), 15.4, "リアルタイム馬連オッズ 15.4倍が正しく反映されていること")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,7 +68,7 @@ class Settings:
 
     # 安全ガードレール定数（決定済み仕様）
     MAX_DELAY_MINUTES: int = 30               # 当初発走時刻から30分以上の遅延で自動投票中止
-    DEFAULT_MAX_BET_PER_RACE: int = 2500      # 1レース最大上限額（デフォルト）
+    DEFAULT_MAX_BET_PER_RACE: int = 5000      # 1レース最大上限額（勝負R-Sランク対応: 5,000円）
 
     # スクレイピング設定
     SCRAPER_MAX_RETRIES: int = 3              # Netkeiba最大リトライ回数

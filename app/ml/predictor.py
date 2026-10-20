@@ -192,7 +192,8 @@ def compute_hybrid_rec_from_inputs(
     is_daily_top_race: bool = False,
     is_real_guarantee: bool = False,
     is_virtual_guarantee: bool = False,
-    race_class_code: Optional[int] = None
+    race_class_code: Optional[int] = None,
+    real_umaren_odds: Optional[dict] = None,
 ) -> dict:
     """買い目戦略・調停・最新オッズ再推論判定を app/strategies/arbiter.py へ委任"""
     return _strategy_arbiter.evaluate_race(
@@ -212,7 +213,8 @@ def compute_hybrid_rec_from_inputs(
         is_daily_top_race=is_daily_top_race,
         is_real_guarantee=is_real_guarantee,
         is_virtual_guarantee=is_virtual_guarantee,
-        race_class_code=race_class_code
+        race_class_code=race_class_code,
+        real_umaren_odds=real_umaren_odds,
     )
 
 
@@ -985,7 +987,8 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         is_daily_top_race=is_daily_top_race,
         is_real_guarantee=is_real_guarantee,
         is_virtual_guarantee=is_virtual_guarantee,
-        race_class_code=race_class_code
+        race_class_code=race_class_code,
+        real_umaren_odds=umaren_real_map,
     )
 
     horses_sorted_by_num = sorted(sorted_horses, key=lambda x: x["umaban"])

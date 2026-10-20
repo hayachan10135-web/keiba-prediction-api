@@ -250,9 +250,24 @@ async def global_exception_handler(request: Request, exc: Exception):
     tb_str = traceback.format_exc()
     err_msg = f"【サーバー内部未捕捉例外 [{exc.__class__.__name__}]】: {str(exc)}\n{tb_str}"
     print(f"[ERROR GlobalException] {err_msg}")
+
+    # セキュリティ強化: 認証済みリクエスト（Androidアプリ・管理ツール）およびローカル接続には詳細スタックトレースを返却 (DoD 3.3 準拠)
+    # 未認証の外部アクセス・スキャナーに対しては内部ファイルパスや環境変数を漏洩させない汎用500を返却
+    api_key_header = request.headers.get("x-api-key", "").strip()
+    from app.core.security import get_expected_api_key
+    import secrets
+    is_authenticated = bool(api_key_header and secrets.compare_digest(api_key_header, get_expected_api_key()))
+    client_ip = request.client.host if request.client else ""
+    is_localhost = client_ip in ("127.0.0.1", "::1", "localhost")
+
+    if is_authenticated or is_localhost:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": err_msg}
+        )
     return JSONResponse(
         status_code=500,
-        content={"detail": err_msg}
+        content={"detail": "Internal Server Error"}
     )
 
 
@@ -271,55 +286,9 @@ if supabase is None:
     print("[Database Warning] データベースクライアントの初期化に失敗しました。")
 
 
-# --- Firebase Admin SDK 初期化 & プッシュ通知ヘルパー ---
-firebase_app = None
-FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", "firebase_service_account.json")
-FIREBASE_KEY_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", "")
+# --- Firebase Admin SDK 初期化 & プッシュ通知ヘルパー (app/core/notification.py へ移管完了) ---
+from app.core.notification import firebase_app, send_fcm_notification
 
-try:
-    import firebase_admin
-    from firebase_admin import credentials, messaging
-
-    if FIREBASE_KEY_JSON:
-        try:
-            cred_dict = json.loads(FIREBASE_KEY_JSON)
-            cred = credentials.Certificate(cred_dict)
-            firebase_app = firebase_admin.initialize_app(cred)
-            print("[Firebase] 環境変数 FIREBASE_SERVICE_ACCOUNT_KEY から正常に初期化しました。")
-        except Exception as fe:
-            print(f"[Firebase] JSONパース失敗: {fe}")
-    elif os.path.exists(FIREBASE_KEY_PATH):
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-        firebase_app = firebase_admin.initialize_app(cred)
-        print(f"[Firebase] ファイル {FIREBASE_KEY_PATH} から正常に初期化しました。")
-    else:
-        print("[Firebase] サービスアカウント情報未設定（設定完了後にプッシュ通知が有効化されます）。")
-except Exception as f_err:
-    print(f"[Firebase] 初期化待機: {f_err}")
-
-
-def send_fcm_notification(title: str, body: str, data: Optional[Dict[str, Any]] = None, topic: str = "keiba_real_bet") -> bool:
-    """Firebase Cloud Messaging で指定トピックへプッシュ通知を配信"""
-    if not firebase_app:
-        print(f"[FCM未設定・通知待機] {title} | {body} (Topic: {topic})")
-        return False
-    try:
-        from firebase_admin import messaging
-        str_data = {str(k): str(v) for k, v in (data or {}).items()}
-        msg = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            data=str_data,
-            topic=topic
-        )
-        resp = messaging.send(msg)
-        print(f"[FCM送信成功] {title} (ID: {resp})")
-        return True
-    except Exception as e:
-        print(f"[FCM送信失敗] {title}: {e}")
-        return False
 
 # LightGBMモデル・統計辞書・オンライン更新機構は app/ml/model_loader.py へ移管完了
 _auto_betted_races = set()       # 二重投票防止用メモリセット (race_id)

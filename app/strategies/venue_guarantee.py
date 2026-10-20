@@ -65,6 +65,7 @@ def resolve_venue_guarantees_for_date(
             if "障" in r_name or "障害" in c_det:
                 continue
 
+            is_shinba = ("新馬" in r_name) or ("メイクデビュー" in r_name)
             horses = dj.get("horses") or []
             if len(horses) < 6:
                 continue
@@ -86,7 +87,8 @@ def resolve_venue_guarantees_for_date(
                 "conf_score": conf_score,
                 "win_edge": win_edge,
                 "w0_top3": w0_top3,
-                "stability_score": round(w0_top3 * 2.0 + win_edge + conf_score, 4),
+                "is_shinba": is_shinba,
+                "stability_score": round(w0_top3 * 1.5 + conf_score + win_edge, 4),
                 "bet_category": h_rec.get("bet_category", "skip"),
                 "strategy_type": h_rec.get("strategy_type", "skip"),
             }
@@ -101,9 +103,10 @@ def resolve_venue_guarantees_for_date(
         has_any_super = any(item["bet_category"] == "super" or item["strategy_type"] == "super_bet" for item in all_day_races)
         has_any_real = any(item["bet_category"] == "real" or item["strategy_type"] == "real_bet" for item in all_day_races)
 
-        # 1. 実勝負保証: 当日全体で勝負Rも自然実勝負も0件の場合のみ、当日最高安定レース1Rを保証昇格
+        # 1. 実勝負保証: 当日全体で勝負Rも自然実勝負も0件の場合のみ、当日最高安定レース1Rを保証昇格 (新馬戦は実馬券除外)
         if not has_any_super and not has_any_real and all_day_races:
-            sorted_by_stab = sorted(all_day_races, key=lambda x: x["stability_score"], reverse=True)
+            eligible_for_real_guarantee = [item for item in all_day_races if not item["is_shinba"]]
+            sorted_by_stab = sorted(eligible_for_real_guarantee, key=lambda x: x["stability_score"], reverse=True)
             if sorted_by_stab:
                 real_guarantees.add(sorted_by_stab[0]["race_id"])
 

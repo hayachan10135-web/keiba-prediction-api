@@ -52,9 +52,8 @@ class TestInvestmentLimit(unittest.TestCase):
             self.assertFalse(is_exceeded, "上限ちょうどは許容されること")
 
     def test_max_bet_per_race_constant(self):
-        """1レースあたりの最大賭け金定数が安全基準（最大5000円以内）に収まっていること"""
-        self.assertLessEqual(settings.DEFAULT_MAX_BET_PER_RACE, 5000)
-        self.assertGreater(settings.DEFAULT_MAX_BET_PER_RACE, 0)
+        """1レースあたりの最大賭け金定数が勝負R-Sランク対応（5000円）として定義されていること"""
+        self.assertEqual(settings.DEFAULT_MAX_BET_PER_RACE, 5000)
 
 
 if __name__ == "__main__":

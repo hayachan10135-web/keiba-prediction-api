@@ -48,6 +48,10 @@ class StrategySuper(BaseBettingStrategy):
         if surface_type == 2:
             return False
 
+        # 新馬戦除外 (実馬券は過去走実績・ゼロリーク確定データ重視のため除外)
+        if race_info.get("is_shinba", False):
+            return False
+
         w0_odds = float(honmei_horse.get("odds") or 50.0)
 
         # レースクラス判定 (class_group: B_1_2_Win を中心とする)

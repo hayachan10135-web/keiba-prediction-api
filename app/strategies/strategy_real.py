@@ -47,6 +47,10 @@ class StrategyReal(BaseBettingStrategy):
         if len(horses) < 6 or surface_type == 2:
             return False
 
+        # 新馬戦除外 (実馬券は除外、仮想枠への参加を許可)
+        if race_info.get("is_shinba", False):
+            return False
+
         w0_odds = float(honmei_horse.get("odds") or 50.0)
         s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
         w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else float(honmei_horse.get("prob_top3", 0.0))

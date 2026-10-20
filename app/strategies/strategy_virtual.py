@@ -95,18 +95,28 @@ class StrategyVirtual(BaseBettingStrategy):
         elif is_class_c:
             # クラスC (3勝・オープン): 馬連流し2点 各500円
             ticket_type_name = "馬連2点"
+            real_umaren_map = race_info.get("real_umaren_odds") or {}
             for opp_h in opponents:
                 opp_u = int(opp_h["umaban"])
                 opp_name = str(opp_h.get("horse_name", f"馬{opp_u}"))
                 comb = sorted([w0_u, opp_u])
+                comb_key = (min(w0_u, opp_u), max(w0_u, opp_u))
+                real_o = real_umaren_map.get(comb_key)
+                if real_o and float(real_o) > 0:
+                    u_odds = float(real_o)
+                    is_real_o = True
+                else:
+                    u_odds = round(max(3.0, w0_odds * 0.8), 1)
+                    is_real_o = False
+
                 tickets.append(BetTicket(
                     ticket_type="馬連",
                     combination=comb,
                     combination_str=f"{comb[0]}-{comb[1]}",
                     amount=500,
-                    odds=round(max(3.0, w0_odds * 0.8), 1),
-                    expected_payout=int(round(500 * max(3.0, w0_odds * 0.8))),
-                    is_real_odds=False,
+                    odds=u_odds,
+                    expected_payout=int(round(500 * u_odds)),
+                    is_real_odds=is_real_o,
                     memo=f"馬連 {comb[0]}-{comb[1]} ({opp_name}) 500円"
                 ))
         else:

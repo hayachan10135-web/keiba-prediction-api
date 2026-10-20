@@ -189,14 +189,18 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            aptitude_score = conf * min(max(edge, 0.8), 2.5)
+            s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
+            w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else 0.0
+            # SSOT (FR-STR-03): 最高安定度スコア（複勝率×1.5＋確信度＋EV）
+            stability_score = round(w0_t3 * 1.5 + conf + edge, 4)
 
             candidates.append({
                 "race_id": rid,
                 "is_unrun": is_unrun,
                 "confidence_score": conf,
                 "edge_ratio": edge,
-                "aptitude_score": aptitude_score
+                "aptitude_score": stability_score,
+                "stability_score": stability_score
             })
 
         if not candidates:
@@ -204,7 +208,7 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
 
         unrun_candidates = [c for c in candidates if c["is_unrun"]]
         pool = unrun_candidates if unrun_candidates else candidates
-        pool.sort(key=lambda x: (x["aptitude_score"], x["confidence_score"]), reverse=True)
+        pool.sort(key=lambda x: (x["stability_score"], x["confidence_score"]), reverse=True)
         chosen_rid = pool[0]["race_id"]
 
         _daily_top_race_id_cache[target_date] = chosen_rid
@@ -315,7 +319,10 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            score = conf * min(max(edge, 0.8), 2.5)
+            s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
+            w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else 0.0
+            # SSOT (FR-STR-03): 最高安定度スコア（複勝率×1.5＋確信度＋EV）
+            score = round(w0_t3 * 1.5 + conf + edge, 4)
             candidates.append({
                 "race_id": rid,
                 "data_json": dj,

@@ -98,6 +98,37 @@ class TestManualBetExclusion(unittest.TestCase):
             self.assertNotIn(d, seen_dates, f"重複日付が存在してはならない: {d}")
             seen_dates.add(d)
 
+    def test_sqlite_bridge_schema_columns_and_bulk_insert(self):
+        """
+        LocalSQLiteClient のスキーマ自動保証により、
+        keiba_race_settlements に必要な新4区分およびワイド馬券カラムが存在し、
+        executemany によるバルク書き込みが正常に動作することを検証
+        """
+        from app.core.sqlite_bridge import LocalSQLiteClient, DEFAULT_DB_PATH
+
+        if not os.path.exists(DEFAULT_DB_PATH):
+            self.skipTest("ローカル SQLite DBが存在しないためスキップ")
+
+        client = LocalSQLiteClient(DEFAULT_DB_PATH)
+        conn = client.pool.get_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(keiba_race_settlements);")
+        cols = {row[1] for row in cur.fetchall()}
+
+        for req_col in ("bet_category", "is_real_bet_target", "is_virtual_bet", "real_bet_badge", "wide_bet", "wide_payout"):
+            self.assertIn(req_col, cols, f"keiba_race_settlements にカラム {req_col} が存在すること")
+
+        # バルク挿入 (upsert) テスト
+        test_rows = [
+            {"key": "test_bulk_k1", "value": {"test": 1}, "updated_at": "2026-10-20"},
+            {"key": "test_bulk_k2", "value": {"test": 2}, "updated_at": "2026-10-20"}
+        ]
+        res_bulk = client.table("keiba_app_meta").upsert(test_rows).execute()
+        self.assertEqual(len(res_bulk.data), 2)
+        # 後始末
+        client.table("keiba_app_meta").eq("key", "test_bulk_k1").delete().execute()
+        client.table("keiba_app_meta").eq("key", "test_bulk_k2").delete().execute()
+
 
 if __name__ == "__main__":
     unittest.main()

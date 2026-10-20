@@ -17,6 +17,7 @@ import gc
 from typing import Optional, Callable, Dict, Any, List, Set
 
 from app.core.database import get_supabase_client
+from app.core.config import settings
 from app.routers.batch import batch_status
 from app.betting.factory import BettingClientFactory
 from app.betting.settings import (
@@ -229,14 +230,26 @@ async def background_maintenance_loop():
                         .execute()
                     unpredicted_races = res_pred.data or []
 
-                    # 1ループあたりに実行する最大推論数をPCスペック(10コア/16GB)に合わせて引き上げ (直前推論の遅延・滞留を完全根絶)
+                    # 発走までの残り時間およびStage 5（発走5分前・自動投票）最優先ソート
+                    def _race_urgency_key(race_row):
+                        p_str = race_row.get("post_datetime")
+                        p_dt = _parse_post_datetime_fn(p_str, today_str) if _parse_post_datetime_fn else None
+                        if not p_dt:
+                            return (999, 99999.0)
+                        m_to_p = (p_dt - now_dt).total_seconds() / 60.0
+                        cur_st = int(race_row.get("is_predicted") or 0)
+                        # Stage 5（発走5分前かつ未推論）: 最優先 (0)
+                        is_st5 = (0 < m_to_p <= 6.5 and cur_st < 5)
+                        priority = 0 if is_st5 else 1
+                        return (priority, m_to_p if m_to_p > 0 else 99999.0)
+
+                    unpredicted_races.sort(key=_race_urgency_key)
+
+                    # 1ループあたりに実行する最大推論数 (Stage 5 以外の Stage 2〜4 を制御)
                     predicted_count_this_loop = 0
                     MAX_PREDICTIONS_PER_LOOP = 6
 
                     for r in unpredicted_races:
-                        if predicted_count_this_loop >= MAX_PREDICTIONS_PER_LOOP:
-                            break
-
                         r_id = r["race_id"]
                         venue_code = r_id[4:6] if len(r_id) == 12 else ""
                         if not (venue_code.isdigit() and 1 <= int(venue_code) <= 10):
@@ -250,6 +263,12 @@ async def background_maintenance_loop():
 
                         mins_to_post = (post_dt - now_dt).total_seconds() / 60.0
                         if mins_to_post <= 0 or mins_to_post > 65.0:
+                            continue
+
+                        is_stage5_target = (mins_to_post <= 6.5 and cur_stage < 5)
+
+                        # Stage 5（実投票・最終確定）以外のStage 2〜4はループあたり上限 MAX_PREDICTIONS_PER_LOOP で制御
+                        if not is_stage5_target and predicted_count_this_loop >= MAX_PREDICTIONS_PER_LOOP:
                             continue
 
                         # Stage 5: 発走 5分前 (0 < mins <= 6.5) -> 最終オッズ推論 ＆ 確定通知
@@ -315,6 +334,23 @@ async def background_maintenance_loop():
                                         if already_betted:
                                             print(f"[AutoBet] {r_id} は既に投票済みのためスキップします (二重発注防止)")
                                         else:
+                                            # --- 【1レース最大投資上限ガード判定 (DEFAULT_MAX_BET_PER_RACE)】 ---
+                                            max_per_race_limit = getattr(settings, "DEFAULT_MAX_BET_PER_RACE", 5000)
+                                            if tot_amt > max_per_race_limit:
+                                                print(f"[AutoBet Guard] 🛡️ 1レース最大投資上限（{max_per_race_limit:,}円）を超過（{tot_amt:,}円）するため安全スキップします")
+                                                if _send_fcm_notification_fn:
+                                                    _send_fcm_notification_fn(
+                                                        title=f"🛡️【単発上限ガード】{r_name}",
+                                                        body=f"1レースあたりの最大上限（{max_per_race_limit:,}円）を超過（{tot_amt:,}円）するため、自動投票を安全スキップしました。",
+                                                        data={
+                                                            "type": "RACE_LIMIT_EXCEEDED",
+                                                            "race_id": r_id,
+                                                            "limit": str(max_per_race_limit),
+                                                            "attempted_amount": str(tot_amt)
+                                                        }
+                                                    )
+                                                continue
+
                                             # --- 【1日最大投資上限ガード判定 (FR-BET-04 / FR-SAF-01)】 ---
                                             is_limit_exceeded, cur_today_betted, daily_limit = check_investment_limit(tot_amt, today_str)
                                             if is_limit_exceeded:

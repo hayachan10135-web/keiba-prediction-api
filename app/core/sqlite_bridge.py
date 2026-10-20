@@ -64,6 +64,153 @@ class SQLiteConnectionPool:
         return self._local.conn
 
 
+def ensure_database_schema(conn: sqlite3.Connection):
+    """ローカル SQLite の全テーブル・全インデックス・全カラムの存在を物理保証"""
+    cur = conn.cursor()
+    # 1. keiba_scheduled_races
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_scheduled_races (
+        race_id TEXT PRIMARY KEY,
+        race_date TEXT,
+        race_name TEXT,
+        post_datetime TEXT,
+        is_predicted INTEGER DEFAULT 0,
+        is_settled INTEGER DEFAULT 0,
+        retry_count INTEGER DEFAULT 0,
+        created_at TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sched_date ON keiba_scheduled_races(race_date);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sched_post ON keiba_scheduled_races(post_datetime);")
+
+    # 2. keiba_race_settlements
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_race_settlements (
+        race_id TEXT PRIMARY KEY,
+        race_date TEXT,
+        race_name TEXT,
+        strategy_type TEXT,
+        target_umaban INTEGER,
+        horse_name TEXT,
+        grade TEXT,
+        is_pass INTEGER DEFAULT 0,
+        total_bet INTEGER DEFAULT 0,
+        total_payout INTEGER DEFAULT 0,
+        is_hit INTEGER DEFAULT 0,
+        actual_order INTEGER,
+        hit_type TEXT,
+        hypothetical_bet INTEGER DEFAULT 0,
+        hypothetical_payout INTEGER DEFAULT 0,
+        pass_benefit INTEGER DEFAULT 0,
+        bet_breakdown TEXT,
+        payout_breakdown TEXT,
+        bet_details TEXT,
+        payout_details TEXT,
+        umaren_bet INTEGER DEFAULT 0,
+        trio_bet INTEGER DEFAULT 0,
+        umaren_payout INTEGER DEFAULT 0,
+        trio_payout INTEGER DEFAULT 0,
+        tansho_bet INTEGER DEFAULT 0,
+        fukusho_bet INTEGER DEFAULT 0,
+        tansho_payout INTEGER DEFAULT 0,
+        fukusho_payout INTEGER DEFAULT 0,
+        created_at TEXT,
+        updated_at TEXT,
+        track_bias TEXT,
+        odds_alerts TEXT,
+        top3_orders TEXT,
+        mark_orders TEXT,
+        bet_category TEXT,
+        is_real_bet_target INTEGER,
+        is_virtual_bet INTEGER,
+        real_bet_badge TEXT,
+        race_class_code INTEGER,
+        wide_bet INTEGER DEFAULT 0,
+        wide_payout INTEGER DEFAULT 0,
+        umatan_bet INTEGER DEFAULT 0,
+        umatan_payout INTEGER DEFAULT 0,
+        sanrentan_bet INTEGER DEFAULT 0,
+        sanrentan_payout INTEGER DEFAULT 0
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_settle_date ON keiba_race_settlements(race_date);")
+
+    # 既存の keiba_race_settlements テーブルのカラム不足を自動マイグレーション
+    cur.execute("PRAGMA table_info(keiba_race_settlements);")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    columns_to_ensure = {
+        "mark_orders": "TEXT",
+        "bet_category": "TEXT",
+        "is_real_bet_target": "INTEGER",
+        "is_virtual_bet": "INTEGER",
+        "real_bet_badge": "TEXT",
+        "race_class_code": "INTEGER",
+        "wide_bet": "INTEGER DEFAULT 0",
+        "wide_payout": "INTEGER DEFAULT 0",
+        "umatan_bet": "INTEGER DEFAULT 0",
+        "umatan_payout": "INTEGER DEFAULT 0",
+        "sanrentan_bet": "INTEGER DEFAULT 0",
+        "sanrentan_payout": "INTEGER DEFAULT 0",
+    }
+    for col_name, col_type in columns_to_ensure.items():
+        if col_name not in existing_cols:
+            try:
+                cur.execute(f"ALTER TABLE keiba_race_settlements ADD COLUMN {col_name} {col_type};")
+            except Exception:
+                pass
+
+    # 3. keiba_predictions_cache
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_predictions_cache (
+        race_id TEXT PRIMARY KEY,
+        race_date TEXT,
+        data_json TEXT,
+        created_at TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pred_date ON keiba_predictions_cache(race_date);")
+
+    # 4. keiba_race_results_cache
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_race_results_cache (
+        race_id TEXT PRIMARY KEY,
+        race_name TEXT,
+        race_date TEXT,
+        result_json TEXT,
+        created_at TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_res_date ON keiba_race_results_cache(race_date);")
+
+    # 5. keiba_real_bets
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_real_bets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        race_id TEXT,
+        platform TEXT,
+        receipt_no TEXT,
+        total_amount INTEGER DEFAULT 0,
+        items TEXT,
+        status TEXT,
+        is_manual_bet INTEGER DEFAULT 0,
+        bet_time TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_real_bets_race_id ON keiba_real_bets(race_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_real_bets_time ON keiba_real_bets(bet_time);")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bets_auto_unique ON keiba_real_bets(race_id) WHERE is_manual_bet = 0 AND status = 'success';")
+
+    # 6. keiba_app_meta
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS keiba_app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+    );
+    """)
+    conn.commit()
+
+
 class SQLiteQueryBuilder:
     """Supabase PostgREST クエリビルダー互換"""
     def __init__(self, pool: SQLiteConnectionPool, table_name: str):
@@ -256,18 +403,29 @@ class SQLiteQueryBuilder:
         if not rows_to_insert:
             return SQLiteResponse(data=[])
 
-        inserted_records = []
-        for row in rows_to_insert:
-            cols = list(row.keys())
-            vals = [self._format_value_for_db(c, row[c]) for c in cols]
-            col_clause = ", ".join([f'"{c}"' for c in cols])
-            placeholders = ", ".join(["?"] * len(cols))
+        # 全ての行が同一キー構成を持つ場合は executemany で一括高速実行
+        first_cols = list(rows_to_insert[0].keys())
+        same_schema = all(list(r.keys()) == first_cols for r in rows_to_insert)
+        if same_schema and len(rows_to_insert) > 1:
+            col_clause = ", ".join([f'"{c}"' for c in first_cols])
+            placeholders = ", ".join(["?"] * len(first_cols))
             sql = f"INSERT INTO {self.table_name} ({col_clause}) VALUES ({placeholders});"
-            cur.execute(sql, vals)
-            inserted_records.append(row)
+            batch_vals = [
+                [self._format_value_for_db(c, r[c]) for c in first_cols]
+                for r in rows_to_insert
+            ]
+            cur.executemany(sql, batch_vals)
+        else:
+            for row in rows_to_insert:
+                cols = list(row.keys())
+                vals = [self._format_value_for_db(c, row[c]) for c in cols]
+                col_clause = ", ".join([f'"{c}"' for c in cols])
+                placeholders = ", ".join(["?"] * len(cols))
+                sql = f"INSERT INTO {self.table_name} ({col_clause}) VALUES ({placeholders});"
+                cur.execute(sql, vals)
 
         conn.commit()
-        return SQLiteResponse(data=inserted_records)
+        return SQLiteResponse(data=rows_to_insert)
 
     def _execute_update(self, conn: sqlite3.Connection, cur: sqlite3.Cursor) -> SQLiteResponse:
         if not self._action_data:
@@ -291,18 +449,28 @@ class SQLiteQueryBuilder:
         if not rows_to_upsert:
             return SQLiteResponse(data=[])
 
-        upserted_records = []
-        for row in rows_to_upsert:
-            cols = list(row.keys())
-            vals = [self._format_value_for_db(c, row[c]) for c in cols]
-            col_clause = ", ".join([f'"{c}"' for c in cols])
-            placeholders = ", ".join(["?"] * len(cols))
+        first_cols = list(rows_to_upsert[0].keys())
+        same_schema = all(list(r.keys()) == first_cols for r in rows_to_upsert)
+        if same_schema and len(rows_to_upsert) > 1:
+            col_clause = ", ".join([f'"{c}"' for c in first_cols])
+            placeholders = ", ".join(["?"] * len(first_cols))
             sql = f"INSERT OR REPLACE INTO {self.table_name} ({col_clause}) VALUES ({placeholders});"
-            cur.execute(sql, vals)
-            upserted_records.append(row)
+            batch_vals = [
+                [self._format_value_for_db(c, r[c]) for c in first_cols]
+                for r in rows_to_upsert
+            ]
+            cur.executemany(sql, batch_vals)
+        else:
+            for row in rows_to_upsert:
+                cols = list(row.keys())
+                vals = [self._format_value_for_db(c, row[c]) for c in cols]
+                col_clause = ", ".join([f'"{c}"' for c in cols])
+                placeholders = ", ".join(["?"] * len(cols))
+                sql = f"INSERT OR REPLACE INTO {self.table_name} ({col_clause}) VALUES ({placeholders});"
+                cur.execute(sql, vals)
 
         conn.commit()
-        return SQLiteResponse(data=upserted_records)
+        return SQLiteResponse(data=rows_to_upsert)
 
     def _execute_delete(self, conn: sqlite3.Connection, cur: sqlite3.Cursor) -> SQLiteResponse:
         where_clause, where_params = self._build_where_clause()
@@ -317,6 +485,12 @@ class LocalSQLiteClient:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self.pool = SQLiteConnectionPool(db_path)
+        # テーブル・インデックス・カラムの物理存在保証 (自動マイグレーション)
+        try:
+            conn = self.pool.get_connection()
+            ensure_database_schema(conn)
+        except Exception as e:
+            print(f"[LocalSQLiteClient] スキーマ初期化警告: {e}")
 
     def table(self, table_name: str) -> SQLiteQueryBuilder:
         return SQLiteQueryBuilder(self.pool, table_name)
