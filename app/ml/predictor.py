@@ -1107,8 +1107,9 @@ def predict_race_core(
         if hr_c and isinstance(hr_c, dict):
             if hr_c.get("strategy_type") == "skip" or (hr_c.get("total_amount") or 0) == 0:
                 hr_c["is_real_bet_target"] = False
-                hr_c["real_bet_badge"] = None
-                hr_c["real_bet_level"] = "none"
+                if not hr_c.get("is_virtual_bet_target") and not hr_c.get("is_virtual_bet") and hr_c.get("bet_category") != "virtual":
+                    hr_c["real_bet_badge"] = None
+                    hr_c["real_bet_level"] = "none"
 
         return cached_pred
 
@@ -1216,8 +1217,9 @@ def predict_race_core(
         if hr_final and isinstance(hr_final, dict):
             if hr_final.get("strategy_type") == "skip" or (hr_final.get("total_amount") or 0) == 0:
                 hr_final["is_real_bet_target"] = False
-                hr_final["real_bet_badge"] = None
-                hr_final["real_bet_level"] = "none"
+                if not hr_final.get("is_virtual_bet_target") and not hr_final.get("is_virtual_bet") and hr_final.get("bet_category") != "virtual":
+                    hr_final["real_bet_badge"] = None
+                    hr_final["real_bet_level"] = "none"
 
         return resp_data
     except HTTPException:

@@ -364,9 +364,25 @@ def save_settlement(data: dict):
         
         # bet_details からカテゴリ情報等を安全にフォールバック取得
         b_det_in = data.get("bet_details") or {}
-        b_cat = data.get("bet_category") or (b_det_in.get("bet_category") if isinstance(b_det_in, dict) else None) or "skip"
-        is_real_t = 1 if (data.get("is_real_bet_target") or (isinstance(b_det_in, dict) and b_det_in.get("is_real_bet_target"))) else 0
-        is_virt = 1 if (data.get("is_virtual_bet") or (isinstance(b_det_in, dict) and b_det_in.get("is_virtual_bet"))) else 0
+        rb_meta_in = b_det_in.get("real_bet_meta") if isinstance(b_det_in, dict) else {}
+        b_cat = (
+            data.get("bet_category")
+            or (b_det_in.get("bet_category") if isinstance(b_det_in, dict) else None)
+            or (rb_meta_in.get("bet_category") if isinstance(rb_meta_in, dict) else None)
+            or "skip"
+        )
+        is_real_t = 1 if (
+            data.get("is_real_bet_target")
+            or (isinstance(b_det_in, dict) and b_det_in.get("is_real_bet_target"))
+            or (isinstance(rb_meta_in, dict) and rb_meta_in.get("is_real_bet_target"))
+            or b_cat in ("super", "real")
+        ) else 0
+        is_virt = 1 if (
+            data.get("is_virtual_bet")
+            or (isinstance(b_det_in, dict) and b_det_in.get("is_virtual_bet"))
+            or (isinstance(rb_meta_in, dict) and rb_meta_in.get("is_virtual_bet_target"))
+            or b_cat == "virtual"
+        ) else 0
 
         row_dict = {
             "race_id": data["race_id"],
@@ -380,7 +396,11 @@ def save_settlement(data: dict):
             "bet_category": b_cat,
             "is_real_bet_target": is_real_t,
             "is_virtual_bet": is_virt,
-            "real_bet_badge": data.get("real_bet_badge") or (b_det_in.get("real_bet_badge") if isinstance(b_det_in, dict) else None),
+            "real_bet_badge": (
+                data.get("real_bet_badge")
+                or (b_det_in.get("real_bet_badge") if isinstance(b_det_in, dict) else None)
+                or (rb_meta_in.get("real_bet_badge") if isinstance(rb_meta_in, dict) else None)
+            ),
             "race_class_code": data.get("race_class_code"),
             "tansho_bet": data.get("tansho_bet", 0),
             "fukusho_bet": data.get("fukusho_bet", 0),
@@ -706,16 +726,24 @@ def get_cached_settlement(race_id: str) -> Optional[dict]:
                 "payout_details": d.get("payout_details"),
                 "tansho_bet": d.get("tansho_bet", 0),
                 "fukusho_bet": d.get("fukusho_bet", 0),
+                "wide_bet": d.get("wide_bet", 0),
                 "umatan_bet": d.get("umatan_bet", 0),
                 "umaren_bet": u_bet,
                 "trio_bet": t_bet,
+                "sanrentan_bet": d.get("sanrentan_bet", 0),
                 "tansho_payout": d.get("tansho_payout", 0),
                 "fukusho_payout": d.get("fukusho_payout", 0),
+                "wide_payout": d.get("wide_payout", 0),
                 "umatan_payout": d.get("umatan_payout", 0),
                 "umaren_payout": u_pay,
                 "trio_payout": t_pay,
+                "sanrentan_payout": d.get("sanrentan_payout", 0),
                 "mark_orders": mark_orders,
-                "top3_orders": top3_orders
+                "top3_orders": top3_orders,
+                "bet_category": d.get("bet_category") or rb_meta.get("bet_category") or "skip",
+                "is_real_bet_target": bool(d.get("is_real_bet_target") or rb_meta.get("is_real_bet_target")),
+                "is_virtual_bet": bool(d.get("is_virtual_bet") or rb_meta.get("is_virtual_bet")),
+                "real_bet_badge": d.get("real_bet_badge") or rb_meta.get("real_bet_badge")
             }
     except Exception as e:
         print(f"Supabase収支取得エラー ({race_id}): {e}")
@@ -728,7 +756,8 @@ def process_settlement_calculation(
     race_name: str,
     pred_data: dict,
     race_res: dict,
-    from_cache: bool = False
+    from_cache: bool = False,
+    bypass_cache: bool = False
 ) -> dict:
     """レース着順・払戻結果と予想データを突き合わせ、収支・損益・的中判定を確定計算"""
     race_name = clean_pure_race_name(race_name, race_id)
@@ -932,16 +961,20 @@ def process_settlement_calculation(
                 "is_pass": False,
                 "tansho_bet": 100,
                 "fukusho_bet": 100,
+                "wide_bet": 0,
                 "umatan_bet": 0,
                 "umaren_bet": 0,
                 "trio_bet": 0,
+                "sanrentan_bet": 0,
                 "total_bet": hypo_bet,
                 "actual_order": actual_order if (actual_order and actual_order < 90) else None,
                 "tansho_payout": pay_tan,
                 "fukusho_payout": pay_fuku,
+                "wide_payout": 0,
                 "umatan_payout": 0,
                 "umaren_payout": 0,
                 "trio_payout": 0,
+                "sanrentan_payout": 0,
                 "total_payout": hypo_pay,
                 "is_hit": is_virt_hit,
                 "hit_type": hit_type_virt,
@@ -950,12 +983,22 @@ def process_settlement_calculation(
                 "pass_benefit": pass_benefit,
                 "bet_breakdown": {"単勝": 100, "複勝": 100},
                 "payout_breakdown": p_breakdown,
-                "bet_details": {"real_bet_meta": real_bet_meta},
+                "bet_details": {
+                    "real_bet_meta": real_bet_meta,
+                    "bet_category": "virtual",
+                    "is_virtual_bet": True,
+                    "is_real_bet_target": False,
+                    "real_bet_badge": real_bet_meta.get("real_bet_badge")
+                },
                 "payout_details": p_details,
                 "mark_orders": mark_orders,
                 "top3_orders": top3_orders,
                 "track_bias": t_bias,
-                "odds_alerts": o_alerts
+                "odds_alerts": o_alerts,
+                "bet_category": "virtual",
+                "is_real_bet_target": 0,
+                "is_virtual_bet": 1,
+                "real_bet_badge": real_bet_meta.get("real_bet_badge")
             }
             save_settlement(settlement)
             if supabase:
@@ -986,20 +1029,34 @@ def process_settlement_calculation(
                 "hit_type": hit_type_virt,
                 "bet_breakdown": {"単勝": 100, "複勝": 100},
                 "payout_breakdown": p_breakdown,
-                "bet_details": {"real_bet_meta": real_bet_meta},
+                "bet_details": {
+                    "real_bet_meta": real_bet_meta,
+                    "bet_category": "virtual",
+                    "is_virtual_bet": True,
+                    "is_real_bet_target": False,
+                    "real_bet_badge": real_bet_meta.get("real_bet_badge")
+                },
                 "payout_details": p_details,
                 "tansho_bet": 100,
                 "fukusho_bet": 100,
+                "wide_bet": 0,
                 "umatan_bet": 0,
                 "umaren_bet": 0,
                 "trio_bet": 0,
+                "sanrentan_bet": 0,
                 "tansho_payout": pay_tan,
                 "fukusho_payout": pay_fuku,
+                "wide_payout": 0,
                 "umatan_payout": 0,
                 "umaren_payout": 0,
                 "trio_payout": 0,
+                "sanrentan_payout": 0,
                 "mark_orders": mark_orders,
-                "top3_orders": top3_orders
+                "top3_orders": top3_orders,
+                "bet_category": "virtual",
+                "is_real_bet_target": False,
+                "is_virtual_bet": True,
+                "real_bet_badge": real_bet_meta.get("real_bet_badge")
             }
         else:
             msg = pass_info["message"]
@@ -1085,6 +1142,17 @@ def process_settlement_calculation(
             }
 
     # 参戦レースの場合: PayoutVerifier で全券種を一括照合
+    tansho_bets = hybrid_rec.get("tansho_bets") or []
+    fukusho_bets = hybrid_rec.get("fukusho_bets") or []
+    umatan_bets = hybrid_rec.get("umatan_bets") or []
+    umaren_bets = hybrid_rec.get("umaren_bets") or []
+    wide_bets = hybrid_rec.get("wide_bets") or []
+    sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
+    trio_bets = hybrid_rec.get("trio_bets") or []
+    trio_bet = hybrid_rec.get("trio_bet")
+    if not trio_bets and trio_bet and isinstance(trio_bet, dict) and trio_bet.get("combination"):
+        trio_bets = [trio_bet]
+
     raw_tickets = hybrid_rec.get("tickets")
     if raw_tickets and isinstance(raw_tickets, list):
         all_tickets = []
@@ -1098,17 +1166,6 @@ def process_settlement_calculation(
                 "amount": b.get("amount", 100)
             })
     else:
-        tansho_bets = hybrid_rec.get("tansho_bets") or []
-        fukusho_bets = hybrid_rec.get("fukusho_bets") or []
-        umatan_bets = hybrid_rec.get("umatan_bets") or []
-        umaren_bets = hybrid_rec.get("umaren_bets") or []
-        wide_bets = hybrid_rec.get("wide_bets") or []
-        sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
-        trio_bets = hybrid_rec.get("trio_bets") or []
-        trio_bet = hybrid_rec.get("trio_bet")
-        if not trio_bets and trio_bet and isinstance(trio_bet, dict) and trio_bet.get("combination"):
-            trio_bets = [trio_bet]
-
         all_tickets = []
         for b in tansho_bets:
             all_tickets.append({"ticket_type": "単勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
@@ -1220,16 +1277,20 @@ def process_settlement_calculation(
         "is_pass": False,
         "tansho_bet": tan_bet_tot,
         "fukusho_bet": fuku_bet_tot,
+        "wide_bet": wide_bet_tot,
         "umatan_bet": utan_bet_tot,
         "umaren_bet": u_bet_tot,
         "trio_bet": t_bet_tot,
+        "sanrentan_bet": s_bet_tot,
         "total_bet": total_bet,
         "actual_order": actual_order if (actual_order and actual_order < 90) else None,
         "tansho_payout": tansho_payout,
         "fukusho_payout": fukusho_payout,
+        "wide_payout": wide_payout,
         "umatan_payout": umatan_payout,
         "umaren_payout": umaren_payout,
         "trio_payout": trio_payout,
+        "sanrentan_payout": sanrentan_payout,
         "total_payout": total_payout,
         "is_hit": is_hit,
         "hit_type": hit_type,
@@ -1250,13 +1311,19 @@ def process_settlement_calculation(
             "real_bet_meta": real_bet_meta,
             "bet_category": hybrid_rec.get("bet_category", "skip"),
             "is_virtual_bet": hybrid_rec.get("is_virtual_bet", False),
+            "is_real_bet_target": bool(hybrid_rec.get("is_real_bet_target", False)),
+            "real_bet_badge": hybrid_rec.get("real_bet_badge"),
             "badge_text": hybrid_rec.get("badge_text")
         },
         "payout_details": all_hits,
         "mark_orders": mark_orders,
         "top3_orders": top3_orders,
         "track_bias": t_bias,
-        "odds_alerts": o_alerts
+        "odds_alerts": o_alerts,
+        "bet_category": hybrid_rec.get("bet_category", "skip"),
+        "is_real_bet_target": 1 if hybrid_rec.get("is_real_bet_target") else 0,
+        "is_virtual_bet": 1 if hybrid_rec.get("is_virtual_bet") else 0,
+        "real_bet_badge": hybrid_rec.get("real_bet_badge")
     }
     save_settlement(settlement)
     if supabase:
@@ -1325,24 +1392,38 @@ def process_settlement_calculation(
             "fukusho_bets": fukusho_bets,
             "umatan_bets": umatan_bets,
             "umaren_bets": umaren_bets,
+            "wide_bets": wide_bets,
             "sanrentan_bets": sanrentan_bets,
             "trio_bets": trio_bets,
-            "trio_bet": trio_bet
+            "trio_bet": trio_bet,
+            "real_bet_meta": real_bet_meta,
+            "bet_category": hybrid_rec.get("bet_category", "skip"),
+            "is_virtual_bet": hybrid_rec.get("is_virtual_bet", False),
+            "is_real_bet_target": bool(hybrid_rec.get("is_real_bet_target", False)),
+            "real_bet_badge": hybrid_rec.get("real_bet_badge"),
+            "badge_text": hybrid_rec.get("badge_text")
         },
         "payout_details": all_hits,
         "tansho_bet": tan_bet_tot,
         "fukusho_bet": fuku_bet_tot,
+        "wide_bet": wide_bet_tot,
         "umatan_bet": utan_bet_tot,
         "umaren_bet": u_bet_tot,
         "trio_bet": t_bet_tot,
+        "sanrentan_bet": s_bet_tot,
         "tansho_payout": tansho_payout,
         "fukusho_payout": fukusho_payout,
+        "wide_payout": wide_payout,
         "umatan_payout": umatan_payout,
         "umaren_payout": umaren_payout,
         "trio_payout": trio_payout,
+        "sanrentan_payout": sanrentan_payout,
         "mark_orders": mark_orders,
         "top3_orders": top3_orders,
-        "is_real_bet_target": bool(hybrid_rec.get("is_real_bet_target", False))
+        "bet_category": hybrid_rec.get("bet_category", "skip"),
+        "is_real_bet_target": bool(hybrid_rec.get("is_real_bet_target", False)),
+        "is_virtual_bet": bool(hybrid_rec.get("is_virtual_bet", False)),
+        "real_bet_badge": hybrid_rec.get("real_bet_badge")
     }
 
 
@@ -1423,6 +1504,7 @@ def verify_race_result(
         race_name=race_name,
         pred_data=pred_data,
         race_res=race_res,
-        from_cache=from_cache
+        from_cache=from_cache,
+        bypass_cache=bypass_cache
     )
 

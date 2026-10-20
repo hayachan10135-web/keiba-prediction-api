@@ -392,17 +392,8 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
         h_rec["badge_text"] = "⭐実勝負"
         h_rec["target_umaban"] = w0_u
         h_rec["target_horse_name"] = w0_name
-        h_rec["tansho_bets"] = []
-        h_rec["fukusho_bets"] = fukusho_bets
-        h_rec["umatan_bets"] = []
-        h_rec["umaren_bets"] = []
-        h_rec["wide_bets"] = []
-        h_rec["trio_bets"] = []
-        h_rec["sanrentan_bets"] = []
-        h_rec["tansho_amount"] = 0
-        h_rec["fukusho_amount"] = bet_amount
-        h_rec["umatan_amount"] = 0
-        h_rec["wide_amount"] = 0
+        ticket_fields = TicketTypeRegistry.build_legacy_ticket_fields(fukusho_bets)
+        h_rec.update(ticket_fields)
         h_rec["total_amount"] = bet_amount
         h_rec["summary"] = f"{strategy_name} [複勝{w0_u} {w0_name} / 計{bet_amount:,}円]"
 

@@ -54,6 +54,8 @@ class HybridRecommendation(BaseModel):
     is_participate: bool
     strategy_name: str = "波乱度メタモデル最適化"
     strategy_type: Optional[str] = "daiharan"
+    bet_category: Optional[str] = "skip"
+    badge_text: Optional[str] = None
     total_amount: int
     summary: str
     tansho_bets: Optional[List[TicketBet]] = []
@@ -66,6 +68,7 @@ class HybridRecommendation(BaseModel):
     wide_amount: Optional[int] = 0
     umaren_amount: Optional[int] = 0
     trio_amount: Optional[int] = 0
+    sanrentan_amount: Optional[int] = 0
     tickets: Optional[List[TicketBet]] = []
     umaren_bets: List[TicketBet] = []
     sanrentan_bets: Optional[List[TicketBet]] = []
@@ -83,6 +86,7 @@ class HybridRecommendation(BaseModel):
     real_bet_badge: Optional[str] = None
     real_bet_level: Optional[str] = None
     is_final_odds: Optional[bool] = False
+    is_virtual_bet: Optional[bool] = False
     # 仮想馬券フィールド
     is_virtual_bet_target: Optional[bool] = False
     virtual_bet_slot: Optional[int] = None
@@ -102,6 +106,9 @@ class TanFukuRecommendation(BaseModel):
     fukusho_amount: int
     total_amount: int
     summary: str
+    bet_category: Optional[str] = "skip"
+    badge_text: Optional[str] = None
+    is_virtual_bet: Optional[bool] = False
 
 
 class RaceDetails(BaseModel):
@@ -130,6 +137,7 @@ class PredictResponse(BaseModel):
     recommendation: TanFukuRecommendation
     hybrid_recommendation: Optional[HybridRecommendation] = None
     track_bias: Optional[TrackBiasInfo] = None
+    last_odds_stage: Optional[str] = None
 
 
 # --- 外部から注入される推論・レース一覧ハンドラー関数 ---
@@ -178,7 +186,8 @@ def predict_race_endpoint(race_id: str, force_refresh: bool = Query(False, descr
         if hr and isinstance(hr, dict):
             if hr.get("strategy_type") == "skip" or (hr.get("total_amount") or 0) == 0 or res.get("recommendation", {}).get("is_pass"):
                 hr["is_real_bet_target"] = False
-                hr["real_bet_badge"] = None
-                hr["real_bet_level"] = "none"
+                if not hr.get("is_virtual_bet_target") and not hr.get("is_virtual_bet") and hr.get("bet_category") != "virtual":
+                    hr["real_bet_badge"] = None
+                    hr["real_bet_level"] = "none"
     return res
 

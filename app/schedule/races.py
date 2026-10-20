@@ -411,6 +411,8 @@ def attach_prediction_badges_to_venues(formatted_date: str, venues: List[dict]) 
         for r in races_in_venue:
             if float(r.get("confidence_score") or 0.0) <= 0.0:
                 continue
+            if r.get("is_real_bet_target"):
+                continue
             r_nm = r.get("race_name", "")
             r_info = r.get("race_info", "")
             is_obstacle = ("障害" in r_nm) or ("障" in r_info)

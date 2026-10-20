@@ -40,15 +40,23 @@ class VerificationResult(BaseModel):
     trio_bet: Optional[int] = 0
     tansho_bet: Optional[int] = 0
     fukusho_bet: Optional[int] = 0
+    wide_bet: Optional[int] = 0
     umatan_bet: Optional[int] = 0
+    sanrentan_bet: Optional[int] = 0
     umaren_payout: Optional[int] = 0
     trio_payout: Optional[int] = 0
     tansho_payout: Optional[int] = 0
     fukusho_payout: Optional[int] = 0
+    wide_payout: Optional[int] = 0
     umatan_payout: Optional[int] = 0
+    sanrentan_payout: Optional[int] = 0
     mark_orders: Optional[List[dict]] = None
     top3_orders: Optional[List[dict]] = None
     target_popularity: Optional[int] = None
+    bet_category: Optional[str] = "skip"
+    is_real_bet_target: Optional[bool] = False
+    is_virtual_bet: Optional[bool] = False
+    real_bet_badge: Optional[str] = None
 
 
 # 外部から注入される照合ハンドラー関数

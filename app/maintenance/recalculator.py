@@ -147,7 +147,7 @@ def recalculate_period_records():
 
         pred_data["hybrid_recommendation"] = new_h
 
-        if ("新馬" in rname) or ("メイクデビュー" in rname) or surf == 2:
+        if not new_h.get("is_participate") or surf == 2:
             rec_obj = pred_data.get("recommendation") or {}
             rec_obj["grade"] = "D"
             rec_obj["confidence_label"] = "見送り推奨"

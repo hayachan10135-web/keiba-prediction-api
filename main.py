@@ -762,8 +762,9 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
             if hr and isinstance(hr, dict):
                 if hr.get("strategy_type") == "skip" or (hr.get("total_amount") or 0) == 0 or p_obj.get("recommendation", {}).get("is_pass"):
                     hr["is_real_bet_target"] = False
-                    hr["real_bet_badge"] = None
-                    hr["real_bet_level"] = "none"
+                    if not hr.get("is_virtual_bet_target") and not hr.get("is_virtual_bet") and hr.get("bet_category") != "virtual":
+                        hr["real_bet_badge"] = None
+                        hr["real_bet_level"] = "none"
 
         result_payload = {
             "date": target_date,

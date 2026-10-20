@@ -336,6 +336,70 @@ class TestArbiter4Classes(unittest.TestCase):
         self.assertTrue(u1_ticket.get("is_real_odds"), "実オッズフラグが True になっていること")
         self.assertEqual(u1_ticket.get("odds"), 15.4, "リアルタイム馬連オッズ 15.4倍が正しく反映されていること")
 
+    def test_process_settlement_calculation_for_participating_race(self):
+        """参戦レース（勝負R / 実勝負 / 仮想）に対して process_settlement_calculation がクラッシュせず正常完了すること"""
+        from app.settlement.settlement_engine import process_settlement_calculation
+        from app.core.database import get_db
+
+        dummy_pred = {
+            "race_name": "勝負テスト記念",
+            "horses": [{"umaban": 3, "horse_name": "テストスター", "mark": "◎"}],
+            "recommendation": {"target_umaban": 3, "horse_name": "テストスター", "grade": "S"},
+            "hybrid_recommendation": {
+                "is_participate": True,
+                "is_real_bet_target": True,
+                "bet_category": "super",
+                "strategy_type": "super_bet",
+                "real_bet_badge": "🔥【勝負R (S)】単勝",
+                "badge_text": "🔥勝負R",
+                "tickets": [{"ticket_type": "単勝", "combination": [3], "amount": 5000}],
+                "tansho_bets": [{"ticket_type": "単勝", "combination": [3], "amount": 5000}],
+                "wide_bets": [],
+            }
+        }
+        dummy_res = {
+            "race_name": "勝負テスト記念",
+            "orders": {3: 1, 5: 2, 8: 3},
+            "payouts": {"tansho": {3: 420}, "fukusho": {3: 180}}
+        }
+        test_rid = "202699990101"
+        try:
+            res = process_settlement_calculation(
+                race_id=test_rid,
+                race_date="2026-10-20",
+                race_name="勝負テスト記念",
+                pred_data=dummy_pred,
+                race_res=dummy_res,
+                from_cache=True,
+                bypass_cache=True
+            )
+            self.assertTrue(res["is_hit"])
+            self.assertEqual(res["total_bet"], 5000)
+            self.assertEqual(res["total_payout"], 21000)
+            self.assertTrue(res["is_real_bet_target"])
+            self.assertEqual(res["bet_category"], "super")
+        finally:
+            db = get_db()
+            if db:
+                db.table("keiba_race_settlements").delete().eq("race_id", test_rid).execute()
+
+    def test_predict_and_settlement_pydantic_schemas_include_new_fields(self):
+        """FastAPIルーターの Pydantic レスポンスモデルに新4区分フィールドが網羅されていること"""
+        from app.routers.prediction import HybridRecommendation, PredictResponse
+        from app.routers.settlement import VerificationResult
+
+        hr_fields = HybridRecommendation.__fields__
+        self.assertIn("bet_category", hr_fields)
+        self.assertIn("badge_text", hr_fields)
+        self.assertIn("is_virtual_bet", hr_fields)
+        self.assertIn("sanrentan_amount", hr_fields)
+
+        vr_fields = VerificationResult.__fields__
+        self.assertIn("wide_bet", vr_fields)
+        self.assertIn("wide_payout", vr_fields)
+        self.assertIn("bet_category", vr_fields)
+        self.assertIn("is_real_bet_target", vr_fields)
+
 
 if __name__ == "__main__":
     unittest.main()
