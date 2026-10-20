@@ -3,7 +3,7 @@
 app/strategies/arbiter.py
 
 戦略調停オーケストレーター (StrategyArbiter)
-カスケード評価、スリッページ停止判定、トリガミ間引き、仮想観戦枠の生成を統合
+新4区分カスケード評価、最新オッズ再推論による買い目決定、仮想観戦枠の生成を統合
 """
 
 import datetime
@@ -17,7 +17,6 @@ from app.strategies.strategy_super import StrategySuper
 from app.strategies.strategy_real import StrategyReal
 from app.strategies.strategy_virtual import StrategyVirtual
 from app.strategies.daily_promotion import DailyPromotionStrategy
-from app.strategies.trigami_pruner import TrigamiPruner
 from app.strategies.models import StrategyDecision, BetTicket
 
 

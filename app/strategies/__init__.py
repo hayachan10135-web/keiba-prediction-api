@@ -2,7 +2,7 @@
 """
 app.strategies package
 
-買い目戦略、調停オーケストレーター、トリガミ間引きエンジンの疎結合レイヤ (Strategy Pattern)
+買い目戦略、調停オーケストレーターの疎結合レイヤ (Strategy Pattern)
 """
 
 from app.strategies.models import StrategyDecision, BetTicket
@@ -28,7 +28,6 @@ from app.strategies.daily_promotion import (
     invalidate_daily_top_cache,
     _daily_top_race_id_cache
 )
-from app.strategies.trigami_pruner import TrigamiPruner
 from app.strategies.arbiter import StrategyArbiter
 
 __all__ = [
@@ -52,6 +51,5 @@ __all__ = [
     "set_daily_promotion_dependencies",
     "invalidate_daily_top_cache",
     "_daily_top_race_id_cache",
-    "TrigamiPruner",
     "StrategyArbiter",
 ]

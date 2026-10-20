@@ -194,7 +194,7 @@ def compute_hybrid_rec_from_inputs(
     is_virtual_guarantee: bool = False,
     race_class_code: Optional[int] = None
 ) -> dict:
-    """買い目戦略・調停・トリガミ防止・スリッページ停止判定を app/strategies/arbiter.py へ委任"""
+    """買い目戦略・調停・最新オッズ再推論判定を app/strategies/arbiter.py へ委任"""
     return _strategy_arbiter.evaluate_race(
         race_name=race_name,
         race_details=race_details,
@@ -842,10 +842,7 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
         total_amt = b_tan + b_fuku
 
         if is_pass:
-            if h_odds is not None and h_odds < 2.5:
-                summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{h_odds}倍のためトリガミ回避・見送り推奨)"
-            else:
-                summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
+            summary_text = f"{u_num}番 {h_name} [{conf_label}] (期待値不足のため見送り推奨)"
         else:
             summary_text = f"{u_num}番 {h_name} [{conf_label}] (単勝{b_tan}円 + 複勝{b_fuku}円 / 計{total_amt}円)"
 

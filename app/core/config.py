@@ -67,7 +67,6 @@ class Settings:
     API_KEY: str = os.environ.get("API_KEY", "")
 
     # 安全ガードレール定数（決定済み仕様）
-    SLIPPAGE_ROI_BORDER: float = 105.0        # 期待回収率 105.0% 未満でスリッページ停止
     MAX_DELAY_MINUTES: int = 30               # 当初発走時刻から30分以上の遅延で自動投票中止
     DEFAULT_MAX_BET_PER_RACE: int = 2500      # 1レース最大上限額（デフォルト）
 
