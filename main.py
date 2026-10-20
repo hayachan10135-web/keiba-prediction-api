@@ -29,6 +29,7 @@ from umaca_fast_client import UMACAFastClient
 
 from app.core.security import verify_api_key
 from app.core.timezone import JST, now_jst, now_jst_naive, today_jst_str, parse_post_datetime, is_before_morning_prediction
+from app.core.logging_config import setup_server_logging
 from app.strategies import (
     StrategyArbiter,
     NATURAL_REAL_STRATEGIES,
@@ -192,6 +193,8 @@ _strategy_arbiter = StrategyArbiter()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # サーバーファイルロギング構成
+    setup_server_logging()
     # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
     check_and_apply_db_migration()
     load_stats_overlay_from_supabase()

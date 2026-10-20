@@ -64,6 +64,9 @@ class HybridRecommendation(BaseModel):
     fukusho_amount: Optional[int] = 0
     umatan_amount: Optional[int] = 0
     wide_amount: Optional[int] = 0
+    umaren_amount: Optional[int] = 0
+    trio_amount: Optional[int] = 0
+    tickets: Optional[List[TicketBet]] = []
     umaren_bets: List[TicketBet] = []
     sanrentan_bets: Optional[List[TicketBet]] = []
     hypothetical_umaren_bets: Optional[List[TicketBet]] = []

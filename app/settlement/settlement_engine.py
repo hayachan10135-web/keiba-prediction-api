@@ -1085,32 +1085,45 @@ def process_settlement_calculation(
             }
 
     # 参戦レースの場合: PayoutVerifier で全券種を一括照合
-    tansho_bets = hybrid_rec.get("tansho_bets") or []
-    fukusho_bets = hybrid_rec.get("fukusho_bets") or []
-    umatan_bets = hybrid_rec.get("umatan_bets") or []
-    umaren_bets = hybrid_rec.get("umaren_bets") or []
-    wide_bets = hybrid_rec.get("wide_bets") or []
-    sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
-    trio_bets = hybrid_rec.get("trio_bets") or []
-    trio_bet = hybrid_rec.get("trio_bet")
-    if not trio_bets and trio_bet and isinstance(trio_bet, dict) and trio_bet.get("combination"):
-        trio_bets = [trio_bet]
+    raw_tickets = hybrid_rec.get("tickets")
+    if raw_tickets and isinstance(raw_tickets, list):
+        all_tickets = []
+        for b in raw_tickets:
+            comb = b.get("combination", [])
+            if not comb and b.get("target_umaban"):
+                comb = [b.get("target_umaban")]
+            all_tickets.append({
+                "ticket_type": b.get("ticket_type", ""),
+                "combination": comb,
+                "amount": b.get("amount", 100)
+            })
+    else:
+        tansho_bets = hybrid_rec.get("tansho_bets") or []
+        fukusho_bets = hybrid_rec.get("fukusho_bets") or []
+        umatan_bets = hybrid_rec.get("umatan_bets") or []
+        umaren_bets = hybrid_rec.get("umaren_bets") or []
+        wide_bets = hybrid_rec.get("wide_bets") or []
+        sanrentan_bets = hybrid_rec.get("sanrentan_bets") or []
+        trio_bets = hybrid_rec.get("trio_bets") or []
+        trio_bet = hybrid_rec.get("trio_bet")
+        if not trio_bets and trio_bet and isinstance(trio_bet, dict) and trio_bet.get("combination"):
+            trio_bets = [trio_bet]
 
-    all_tickets = []
-    for b in tansho_bets:
-        all_tickets.append({"ticket_type": "単勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
-    for b in fukusho_bets:
-        all_tickets.append({"ticket_type": "複勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
-    for b in umatan_bets:
-        all_tickets.append({"ticket_type": "馬単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
-    for b in umaren_bets:
-        all_tickets.append({"ticket_type": "馬連", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
-    for b in wide_bets:
-        all_tickets.append({"ticket_type": "ワイド", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
-    for b in sanrentan_bets:
-        all_tickets.append({"ticket_type": "3連単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
-    for b in trio_bets:
-        all_tickets.append({"ticket_type": "三連複", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+        all_tickets = []
+        for b in tansho_bets:
+            all_tickets.append({"ticket_type": "単勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
+        for b in fukusho_bets:
+            all_tickets.append({"ticket_type": "複勝", "combination": b.get("combination", [b.get("target_umaban")]), "amount": b.get("amount", 100)})
+        for b in umatan_bets:
+            all_tickets.append({"ticket_type": "馬単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+        for b in umaren_bets:
+            all_tickets.append({"ticket_type": "馬連", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+        for b in wide_bets:
+            all_tickets.append({"ticket_type": "ワイド", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+        for b in sanrentan_bets:
+            all_tickets.append({"ticket_type": "3連単", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
+        for b in trio_bets:
+            all_tickets.append({"ticket_type": "3連複", "combination": b.get("combination", []), "amount": b.get("amount", 100)})
 
     payouts_data = race_res.get("payouts", {})
     total_payout, all_hits, bet_breakdown, payout_breakdown = PayoutVerifier.verify_all_tickets(all_tickets, payouts_data)
@@ -1121,7 +1134,7 @@ def process_settlement_calculation(
     u_bet_tot = bet_breakdown.get("馬連", 0)
     wide_bet_tot = bet_breakdown.get("ワイド", 0)
     s_bet_tot = bet_breakdown.get("3連単", 0)
-    t_bet_tot = bet_breakdown.get("三連複", 0)
+    t_bet_tot = bet_breakdown.get("3連複", 0) or bet_breakdown.get("三連複", 0)
 
     tansho_payout = payout_breakdown.get("単勝", 0)
     fukusho_payout = payout_breakdown.get("複勝", 0)
@@ -1129,7 +1142,7 @@ def process_settlement_calculation(
     umaren_payout = payout_breakdown.get("馬連", 0)
     wide_payout = payout_breakdown.get("ワイド", 0)
     sanrentan_payout = payout_breakdown.get("3連単", 0)
-    trio_payout = payout_breakdown.get("三連複", 0)
+    trio_payout = payout_breakdown.get("3連複", 0) or payout_breakdown.get("三連複", 0)
 
     total_bet = sum(bet_breakdown.values())
     profit = total_payout - total_bet

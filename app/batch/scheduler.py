@@ -298,15 +298,18 @@ async def background_maintenance_loop():
                                     h_name = pred_res.get("recommendation", {}).get("horse_name", "")
                                     r_name = pred_res.get("race_name", r.get("race_name", f"Race {r_id}"))
 
-                                    all_tickets = (
-                                        (h_rec.get("tansho_bets") or [])
-                                        + (h_rec.get("fukusho_bets") or [])
-                                        + (h_rec.get("umatan_bets") or [])
-                                        + (h_rec.get("umaren_bets") or [])
-                                        + (h_rec.get("wide_bets") or [])
-                                        + (h_rec.get("trio_bets") or [])
-                                        + (h_rec.get("sanrentan_bets") or [])
-                                    )
+                                    # 券種非依存の共通チケットリスト取得 (フォールバック付き)
+                                    all_tickets = h_rec.get("tickets")
+                                    if not all_tickets:
+                                        all_tickets = (
+                                            (h_rec.get("tansho_bets") or [])
+                                            + (h_rec.get("fukusho_bets") or [])
+                                            + (h_rec.get("umatan_bets") or [])
+                                            + (h_rec.get("umaren_bets") or [])
+                                            + (h_rec.get("wide_bets") or [])
+                                            + (h_rec.get("trio_bets") or [])
+                                            + (h_rec.get("sanrentan_bets") or [])
+                                        )
                                     tot_amt = h_rec.get("total_amount", 0)
 
                                     bets_summary = ", ".join([f"{b.get('ticket_type')} {b.get('combination_str')}({b.get('amount')}円)" for b in all_tickets[:3]])

@@ -52,10 +52,13 @@ class StrategyReal(BaseBettingStrategy):
             return False
 
         w0_odds = float(honmei_horse.get("odds") or 50.0)
-        s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
-        w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else float(honmei_horse.get("prob_top3", 0.0))
+        # 本命馬（実際に複勝を購入する対象馬）自身の複勝率を参照
+        w0_t3 = float(honmei_horse.get("prob_top3", 0.0))
+        if w0_t3 <= 0.0:
+            s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
+            w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else 0.0
 
-        # 自然適格条件: 複勝率 >= 0.65 × 期待値 >= 1.05 × オッズ <= 8.0倍
+        # 自然適格条件: 本命馬の複勝率 >= 0.65 × 期待値 >= 1.05 × オッズ <= 8.0倍
         is_top3_fit = (w0_t3 >= 0.65)
         is_edge_fit = (win_edge >= 1.05)
         is_odds_fit = (w0_odds <= 8.0)

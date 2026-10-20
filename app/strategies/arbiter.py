@@ -12,6 +12,7 @@ import numpy as np
 
 from app.core.config import settings
 from app.core.timezone import now_jst_naive, today_jst_str
+from app.core.ticket_spec import TicketTypeRegistry
 from app.strategies.base import BaseBettingStrategy
 from app.strategies.strategy_super import StrategySuper
 from app.strategies.strategy_real import StrategyReal
@@ -227,20 +228,9 @@ class StrategyArbiter:
                 reason=s_reason
             )
 
-        # 券種別リストの分解
-        tansho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "単勝"]
-        fukusho_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "複勝"]
-        umatan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬単"]
-        umaren_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "馬連"]
-        wide_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "ワイド"]
-        trio_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連複"]
-        sanrentan_bets = [t.to_dict() for t in decision.tickets if t.ticket_type == "3連単"]
-
-        tan_amt = sum(b["amount"] for b in tansho_bets)
-        fuku_amt = sum(b["amount"] for b in fukusho_bets)
-        utan_amt = sum(b["amount"] for b in umatan_bets)
-        wide_amt = sum(b["amount"] for b in wide_bets)
-        total_amt = decision.total_amount
+        # 券種非依存の共通インターフェースによるチケットフィールド展開 (後方互換対応)
+        ticket_fields = TicketTypeRegistry.build_legacy_ticket_fields(decision.tickets)
+        total_amt = decision.total_amount or ticket_fields["total_amount"]
 
         # 仮想馬券 (総合台帳用) の生成
         virtual_bets = []
@@ -248,22 +238,16 @@ class StrategyArbiter:
         virtual_strategy_name = None
         virtual_badge = None
 
-        if decision.bet_category in ("super", "real"):
-            # 実投票対象 (勝負R または 実勝負) -> 総合台帳にもそのまま反映
-            virtual_bets = [t.to_dict() for t in decision.tickets]
-            virtual_total_amount = total_amt
-            virtual_strategy_name = decision.strategy_name
-            virtual_badge = decision.real_bet_badge
-        elif decision.bet_category == "virtual":
-            # 仮想観戦枠 -> 生成された全チケット（クラスA:ワイド、クラスB:単勝、クラスC:馬連 等）を仮想馬券として登録
-            virtual_bets = [t.to_dict() for t in decision.tickets]
+        if decision.bet_category in ("super", "real", "virtual"):
+            # 参加対象 (勝負R / 実勝負 / 仮想観戦枠) -> 総合台帳にもそのまま反映
+            virtual_bets = list(ticket_fields["tickets"])
             virtual_total_amount = total_amt
             virtual_strategy_name = decision.strategy_name
             virtual_badge = decision.real_bet_badge
 
-        all_active_bets = [t.to_dict() for t in decision.tickets]
+        all_active_bets = ticket_fields["tickets"]
 
-        return {
+        res = {
             "is_participate": decision.is_participate,
             "strategy_name": decision.strategy_name,
             "strategy_type": decision.strategy_type,
@@ -271,19 +255,6 @@ class StrategyArbiter:
             "badge_text": decision.badge_text,
             "total_amount": total_amt,
             "summary": decision.summary,
-            "tansho_bets": tansho_bets,
-            "fukusho_bets": fukusho_bets,
-            "umatan_bets": umatan_bets,
-            "umaren_bets": umaren_bets,
-            "wide_bets": wide_bets,
-            "trio_bets": trio_bets,
-            "sanrentan_bets": sanrentan_bets,
-            "tansho_amount": tan_amt,
-            "fukusho_amount": fuku_amt,
-            "umatan_amount": utan_amt,
-            "wide_amount": wide_amt,
-            "hypothetical_umaren_bets": [],
-            "trio_bet": trio_bets[0] if trio_bets else None,
             "reason": decision.reason,
             "is_real_odds_applied": any(b.get("is_real_odds", False) for b in all_active_bets),
             "total_expected_payout": sum(b.get("expected_payout", 0) for b in all_active_bets),
@@ -305,4 +276,7 @@ class StrategyArbiter:
             "virtual_bets": virtual_bets,
             "virtual_total_amount": virtual_total_amount
         }
+        # 全券種個別フィールド (tansho_bets, umaren_amount, wide_amount 等) をマージ
+        res.update(ticket_fields)
+        return res
 

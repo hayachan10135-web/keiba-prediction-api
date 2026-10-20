@@ -8,6 +8,7 @@ app/strategies/daily_promotion.py
 from typing import Dict, Any, List, Optional, Callable
 from app.core.database import get_supabase_client
 from app.core.timezone import now_jst_naive, today_jst_str, parse_post_datetime
+from app.core.ticket_spec import TicketTypeRegistry
 from app.strategies.base import BaseBettingStrategy
 from app.strategies.models import StrategyDecision, BetTicket
 
@@ -189,9 +190,10 @@ def get_or_select_daily_top_race_id(target_date: str, supabase_client: Optional[
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
-            w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else 0.0
-            # SSOT (FR-STR-03): 最高安定度スコア（複勝率×1.5＋確信度＋EV）
+            s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+            w0 = s_win[0] if s_win else {}
+            w0_t3 = float(w0.get("prob_top3", 0.0))
+            # SSOT (FR-STR-03): 最高安定度スコア（本命馬複勝率×1.5＋確信度＋EV）
             stability_score = round(w0_t3 * 1.5 + conf + edge, 4)
 
             candidates.append({
@@ -319,9 +321,10 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
             h_rec = dj.get("hybrid_recommendation") or {}
             conf = float(h_rec.get("confidence_score") or 0.0)
             edge = float(h_rec.get("edge_ratio") or 1.0)
-            s_top3 = sorted(horses, key=lambda x: x.get("prob_top3", 0.0), reverse=True)
-            w0_t3 = float(s_top3[0].get("prob_top3", 0.0)) if s_top3 else 0.0
-            # SSOT (FR-STR-03): 最高安定度スコア（複勝率×1.5＋確信度＋EV）
+            s_win = sorted(horses, key=lambda x: x.get("prob_win", 0.0), reverse=True)
+            w0 = s_win[0] if s_win else {}
+            w0_t3 = float(w0.get("prob_top3", 0.0))
+            # SSOT (FR-STR-03): 最高安定度スコア（本命馬複勝率×1.5＋確信度＋EV）
             score = round(w0_t3 * 1.5 + conf + edge, 4)
             candidates.append({
                 "race_id": rid,
@@ -445,18 +448,7 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
                     r_h["bet_category"] = "skip"
                     r_h["strategy_type"] = "skip"
                     r_h["strategy_name"] = "見送り推奨 (資金保全)"
-                    r_h["tansho_bets"] = []
-                    r_h["fukusho_bets"] = []
-                    r_h["umatan_bets"] = []
-                    r_h["umaren_bets"] = []
-                    r_h["wide_bets"] = []
-                    r_h["trio_bets"] = []
-                    r_h["sanrentan_bets"] = []
-                    r_h["tansho_amount"] = 0
-                    r_h["fukusho_amount"] = 0
-                    r_h["umatan_amount"] = 0
-                    r_h["wide_amount"] = 0
-                    r_h["total_amount"] = 0
+                    r_h.update(TicketTypeRegistry.get_empty_legacy_ticket_fields())
                     r_dj["hybrid_recommendation"] = r_h
                     rec_obj = r_dj.get("recommendation") or {}
                     rec_obj["is_pass"] = True
