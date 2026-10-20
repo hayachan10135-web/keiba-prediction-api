@@ -10,25 +10,31 @@ from typing import Optional
 
 
 def _load_dotenv():
-    """ローカル起動時に .env ファイルから環境変数を読み込む"""
+    """ローカル起動時に .env ファイルから環境変数を読み込む (UTF-8 / UTF-8-BOM / CP932 耐障害仕様)"""
     env_paths = [
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),
-        ".env"
+        ".env",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "..", "auto_betting", ".env")
     ]
     for env_path in env_paths:
         if os.path.exists(env_path):
             try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            k = k.strip()
-                            v = v.strip().strip("'\"")
-                            if k and k not in os.environ:
-                                os.environ[k] = v
-            except Exception:
-                pass
+                with open(env_path, "rb") as f:
+                    raw_bytes = f.read()
+                try:
+                    text = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw_bytes.decode("cp932", errors="replace")
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception as e:
+                print(f"[Config Warning] .env 読み込み警告 ({env_path}): {e}")
 
 
 _load_dotenv()

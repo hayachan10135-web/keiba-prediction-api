@@ -61,7 +61,7 @@ NAME_TO_JYO_HEX = {v: k for k, v in JYO_HEX_TO_NAME.items()}
 
 
 def _load_fallback_env() -> Dict[str, str]:
-    """ローカル実行時など環境変数が未設定の場合に .env ファイルから読み込む"""
+    """ローカル実行時など環境変数が未設定の場合に .env ファイルから読み込む (UTF-8 / CP932 耐障害仕様)"""
     candidates = [
         os.path.join(os.path.dirname(__file__), ".env"),
         os.path.join(os.path.dirname(__file__), "..", "auto_betting", ".env"),
@@ -70,14 +70,20 @@ def _load_fallback_env() -> Dict[str, str]:
     for path in candidates:
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        k, v = line.split("=", 1)
-                        env_map[k.strip()] = v.strip()
-                break
+                with open(path, "rb") as f:
+                    raw_bytes = f.read()
+                try:
+                    text = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw_bytes.decode("cp932", errors="replace")
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env_map[k.strip()] = v.strip().strip("'\"")
+                if env_map:
+                    break
             except Exception:
                 pass
     return env_map
