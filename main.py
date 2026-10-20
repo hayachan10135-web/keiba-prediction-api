@@ -1,5 +1,6 @@
 from typing import List, Optional, Dict, Any, Tuple, Set
 from collections import defaultdict
+from contextlib import asynccontextmanager
 import os
 from app.core.config import settings
 import math
@@ -188,10 +189,28 @@ from app.scrapers import (
 
 _strategy_arbiter = StrategyArbiter()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
+    check_and_apply_db_migration()
+    load_stats_overlay_from_supabase()
+    load_betting_settings_from_supabase()
+    maintenance_task = asyncio.create_task(background_maintenance_loop())
+    # 起動時の整合性チェック・馬体重/結果補完は非同期スレッドで実行し、API応答をブロックしない
+    bg_init_task = asyncio.create_task(asyncio.to_thread(_startup_background_init))
+    try:
+        yield
+    finally:
+        maintenance_task.cancel()
+        bg_init_task.cancel()
+
+
 app = FastAPI(
     title="Keiba Prediction & Verification API",
     description="競馬AI予想 ＆ 自律型自動投票システム API",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -352,7 +371,8 @@ def check_and_notify_balance_shortfall():
                 cur_balance = l_res.get("balance", 0)
                 b_settings["last_balance"] = cur_balance
                 save_betting_settings_to_supabase(b_settings)
-        except Exception:
+        except Exception as e:
+            print(f"[BalanceWarning] 残高照会例外: {e}")
             return
 
     if cur_balance is None:
@@ -453,8 +473,8 @@ def has_already_betted_race(date_str: str, race_id: str) -> bool:
             if res.data and len(res.data) > 0:
                 _auto_betted_races.add(race_id)
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[AlreadyBetted Warning] real_bets DB照会例外 ({race_id}): {e}")
     # 2. settings 内の betted_races_by_date から確認
     try:
         settings = load_betting_settings_from_supabase()
@@ -463,8 +483,8 @@ def has_already_betted_race(date_str: str, race_id: str) -> bool:
             if isinstance(item, dict) and item.get("race_id") == race_id:
                 _auto_betted_races.add(race_id)
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[AlreadyBetted Warning] settings 照会例外 ({race_id}): {e}")
     return False
 
 # get_or_select_daily_top_race_id および ensure_daily_single_real_bet は
@@ -510,7 +530,7 @@ def get_cached_prediction(race_id: str) -> Optional[dict]:
                             supabase.table("keiba_predictions_cache").update({"data_json": d_json}).eq("race_id", race_id).execute()
                             print(f"[Self-Heal] {race_id}: キャッシュ内の重複馬番を修復しました ({len(orig_horses)}頭 -> {len(dedup_horses)}頭)")
                         except Exception as ue:
-                            pass
+                            print(f"[Self-Heal Warning] 重複馬番保存スキップ ({race_id}): {ue}")
                 apply_odds_anomaly_indicators(d_json.get("horses", []))
                 c_details = (d_json.get("race_details") or {}).get("course_details", "")
                 surf_str = "芝" if "芝" in c_details else ("ダート" if "ダ" in c_details else "障害")
@@ -519,7 +539,7 @@ def get_cached_prediction(race_id: str) -> Optional[dict]:
                     d_json["track_bias"] = tb_info
             return d_json
     except Exception as e:
-        print(f"Supabase予想取得エラー ({race_id}): {e}")
+        print(f"DB予想取得エラー ({race_id}): {e}")
     return None
 
 def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
@@ -550,7 +570,7 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
             _all_predictions_cache.pop(race_date, None)
         _today_races_cache.pop(race_date, None)
     except Exception as e:
-        print(f"Supabase予想保存エラー ({race_id}): {e}")
+        print(f"DB予想保存エラー ({race_id}): {e}")
 
 
 def sync_virtual_badge_to_prediction(race_id: str, pred_data: dict, race_date: Optional[str] = None) -> dict:
@@ -722,7 +742,8 @@ def get_all_predictions_for_date(date: Optional[str] = Query(None, description="
                     raw_v = fetch_venues_for_date_raw(target_date)
                     if raw_v:
                         venues_list = attach_prediction_badges_to_venues(target_date, raw_v)
-                except Exception:
+                except Exception as ve:
+                    print(f"[VenuesFetch Warning] 会場一覧取得例外 ({target_date}): {ve}")
                     venues_list = []
 
             if venues_list:
@@ -933,15 +954,4 @@ def _startup_background_init():
         heal_today_weights_and_results(today_jst_str())
     except Exception as e:
         print(f"[Startup Bg Init Warning] {e}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    # DB構成（バージョン）に変更があった時のみ初期化し、通常の再起動時はデータを完全保持
-    check_and_apply_db_migration()
-    load_stats_overlay_from_supabase()
-    load_betting_settings_from_supabase()
-    asyncio.create_task(background_maintenance_loop())
-    # 起動時の整合性チェック・馬体重/結果補完は非同期スレッドで実行し、API応答をブロックしない
-    asyncio.create_task(asyncio.to_thread(_startup_background_init))
 
