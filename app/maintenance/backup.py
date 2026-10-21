@@ -13,6 +13,7 @@ import sys
 import glob
 import sqlite3
 import datetime
+from contextlib import closing
 
 # ルートディレクトリをパスに追加
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -45,12 +46,10 @@ def backup_database_to_drive() -> bool:
 
     try:
         # VACUUM INTO による無停止・整合性保証スナップショット
-        conn = sqlite3.connect(DEFAULT_DB_PATH)
-        cur = conn.cursor()
         # パスのバックスラッシュをスラッシュに正規化
         safe_target_path = target_path.replace("\\", "/")
-        cur.execute(f"VACUUM INTO '{safe_target_path}';")
-        conn.close()
+        with closing(sqlite3.connect(DEFAULT_DB_PATH)) as conn:
+            conn.execute("VACUUM INTO ?", (safe_target_path,))
 
         file_size_mb = os.path.getsize(target_path) / (1024 * 1024)
         print(f"[Backup] [SUCCESS] Google ドライブへの自動バックアップ成功: {target_filename} ({file_size_mb:.2f} MB)")
@@ -86,4 +85,4 @@ def cleanup_old_backups(keep_count: int = MAX_BACKUP_GENERATIONS):
 
 
 if __name__ == "__main__":
-    backup_database_to_drive()
+    sys.exit(0 if backup_database_to_drive() else 1)

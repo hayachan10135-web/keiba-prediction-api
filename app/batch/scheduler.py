@@ -144,8 +144,10 @@ async def background_maintenance_loop():
             if now_dt.hour == 3 and last_daily_backup_date != today_str:
                 try:
                     from app.maintenance.backup import backup_database_to_drive
-                    backup_database_to_drive()
-                    last_daily_backup_date = today_str
+                    if backup_database_to_drive():
+                        last_daily_backup_date = today_str
+                    else:
+                        print("[Scheduler] 自動日次バックアップに失敗しました。3時台に再試行します。")
                 except Exception as be:
                     print(f"[Scheduler] 自動日次バックアップエラー: {be}")
 
