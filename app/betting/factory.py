@@ -19,6 +19,6 @@ class BettingClientFactory:
         mode_str = (mode or "ipat").strip().lower()
         if mode_str == "umaca":
             return UMACAClient()
-        else:
+        if mode_str == "ipat":
             return IPATClient()
-
+        raise ValueError(f"無効な投票モードです: {mode_str}")

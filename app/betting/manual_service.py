@@ -10,7 +10,49 @@ import time
 import sys
 from typing import Dict, Any, List, Optional
 from app.core.database import get_supabase_client
+from app.core.ticket_spec import TicketTypeRegistry
 from app.betting.factory import BettingClientFactory
+
+
+def validate_manual_bet(
+    race_id: str,
+    venue_name: str,
+    race_no: int,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """投票通信より前にマニュアル投票の買い目を厳密に検証する。"""
+    allowed_venues = {"札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"}
+    if not race_id or len(race_id) > 64:
+        raise ValueError("レースIDが不正です。")
+    if venue_name not in allowed_venues:
+        raise ValueError(f"無効な競馬場です: {venue_name}")
+    if not 1 <= race_no <= 12:
+        raise ValueError("レース番号は1〜12で指定してください。")
+    if not items:
+        raise ValueError("買い目が指定されていません。")
+
+    validated_items = []
+    for item in items:
+        spec = TicketTypeRegistry.get_spec(str(item.get("ticket_type") or ""))
+        if spec is None:
+            raise ValueError(f"未対応の式別です: {item.get('ticket_type')}")
+        combination = item.get("combination")
+        amount = item.get("amount")
+        if not isinstance(combination, list) or len(combination) != spec.num_horses:
+            raise ValueError(f"{spec.canonical_name}の馬番は{spec.num_horses}頭分必要です。")
+        if any(type(number) is not int or not 1 <= number <= 18 for number in combination):
+            raise ValueError("馬番は1〜18の整数で指定してください。")
+        if len(set(combination)) != len(combination):
+            raise ValueError("同じ馬番を重複して指定できません。")
+        if type(amount) is not int or amount < 100 or amount % 100:
+            raise ValueError("各買い目の金額は100円以上・100円単位で指定してください。")
+        validated_items.append({
+            **item,
+            "ticket_type": spec.canonical_name,
+            "combination": combination,
+            "amount": amount,
+        })
+    return validated_items
 
 
 def execute_manual_bet(
@@ -25,12 +67,8 @@ def execute_manual_bet(
     手動または実機テスト用の馬券発注を実行し、keiba_real_bets に is_manual_bet=True で永続化する。
     AIの収支計算（日次サマリー・累計サマリー・回収率）からは完全に除外されます。
     """
-    if not items:
-        return {"status": "skipped", "error": "買い目が指定されていません"}
-
-    total_amount = sum(int(item.get("amount", 0)) for item in items)
-    if total_amount < 100:
-        return {"status": "skipped", "error": "投資総額が100円未満です"}
+    items = validate_manual_bet(race_id, venue_name, race_no, items)
+    total_amount = sum(item["amount"] for item in items)
 
     client = BettingClientFactory.get_client(mode)
     print(f"[ManualBetService] [REQ] マニュアル実機投票リクエスト: {venue_name}{race_no}R ({race_id}) {len(items)}件 計{total_amount:,}円 (モード: {client.platform_name}, dry_run={dry_run})")
@@ -78,4 +116,3 @@ def execute_manual_bet(
             print(f"[ManualBetService] [WARN] FCM通知エラー: {fe}", file=sys.stderr)
 
     return bet_res
-

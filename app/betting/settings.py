@@ -7,6 +7,7 @@ app/betting/settings.py
 
 import os
 import datetime
+import copy
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.database import get_supabase_client
 from app.core.timezone import now_jst, now_jst_naive, today_jst_str, parse_post_datetime
@@ -27,7 +28,7 @@ def load_betting_settings_from_supabase() -> dict:
     global _betting_settings
     supabase = get_supabase_client()
     if not supabase:
-        return _betting_settings
+        raise RuntimeError("投票設定DBを利用できません。")
     try:
         res = supabase.table("keiba_app_meta").select("value").eq("key", "betting_settings").execute()
         if res.data and len(res.data) > 0 and res.data[0].get("value"):
@@ -35,23 +36,26 @@ def load_betting_settings_from_supabase() -> dict:
             if isinstance(val, dict):
                 _betting_settings.update(val)
     except Exception as e:
-        print(f"[BettingSettings] ロードエラー: {e}")
-    return _betting_settings
+        raise RuntimeError(f"投票設定をDBから読み込めません: {e}") from e
+    return copy.deepcopy(_betting_settings)
 
 
 def save_betting_settings_to_supabase(new_settings: dict) -> bool:
     """Supabase keiba_app_meta に投票モード設定を永続化"""
-    global _betting_settings
-    _betting_settings.update(new_settings)
-    _betting_settings["updated_at"] = f"{today_jst_str()} {now_jst().strftime('%H:%M:%S')}"
+    candidate = copy.deepcopy(_betting_settings)
+    candidate.update(copy.deepcopy(new_settings))
+    candidate["updated_at"] = f"{today_jst_str()} {now_jst().strftime('%H:%M:%S')}"
     supabase = get_supabase_client()
     if not supabase:
-        return True
+        print("[BettingSettings] 保存エラー: 投票設定DBを利用できません。")
+        return False
     try:
         supabase.table("keiba_app_meta").upsert({
             "key": "betting_settings",
-            "value": _betting_settings
+            "value": candidate
         }).execute()
+        _betting_settings.clear()
+        _betting_settings.update(candidate)
         return True
     except Exception as e:
         print(f"[BettingSettings] 保存エラー: {e}")

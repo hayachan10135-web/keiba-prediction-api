@@ -122,6 +122,8 @@ def set_daily_promotion_dependencies(cache_invalidation_handler: Optional[Callab
 def invalidate_daily_top_cache(target_date: str):
     """指定日付のデイリー厳選キャッシュを破棄"""
     _daily_top_race_id_cache.pop(target_date, None)
+    from app.strategies.venue_guarantee import invalidate_venue_guarantee_cache
+    invalidate_venue_guarantee_cache(target_date)
     if _cache_invalidation_handler:
         try:
             _cache_invalidation_handler(target_date)
@@ -460,4 +462,3 @@ def ensure_daily_single_real_bet(target_date: str, supabase_client: Optional[Any
     except Exception as e:
         print(f"[ensure_daily_single_real_bet] エラー: {e}")
         return None
-

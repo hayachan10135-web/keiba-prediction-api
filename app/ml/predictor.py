@@ -77,6 +77,32 @@ ODDS_STAGE_ORDER = ["0830", "60m", "30m", "15m", "05m"]
 ODDS_STAGE_RANK = {"0830": 1, "60m": 2, "30m": 3, "15m": 4, "05m": 5}
 
 
+def calibrate_probabilities(values: np.ndarray, table: List[dict]) -> np.ndarray:
+    """検証済みの単調較正表で確率を補正し、不正・欠損表は明示的に拒否する。"""
+    if not isinstance(table, list) or len(table) < 2:
+        raise ValueError("確率キャリブレーション表が未設定または不完全です。")
+
+    try:
+        x_points = np.asarray([float(item["pred"]) for item in table], dtype=float)
+        y_points = np.asarray([float(item["calib"]) for item in table], dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"確率キャリブレーション表の形式が不正です: {exc}") from exc
+
+    if (
+        not np.all(np.isfinite(x_points))
+        or not np.all(np.isfinite(y_points))
+        or np.any(x_points < 0)
+        or np.any(x_points > 1)
+        or np.any(y_points < 0)
+        or np.any(y_points > 1)
+        or np.any(np.diff(x_points) <= 0)
+        or np.any(np.diff(y_points) < 0)
+    ):
+        raise ValueError("確率キャリブレーション表は[0, 1]内で単調増加している必要があります。")
+
+    return np.interp(values, x_points, y_points)
+
+
 def infer_odds_stage_from_minutes(mins_to_post: Optional[float]) -> str:
     """発走までの残り分数から現在のオッズ取得ステージを判定"""
     if mins_to_post is None or mins_to_post > 65.0:
@@ -711,25 +737,17 @@ def build_prediction_and_recs(race_name: str, race_details: dict, race_id: str, 
             inp_ct = [r[:n_ct] for r in feature_rows]
             raw_cw = np.array(m_cls_w.predict(inp_cw, num_threads=4))
             raw_ct = np.array(m_cls_t.predict(inp_ct, num_threads=4))
-
-            # キャリブレーション補正 (FR-ML-03: 区分線形補間 np.interp)
-            cal_info = (calibration_table or {}).get(cls_key, {})
-            w_cal_tab = cal_info.get("win_calib", [])
-            t_cal_tab = cal_info.get("top3_calib", [])
-
-            def _calib_linear(vals, tab):
-                if not tab:
-                    return vals
-                xp = [float(e.get("pred", 0.0)) for e in tab]
-                fp = [float(e.get("calib", 0.0)) for e in tab]
-                return np.interp(vals, xp, fp)
-
-            w_scores = _calib_linear(raw_cw, w_cal_tab)
-            t_scores = _calib_linear(raw_ct, t_cal_tab)
         except Exception as ex_cls:
             print(f"クラス別モデル推論フォールバック ({cls_key}): {ex_cls}")
             w_scores = None
             t_scores = None
+        else:
+            cal_info = (calibration_table or {}).get(cls_key, {})
+            try:
+                w_scores = calibrate_probabilities(raw_cw, cal_info.get("win_calib"))
+                t_scores = calibrate_probabilities(raw_ct, cal_info.get("top3_calib"))
+            except ValueError as exc:
+                raise RuntimeError(f"{cls_key} の確率キャリブレーションに失敗しました: {exc}") from exc
 
     # 2. クラス別モデル未該当レースまたはエラー時のみ、旧3大GBDTアンサンブル (LightGBM × CatBoost × XGBoost) にフォールバック
     if (w_scores is None or t_scores is None):

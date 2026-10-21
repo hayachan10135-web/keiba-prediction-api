@@ -10,8 +10,6 @@ app/strategies/venue_guarantee.py
 import datetime
 from typing import Dict, Any, List, Optional, Tuple, Set
 from app.core.database import get_supabase_client
-from app.core.timezone import now_jst_naive, today_jst_str
-
 # メモリキャッシュ: target_date -> {"real_guarantees": set(race_ids), "virtual_guarantees": set(race_ids)}
 _venue_guarantee_cache: Dict[str, Dict[str, Set[str]]] = {}
 
@@ -44,9 +42,25 @@ def resolve_venue_guarantees_for_date(
         return set(), set()
 
     try:
+        scheduled_res = supabase.table("keiba_scheduled_races")\
+            .select("race_id")\
+            .eq("race_date", target_date)\
+            .execute()
+        scheduled_ids = {
+            str(row.get("race_id") or "")
+            for row in (scheduled_res.data or [])
+            if row.get("race_id")
+        }
+        if not scheduled_ids:
+            return set(), set()
+
         res = supabase.table("keiba_predictions_cache").select("race_id, data_json").eq("race_date", target_date).execute()
-        rows = res.data or []
-        if not rows:
+        rows = [
+            row for row in (res.data or [])
+            if str(row.get("race_id") or "") in scheduled_ids
+        ]
+        predicted_ids = {str(row.get("race_id") or "") for row in rows}
+        if predicted_ids != scheduled_ids:
             return set(), set()
 
         all_day_races: List[dict] = []
@@ -112,11 +126,21 @@ def resolve_venue_guarantees_for_date(
 
         # 2. 仮想保証: 各会場ごとに最低3Rを確保
         for v_code, r_items in races_by_venue.items():
-            existing_virt_count = sum(1 for item in r_items if item["bet_category"] == "virtual" or item["strategy_type"] == "virtual_bet")
-            avail_for_virt = [item for item in r_items if item["race_id"] not in real_guarantees and item["bet_category"] not in ("super", "real")]
+            existing_participation_count = sum(
+                1 for item in r_items
+                if item["race_id"] in real_guarantees
+                or item["bet_category"] in ("super", "real", "virtual")
+                or item["strategy_type"] in ("super_bet", "real_bet", "virtual_bet")
+            )
+            avail_for_virt = [
+                item for item in r_items
+                if item["race_id"] not in real_guarantees
+                and item["bet_category"] not in ("super", "real", "virtual")
+                and item["strategy_type"] not in ("super_bet", "real_bet", "virtual_bet")
+            ]
             avail_for_virt.sort(key=lambda x: (x["win_edge"] + x["conf_score"]), reverse=True)
 
-            needed_virt = max(0, 3 - existing_virt_count)
+            needed_virt = max(0, 3 - existing_participation_count)
             for item in avail_for_virt[:needed_virt]:
                 virtual_guarantees.add(item["race_id"])
 

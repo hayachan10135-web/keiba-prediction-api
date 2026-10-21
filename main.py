@@ -547,6 +547,8 @@ def save_cached_prediction(race_id: str, race_date: str, data_dict: dict):
         else:
             _all_predictions_cache.pop(race_date, None)
         _today_races_cache.pop(race_date, None)
+        from app.strategies.venue_guarantee import invalidate_venue_guarantee_cache
+        invalidate_venue_guarantee_cache(race_date)
     except Exception as e:
         print(f"DB予想保存エラー ({race_id}): {e}")
 

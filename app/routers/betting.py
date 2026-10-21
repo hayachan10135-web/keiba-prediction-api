@@ -8,7 +8,7 @@ app/routers/betting.py
 import os
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 from app.betting.factory import BettingClientFactory
 from app.betting.umaca_client import UMACAClient
@@ -54,14 +54,14 @@ class UpdateBettingModeRequest(BaseModel):
 
 class ManualBetItem(BaseModel):
     ticket_type: str
-    combination: List[int]
-    amount: int
+    combination: List[StrictInt]
+    amount: StrictInt
 
 
 class ManualBetRequest(BaseModel):
     race_id: str
     venue_name: str
-    race_no: int
+    race_no: StrictInt
     items: List[ManualBetItem]
     mode: Optional[str] = None
     dry_run: bool = False
@@ -194,12 +194,14 @@ def update_betting_mode_endpoint(req: UpdateBettingModeRequest):
             settings["balance_status"] = "off"
             settings["balance_message"] = "自動投票OFF"
 
-    save_betting_settings_to_supabase(settings)
+    if not save_betting_settings_to_supabase(settings):
+        raise HTTPException(status_code=503, detail="投票設定をDBへ保存できませんでした。自動投票設定を変更していません。")
     mode_names = {
         "off": "自動投票なし (OFF)",
         "ipat": "即PAT (IPAT)",
         "umaca": "UMACAスマート"
     }
+    new_mode = settings.get("betting_mode", "off")
     return {
         "status": "ok",
         "betting_mode": new_mode,
@@ -272,16 +274,19 @@ def manual_bet_endpoint(req: ManualBetRequest):
     """
     settings = load_betting_settings_from_supabase()
     target_mode = (req.mode or settings.get("betting_mode") or "ipat").lower().strip()
-    if target_mode == "off":
-        raise HTTPException(status_code=400, detail="投票モードがOFFになっています。設定画面からipatまたはumacaを選択してください。")
+    if target_mode not in ("ipat", "umaca"):
+        raise HTTPException(status_code=400, detail="投票モードはipatまたはumacaを指定してください。")
 
     items_dicts = [item.dict() for item in req.items]
-    res = execute_manual_bet(
-        race_id=req.race_id,
-        venue_name=req.venue_name,
-        race_no=req.race_no,
-        items=items_dicts,
-        mode=target_mode,
-        dry_run=req.dry_run
-    )
+    try:
+        res = execute_manual_bet(
+            race_id=req.race_id,
+            venue_name=req.venue_name,
+            race_no=req.race_no,
+            items=items_dicts,
+            mode=target_mode,
+            dry_run=req.dry_run
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return res

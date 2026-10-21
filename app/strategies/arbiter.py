@@ -29,9 +29,9 @@ class StrategyArbiter:
     def __init__(self):
         # 3段階区分戦略を優先度順に登録
         self.strategies: List[BaseBettingStrategy] = [
-            StrategySuper(),           # 1. ⭐【勝負R】 (最優先: 芝オッズ妙味帯・馬単3点)
-            StrategyReal(),            # 2. 🎯【実勝負】 (各場1R保証枠 または 高安定本命・単複)
-            StrategyVirtual(),         # 3. 🎮【仮想】   (各場3R保証枠 または 観戦枠・3連複6点)
+            StrategySuper(),           # 1. 🔥【勝負R】単勝1点
+            StrategyReal(),            # 2. ⭐【実勝負】複勝1点
+            StrategyVirtual(),         # 3. 🎮【仮想】クラス別買い目
         ]
 
     def evaluate_race(
@@ -279,4 +279,3 @@ class StrategyArbiter:
         # 全券種個別フィールド (tansho_bets, umaren_amount, wide_amount 等) をマージ
         res.update(ticket_fields)
         return res
-
