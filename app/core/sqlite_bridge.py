@@ -198,7 +198,7 @@ def ensure_database_schema(conn: sqlite3.Connection):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_real_bets_race_id ON keiba_real_bets(race_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_real_bets_time ON keiba_real_bets(bet_time);")
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bets_auto_unique ON keiba_real_bets(race_id) WHERE is_manual_bet = 0 AND status = 'success';")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bets_auto_attempt_unique ON keiba_real_bets(race_id) WHERE is_manual_bet = 0;")
 
     # 6. keiba_app_meta
     cur.execute("""

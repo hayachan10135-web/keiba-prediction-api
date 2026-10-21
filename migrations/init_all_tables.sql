@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS keiba_real_bets (
 CREATE INDEX IF NOT EXISTS idx_keiba_real_bets_race_id ON keiba_real_bets (race_id);
 CREATE INDEX IF NOT EXISTS idx_keiba_real_bets_manual ON keiba_real_bets (is_manual_bet);
 CREATE INDEX IF NOT EXISTS idx_keiba_real_bets_bet_time ON keiba_real_bets (bet_time);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bets_auto_attempt_unique
+ON keiba_real_bets (race_id)
+WHERE is_manual_bet = FALSE;
 
 -- 6. システム運用メタ情報テーブル (設定・バージョン)
 CREATE TABLE IF NOT EXISTS keiba_app_meta (
@@ -101,4 +104,3 @@ CREATE TABLE IF NOT EXISTS keiba_app_meta (
     value JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-

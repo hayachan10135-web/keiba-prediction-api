@@ -2,7 +2,7 @@
 """
 tests/test_investment_limit.py
 
-資金安全原則 (AGENT_RULES 第1章 / FR-BET-05 / FR-BET-06) 検証テスト:
+資金安全原則 (AGENT_RULES 第1章 / FR-BET-08 / FR-BET-09) 検証テスト:
 - 1日最大投資上限額 (daily_investment_limit) ガードの判定
 - 累計投資額 + 追加発注額が上限を超える場合の安全スキップ判定
 - 1レース最大上限額 (DEFAULT_MAX_BET_PER_RACE) の制限
@@ -54,6 +54,40 @@ class TestInvestmentLimit(unittest.TestCase):
     def test_max_bet_per_race_constant(self):
         """1レースあたりの最大賭け金定数が勝負R-Sランク対応（5000円）として定義されていること"""
         self.assertEqual(settings.DEFAULT_MAX_BET_PER_RACE, 5000)
+
+    def test_database_error_fails_closed(self):
+        """投票履歴DBの照会に失敗した場合、上限判定を通過させないこと"""
+        with patch("app.betting.settings.get_supabase_client", return_value=None):
+            with self.assertRaises(RuntimeError):
+                from app.betting.settings import get_today_total_betted
+                get_today_total_betted("2026-10-19")
+
+    def test_database_query_error_fails_closed(self):
+        """投票履歴DBのクエリ例外を0円扱いせず、上限判定を中断すること"""
+        from unittest.mock import MagicMock
+        from app.betting.settings import get_today_total_betted
+
+        mock_db = MagicMock()
+        mock_db.table.return_value.select.return_value.gte.return_value.lte.return_value.eq.return_value.execute.side_effect = OSError(
+            "database unavailable"
+        )
+        with patch("app.betting.settings.get_supabase_client", return_value=mock_db):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                get_today_total_betted("2026-10-19")
+
+    def test_pending_and_unknown_attempts_count_toward_daily_limit(self):
+        """処理中・結果不明の自動投票予約も当日上限に算入すること"""
+        from unittest.mock import MagicMock
+        from app.betting.settings import get_today_total_betted
+
+        mock_db = MagicMock()
+        mock_db.table.return_value.select.return_value.gte.return_value.lte.return_value.eq.return_value.execute.return_value.data = [
+            {"race_id": "race-pending", "total_amount": 5000, "is_manual_bet": False, "status": "pending"},
+            {"race_id": "race-unknown", "total_amount": 3000, "is_manual_bet": False, "status": "unknown"},
+            {"race_id": "race-failed", "total_amount": 2000, "is_manual_bet": False, "status": "failed"},
+        ]
+        with patch("app.betting.settings.get_supabase_client", return_value=mock_db):
+            self.assertEqual(get_today_total_betted("2026-10-19"), 8000)
 
 
 if __name__ == "__main__":

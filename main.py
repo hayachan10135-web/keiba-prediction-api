@@ -434,20 +434,26 @@ def _invalidate_main_prediction_caches(target_date: str):
 set_daily_promotion_dependencies(cache_invalidation_handler=_invalidate_main_prediction_caches)
 
 def has_already_betted_race(date_str: str, race_id: str) -> bool:
-    """指定レース(race_id)がすでに自動投票完了済みか確認 (同一レース二重発注防止)"""
+    """指定レースに自動投票の予約・成立記録があるか確認 (同一レース二重発注防止)"""
     if race_id in _auto_betted_races:
         return True
-    # 1. keiba_real_bets テーブルから直接確認 (再起動耐性・DB層物理防御)
+    # 予約済み・結果不明の記録も二重投票を避けるためブロックする。
+    db_cli = get_db()
+    if not db_cli:
+        raise RuntimeError(f"投票履歴DBを利用できず、{race_id} の重複投票を検証できません。")
     try:
-        db_cli = get_db()
-        if db_cli:
-            res = db_cli.table("keiba_real_bets").select("id").eq("race_id", race_id).eq("is_manual_bet", False).eq("status", "success").execute()
-            if res.data and len(res.data) > 0:
-                _auto_betted_races.add(race_id)
-                return True
+        res = db_cli.table("keiba_real_bets")\
+            .select("id")\
+            .eq("race_id", race_id)\
+            .eq("is_manual_bet", False)\
+            .execute()
     except Exception as e:
-        print(f"[AlreadyBetted Warning] real_bets DB照会例外 ({race_id}): {e}")
-    # 2. settings 内の betted_races_by_date から確認
+        raise RuntimeError(f"投票履歴DB照会に失敗し、{race_id} の重複投票を検証できません: {e}") from e
+    if res.data:
+        _auto_betted_races.add(race_id)
+        return True
+
+    # DB記録がまだない旧データに対する互換フォールバック。
     try:
         settings = load_betting_settings_from_supabase()
         betted = settings.get("betted_races_by_date", {})
@@ -927,4 +933,3 @@ def _startup_background_init():
         heal_today_weights_and_results(today_jst_str())
     except Exception as e:
         print(f"[Startup Bg Init Warning] {e}")
-

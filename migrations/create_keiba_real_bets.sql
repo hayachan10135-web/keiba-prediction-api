@@ -26,7 +26,10 @@ ON keiba_real_bets (is_manual_bet);
 CREATE INDEX IF NOT EXISTS idx_keiba_real_bets_bet_time 
 ON keiba_real_bets (bet_time);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bets_auto_attempt_unique
+ON keiba_real_bets (race_id)
+WHERE is_manual_bet = FALSE;
+
 -- 3. テーブル・カラムコメント
 COMMENT ON TABLE keiba_real_bets IS '実馬券発注台帳（自動投票およびマニュアル投票の履歴）';
 COMMENT ON COLUMN keiba_real_bets.is_manual_bet IS '手動・実機テスト投票フラグ (TRUEの場合、AI公式収支サマリーから完全除外)';
-

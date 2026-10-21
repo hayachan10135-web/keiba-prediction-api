@@ -30,7 +30,7 @@ class TestManualBetExclusion(unittest.TestCase):
         # 1. 自動投票レコード (is_manual_bet=False, 2,500円) -> 集計対象
         # 2. 手動テスト投票レコード (is_manual_bet=True, 1,000円) -> 除外対象
         mock_data = [
-            {"total_amount": 2500, "is_manual_bet": False},
+            {"race_id": "race-1", "total_amount": 2500, "is_manual_bet": False, "status": "success"},
         ]
 
         mock_supabase = MagicMock()
@@ -38,22 +38,20 @@ class TestManualBetExclusion(unittest.TestCase):
         mock_select = MagicMock()
         mock_gte = MagicMock()
         mock_lte = MagicMock()
-        mock_eq_status = MagicMock()
         mock_eq_manual = MagicMock()
 
         mock_supabase.table.return_value = mock_table
         mock_table.select.return_value = mock_select
         mock_select.gte.return_value = mock_gte
         mock_gte.lte.return_value = mock_lte
-        mock_lte.eq.return_value = mock_eq_status
-        mock_eq_status.eq.return_value = mock_eq_manual
+        mock_lte.eq.return_value = mock_eq_manual
         mock_eq_manual.execute.return_value = MagicMock(data=mock_data)
 
         with patch("app.betting.settings.get_supabase_client", return_value=mock_supabase):
             total = get_today_total_betted("2026-10-19")
 
             # eq("is_manual_bet", False) がクエリチェーンで確実に呼ばれたことを検証
-            mock_eq_status.eq.assert_called_with("is_manual_bet", False)
+            mock_lte.eq.assert_called_with("is_manual_bet", False)
             # 自動投票の2,500円のみが集計され、マニュアル投票は含まれないこと
             self.assertEqual(total, 2500)
 

@@ -169,30 +169,32 @@ def calculate_remaining_real_bet_amount(target_date: Optional[str] = None) -> Tu
 
 
 def get_today_total_betted(target_date: Optional[str] = None) -> int:
-    """当日（JST）の自動投票済み累計金額（円）を取得（マニュアル投票 FR-BET-07 は完全除外）"""
+    """当日（JST）の自動投票済み・処理中・結果不明の累計金額を取得"""
     t_date = target_date or today_jst_str()
     supabase = get_supabase_client()
+    if not supabase:
+        raise RuntimeError("投票履歴DBを利用できないため、日次投資上限を検証できません。")
+
     betted_by_race: Dict[str, int] = {}
 
-    if supabase:
-        try:
-            res = supabase.table("keiba_real_bets")\
-                .select("race_id, total_amount, is_manual_bet")\
-                .gte("bet_time", f"{t_date} 00:00:00")\
-                .lte("bet_time", f"{t_date} 23:59:59")\
-                .eq("status", "success")\
-                .eq("is_manual_bet", False)\
-                .execute()
-            if res.data:
-                for row in res.data:
-                    rid = str(row.get("race_id") or "")
-                    amt = int(row.get("total_amount") or 0)
-                    if rid:
-                        betted_by_race[rid] = max(betted_by_race.get(rid, 0), amt)
-                    else:
-                        betted_by_race[f"_db_{len(betted_by_race)}"] = amt
-        except Exception as e:
-            print(f"[get_today_total_betted] keiba_real_bets 集計警告: {e}")
+    try:
+        res = supabase.table("keiba_real_bets")\
+            .select("race_id, total_amount, is_manual_bet, status")\
+            .gte("bet_time", f"{t_date} 00:00:00")\
+            .lte("bet_time", f"{t_date} 23:59:59")\
+            .eq("is_manual_bet", False)\
+            .execute()
+        for row in (res.data or []):
+            if str(row.get("status") or "").lower() not in {"success", "pending", "unknown"}:
+                continue
+            rid = str(row.get("race_id") or "")
+            amt = int(row.get("total_amount") or 0)
+            if rid:
+                betted_by_race[rid] = max(betted_by_race.get(rid, 0), amt)
+            else:
+                betted_by_race[f"_db_{len(betted_by_race)}"] = amt
+    except Exception as e:
+        raise RuntimeError(f"投票履歴DBを読めず、日次投資上限を検証できません: {e}") from e
 
     # settings 内の betted_races_by_date とマージ（二重計上を防ぎつつどちらの記録も漏らさず上限保護）
     b_dict = _betting_settings.get("betted_races_by_date", {})
@@ -206,6 +208,59 @@ def get_today_total_betted(target_date: Optional[str] = None) -> int:
             betted_by_race[f"_meta_{len(betted_by_race)}"] = amt
 
     return sum(betted_by_race.values())
+
+
+def reserve_auto_bet_attempt(
+    race_id: str,
+    platform: str,
+    total_amount: int,
+    items: List[dict],
+    bet_time: str,
+) -> bool:
+    """投票通信の前にレース単位の永続ロックを取得する。既存記録があれば False。"""
+    db = get_supabase_client()
+    if not db:
+        raise RuntimeError("投票ロックDBを利用できないため、自動投票を中止します。")
+
+    existing = db.table("keiba_real_bets")\
+        .select("id")\
+        .eq("race_id", race_id)\
+        .eq("is_manual_bet", False)\
+        .execute()
+    if existing.data:
+        return False
+
+    db.table("keiba_real_bets").insert({
+        "race_id": race_id,
+        "platform": platform,
+        "receipt_no": "",
+        "total_amount": total_amount,
+        "items": items,
+        "status": "pending",
+        "is_manual_bet": False,
+        "bet_time": bet_time,
+    }).execute()
+    return True
+
+
+def update_auto_bet_attempt(race_id: str, values: dict) -> None:
+    """予約済み自動投票の状態を更新する。失敗時は pending ロックが残る。"""
+    db = get_supabase_client()
+    if not db:
+        raise RuntimeError("投票状態DBを利用できません。")
+    query = db.table("keiba_real_bets")\
+        .update(values)\
+        .eq("race_id", race_id)\
+        .eq("is_manual_bet", False)\
+        .eq("status", "pending")
+    query.execute()
+    updated = db.table("keiba_real_bets")\
+        .select("id, status")\
+        .eq("race_id", race_id)\
+        .eq("is_manual_bet", False)\
+        .execute()
+    if not any(row.get("status") == values.get("status") for row in (updated.data or [])):
+        raise RuntimeError(f"{race_id} の自動投票状態をDBで確認できません。")
 
 
 def check_investment_limit(additional_amount: int, target_date: Optional[str] = None) -> Tuple[bool, int, int]:
@@ -231,4 +286,3 @@ def check_investment_limit(additional_amount: int, target_date: Optional[str] = 
     current_total = get_today_total_betted(target_date)
     is_exceeded = (current_total + additional_amount) > limit
     return is_exceeded, current_total, limit
-

@@ -24,6 +24,8 @@ from app.betting.settings import (
     load_betting_settings_from_supabase,
     save_betting_settings_to_supabase,
     check_investment_limit,
+    reserve_auto_bet_attempt,
+    update_auto_bet_attempt,
 )
 
 # DIされる外部依存
@@ -373,9 +375,7 @@ async def background_maintenance_loop():
                                                         }
                                                     )
                                             else:
-                                                if _auto_betted_races_ref is not None:
-                                                    _auto_betted_races_ref.add(r_id)
-                                                print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
+                                                reservation_acquired = False
                                                 try:
                                                     v_code = r_id[4:6] if len(r_id) == 12 else "05"
                                                     v_map = _venue_code_map_ref or {}
@@ -394,6 +394,21 @@ async def background_maintenance_loop():
                                                             "amount": b.get("amount", 100)
                                                         })
 
+                                                    now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
+                                                    now_time_iso = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
+                                                    reserved = reserve_auto_bet_attempt(
+                                                        r_id, cur_bet_mode, tot_amt, bet_items, now_time_iso
+                                                    )
+                                                    if not reserved:
+                                                        if _auto_betted_races_ref is not None:
+                                                            _auto_betted_races_ref.add(r_id)
+                                                        print(f"[AutoBet] {r_id} はDB上に自動投票記録があるためスキップします")
+                                                        continue
+                                                    reservation_acquired = True
+                                                    if _auto_betted_races_ref is not None:
+                                                        _auto_betted_races_ref.add(r_id)
+
+                                                    print(f"[AutoBet] 🎫 {r_id} ({r_name}) の{mode_label}自動投票を開始します...")
                                                     client = BettingClientFactory.get_client(cur_bet_mode)
                                                     bet_res = await asyncio.to_thread(client.execute_bets, v_name, r_no, bet_items, False)
 
@@ -404,27 +419,15 @@ async def background_maintenance_loop():
                                                         if _auto_betted_races_ref is not None:
                                                             _auto_betted_races_ref.add(r_id)
 
-                                                        now_jst_obj = _now_jst_fn() if _now_jst_fn else datetime.datetime.now()
-                                                        now_time_iso = now_jst_obj.strftime("%Y-%m-%d %H:%M:%S")
-
-                                                        # 1. keiba_real_bets テーブルへ自動投票レコードを永続化 (is_manual_bet=False)
+                                                        # 予約レコードを成立済みに更新する。失敗しても予約ロックは残る。
                                                         try:
-                                                            supabase_cli = get_supabase_client()
-                                                            if supabase_cli:
-                                                                bet_record = {
-                                                                    "race_id": r_id,
-                                                                    "platform": cur_bet_mode,
-                                                                    "receipt_no": str(rcpt),
-                                                                    "total_amount": tot_amt,
-                                                                    "items": bet_items,
-                                                                    "status": "success",
-                                                                    "is_manual_bet": False,
-                                                                    "bet_time": now_time_iso,
-                                                                }
-                                                                supabase_cli.table("keiba_real_bets").insert(bet_record).execute()
-                                                                print(f"[AutoBet] 💾 keiba_real_bets に自動投票レコードを永続化完了 (race_id: {r_id}, 受付: {rcpt})")
+                                                            update_auto_bet_attempt(r_id, {
+                                                                "receipt_no": str(rcpt),
+                                                                "status": "success",
+                                                            })
+                                                            print(f"[AutoBet] 💾 keiba_real_bets の投票記録を確定しました (race_id: {r_id}, 受付: {rcpt})")
                                                         except Exception as db_err:
-                                                            print(f"[AutoBet DB Error] keiba_real_bets 保存エラー: {db_err}")
+                                                            print(f"[AutoBet DB Error] 投票成立記録を更新できません。pending ロックを維持します: {db_err}")
 
                                                         # 2. settings 内の betted_races_by_date の更新
                                                         try:
@@ -461,6 +464,10 @@ async def background_maintenance_loop():
                                                             )
                                                     else:
                                                         err_msg = bet_res.get("reason") or bet_res.get("error") or "投票処理エラー"
+                                                        try:
+                                                            update_auto_bet_attempt(r_id, {"status": "unknown"})
+                                                        except Exception as db_err:
+                                                            print(f"[AutoBet DB Error] 結果不明ロック更新失敗 (pending ロックを維持): {db_err}")
                                                         print(f"[AutoBet] ⚠️ {mode_label}投票失敗: {err_msg}")
                                                         if _send_fcm_notification_fn:
                                                             _send_fcm_notification_fn(
@@ -474,6 +481,11 @@ async def background_maintenance_loop():
                                                                 }
                                                             )
                                                 except Exception as ab_err:
+                                                    if reservation_acquired:
+                                                            try:
+                                                                update_auto_bet_attempt(r_id, {"status": "unknown"})
+                                                            except Exception as db_err:
+                                                                print(f"[AutoBet DB Error] 例外時の結果不明ロック更新失敗 (pending ロックを維持): {db_err}")
                                                     print(f"[AutoBet] 例外エラー: {ab_err}")
                                                     if _send_fcm_notification_fn:
                                                         _send_fcm_notification_fn(
